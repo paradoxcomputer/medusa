@@ -1,0 +1,16 @@
+{
+  "name": "medusa_ui",
+  "version": "0.2.3",
+  "type": "ui_qml",
+  "category": "blockchain",
+  "description": "Native token wallet UI: accounts, faucet, keycard-gated transfers",
+  "view": "qml/Main.qml",
+  "icon": "icons/medusa-icon.png",
+  "dependencies": ["medusa_core"],
+
+  "nix": {
+    "packages": { "build": [], "runtime": [] },
+    "external_libraries": [],
+    "cmake": { "find_packages": [], "extra_sources": [], "extra_include_dirs": [], "extra_link_libraries": [] }
+  }
+}

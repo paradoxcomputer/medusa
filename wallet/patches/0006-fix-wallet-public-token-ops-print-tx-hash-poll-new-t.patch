@@ -1,0 +1,95 @@
+From 2a753dda0d6a6824589288a0d069f8a67257b984 Mon Sep 17 00:00:00 2001
+From: Medusa <plnnoel@gmail.com>
+Date: Wed, 24 Jun 2026 21:42:35 +0000
+Subject: [PATCH] fix(wallet): public token ops print tx hash + poll
+ (new/transfer/burn/mint)
+
+The public token-program subcommands were submitted fire-and-forget:
+send_new_definition / send_transfer_transaction / send_burn_transaction /
+send_mint_transaction all return the tx hash, but the handlers discarded it
+and returned SubcommandReturnValue::Empty -- so 'token new' and public
+'token send/burn/mint' produced NO output and did not wait for inclusion.
+A user checking state immediately saw an empty/no-op result (this cost hours
+of debugging). Capture the hash, print 'Transaction hash is <hash>', and
+poll_native_token_transfer to wait for inclusion -- matching the private
+token arms and the native public send (native_token_transfer.rs).
+---
+ wallet/src/cli/programs/token.rs | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/wallet/src/cli/programs/token.rs b/wallet/src/cli/programs/token.rs
+index 73bb6c2..5153d80 100644
+--- a/wallet/src/cli/programs/token.rs
++++ b/wallet/src/cli/programs/token.rs
+@@ -801,13 +801,15 @@ impl WalletSubcommand for TokenProgramSubcommandPublic {
+                 recipient_account_id,
+                 balance_to_move,
+             } => {
+-                Token(wallet_core)
++                let tx_hash = Token(wallet_core)
+                     .send_transfer_transaction(
+                         sender_account_id.parse().unwrap(),
+                         recipient_account_id.parse().unwrap(),
+                         balance_to_move,
+                     )
+                     .await?;
++                println!("Transaction hash is {tx_hash}");
++                wallet_core.poll_native_token_transfer(tx_hash).await?;
+                 Ok(SubcommandReturnValue::Empty)
+             }
+             Self::BurnToken {
+@@ -815,13 +817,15 @@ impl WalletSubcommand for TokenProgramSubcommandPublic {
+                 holder_account_id,
+                 amount,
+             } => {
+-                Token(wallet_core)
++                let tx_hash = Token(wallet_core)
+                     .send_burn_transaction(
+                         definition_account_id.parse().unwrap(),
+                         holder_account_id.parse().unwrap(),
+                         amount,
+                     )
+                     .await?;
++                println!("Transaction hash is {tx_hash}");
++                wallet_core.poll_native_token_transfer(tx_hash).await?;
+                 Ok(SubcommandReturnValue::Empty)
+             }
+             Self::MintToken {
+@@ -829,13 +833,15 @@ impl WalletSubcommand for TokenProgramSubcommandPublic {
+                 holder_account_id,
+                 amount,
+             } => {
+-                Token(wallet_core)
++                let tx_hash = Token(wallet_core)
+                     .send_mint_transaction(
+                         definition_account_id.parse().unwrap(),
+                         holder_account_id.parse().unwrap(),
+                         amount,
+                     )
+                     .await?;
++                println!("Transaction hash is {tx_hash}");
++                wallet_core.poll_native_token_transfer(tx_hash).await?;
+                 Ok(SubcommandReturnValue::Empty)
+             }
+         }
+@@ -1478,7 +1484,7 @@ impl WalletSubcommand for CreateNewTokenProgramSubcommand {
+                 name,
+                 total_supply,
+             } => {
+-                Token(wallet_core)
++                let tx_hash = Token(wallet_core)
+                     .send_new_definition(
+                         definition_account_id.parse().unwrap(),
+                         supply_account_id.parse().unwrap(),
+@@ -1486,6 +1492,8 @@ impl WalletSubcommand for CreateNewTokenProgramSubcommand {
+                         total_supply,
+                     )
+                     .await?;
++                println!("Transaction hash is {tx_hash}");
++                wallet_core.poll_native_token_transfer(tx_hash).await?;
+                 Ok(SubcommandReturnValue::Empty)
+             }
+         }
+-- 
+2.34.1
+
