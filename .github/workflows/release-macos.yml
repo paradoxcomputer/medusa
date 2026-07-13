@@ -1,0 +1,115 @@
+# Build the SELF-CONTAINED macOS Medusa apps (.lgx) on real Apple hardware.
+#
+# Why CI (not local): the wallet ENGINE (wallet-lez, sequencer_service*) is Rust with a
+# risc0/zk toolchain, and the module .dylib is Qt - neither cross-compiles to darwin from
+# Linux (nix cross-build fails on the Qt/darwin deps). A macOS runner builds both NATIVELY.
+#
+# Output: for each arch, a self-contained `darwin-<arch>` medusa_core (engine + sequencers +
+# Tor-forward bundled under bin/, exactly like the linux-amd64 build) plus medusa_ui + tip_jar.
+# These artifacts are then merged with the linux .lgx into the multi-variant packages served
+# by paradox-modules-repo (see its scripts/build-release.sh + `lgx merge`).
+#
+# Trigger: a release tag (v*) or manual dispatch - macOS minutes are ~10× Linux, so not on
+# every push.
+name: release-macos
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14        # Apple Silicon (Intel/macos-13 dropped: GitHub Intel runners are scarce)
+            arch:   aarch64-apple-darwin
+            variant: darwin-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }   # tags, for a reproducible engine build
+
+      - name: Install Nix (flakes)
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Rust toolchain (+ risc0)
+        run: |
+          rustup default stable || true
+          rustup target add ${{ matrix.arch }} || true
+          # The LEZ wallet builds risc0 guest programs - install the zkVM toolchain.
+          # (If the crate vendors/pins its own, this is a harmless no-op.)
+          cargo install cargo-risczero || true
+          cargo risczero install || true
+
+      - name: Build the LEZ engine (patched rc5 source)
+        run: |
+          # clones logos-execution-zone@v0.2.0-rc5, applies wallet/patches-rc5/*, builds:
+          #   wallet (→ wallet-lez), sequencer_service (standalone), sequencer_service_l1 (L1),
+          #   diaphani-forward (Tor forwarder). Produces native darwin binaries.
+          bash wallet/build.sh
+          echo "LEZ=$PWD/wallet/.lez-build/target/release"     >> "$GITHUB_ENV"
+          echo "DIA=$PWD/wallet/.diaphani-build/target/release" >> "$GITHUB_ENV"
+
+      - name: Build module .lgx (native darwin, self-contained .dylib)
+        run: |
+          set -euo pipefail
+          out="$PWD/mac-out"; mkdir -p "$out"
+          ( cd module                   && nix build .#lgx-portable -o result-portable ); cp module/result-portable/*.lgx                   "$out/medusa_core.lgx"
+          ( cd module/plugins/medusa_ui && nix build .#lgx-portable -o result-portable ); cp module/plugins/medusa_ui/result-portable/*.lgx "$out/medusa_ui.lgx"
+          ( cd examples/tip-jar         && nix build .#lgx-portable -o result-portable ); cp examples/tip-jar/result-portable/*.lgx         "$out/tip_jar.lgx"
+          echo "MACOUT=$out" >> "$GITHUB_ENV"
+
+      - name: Obtain the lgx CLI (built as a nix dep; pin against GC)
+        run: |
+          drv=$(ls -t /nix/store/*-lgx-0.1.0.drv | grep -vE 'logos|module' | head -1)
+          nix-store --realise "$drv" --add-root "$PWD/lgx-cli" >/dev/null
+          echo "LGX=$PWD/lgx-cli/bin/lgx" >> "$GITHUB_ENV"
+
+      - name: Bundle the engine into the ${{ matrix.variant }} medusa_core
+        run: |
+          set -euo pipefail
+          mc="$MACOUT/medusa_core.lgx"
+          stg="$PWD/mc-stage"; mkdir -p "$stg/bin"
+          # extract the darwin variant payload (the .dylib + its bundled libs)
+          python3 - "$mc" "$stg" "${{ matrix.variant }}" <<'PY'
+          import sys,gzip,io,tarfile,os
+          src,stg,var=sys.argv[1],sys.argv[2],sys.argv[3]; pre=f"variants/{var}/"
+          tf=tarfile.open(fileobj=io.BytesIO(gzip.open(src,'rb').read()))
+          for m in tf.getmembers():
+              if m.name.startswith(pre) and not m.isdir():
+                  dst=os.path.join(stg,m.name[len(pre):]); os.makedirs(os.path.dirname(dst) or '.',exist_ok=True)
+                  open(dst,'wb').write(tf.extractfile(m).read())
+          PY
+          # engine binaries under bin/ (resolveBin looks at <module>/bin/<name> first):
+          install -m755 "$LEZ/wallet"                "$stg/bin/wallet-lez"
+          install -m755 module/scripts/wallet-wrapper "$stg/bin/wallet"
+          install -m755 "$LEZ/sequencer_service"      "$stg/bin/sequencer_service"
+          install -m755 "$LEZ/sequencer_service_l1"   "$stg/bin/sequencer_service_l1"
+          install -m755 "$DIA/diaphani-forward"        "$stg/bin/diaphani-forward" || true
+          # NOTE: medusa-tor is not built here - on mac the wallet falls back to a system `tor`
+          #       (resolveTorBin), and the "no Tor" disclaimer covers a machine without it.
+          mainfile=$(basename "$(ls "$stg"/*.dylib 2>/dev/null || ls "$stg"/*plugin* | head -1)")
+          cp "$mc" medusa_core-selfcontained.lgx; chmod u+w medusa_core-selfcontained.lgx
+          "$LGX" add medusa_core-selfcontained.lgx -v "${{ matrix.variant }}" -f "$stg" --main "$mainfile" -y
+          "$LGX" verify medusa_core-selfcontained.lgx
+
+      - name: Collect artifacts
+        run: |
+          dst="$PWD/artifacts"; mkdir -p "$dst"
+          cp medusa_core-selfcontained.lgx "$dst/medusa_core-${{ matrix.variant }}.lgx"
+          cp "$MACOUT"/medusa_ui.lgx "$dst/medusa_ui-${{ matrix.variant }}.lgx"
+          cp "$MACOUT"/tip_jar.lgx   "$dst/tip_jar-${{ matrix.variant }}.lgx"
+          ls -la "$dst"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-lgx-${{ matrix.variant }}
+          path: artifacts/*.lgx
+
+  # ── next step (do in paradox-modules-repo's release workflow) ──────────────
+  # Download these mac artifacts + the linux .lgx, then for each package:
+  #   lgx merge pkg-linux-amd64.lgx pkg-linux-amd64-dev.lgx pkg-darwin-arm64.lgx pkg-darwin-amd64.lgx -o pkg.lgx
+  # → one multi-variant .lgx per app; regenerate index.json; publish.

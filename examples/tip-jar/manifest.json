@@ -1,0 +1,13 @@
+{
+  "author": "Paradox Computer",
+  "category": "blockchain",
+  "dependencies": ["medusa_core"],
+  "description": "Tip Jar - a Connect-with-Medusa SDK demo (connect + tip)",
+  "icon": "qml/medusa-logo.png",
+  "main": {},
+  "manifestVersion": "0.2.0",
+  "name": "tip_jar",
+  "type": "ui_qml",
+  "version": "0.2.0",
+  "view": "qml/Main.qml"
+}

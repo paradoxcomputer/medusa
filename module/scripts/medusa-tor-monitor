@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Subscribe to the bundled Tor's control port and translate onion-client connection
+events (HS_DESC / CIRC) into a coarse progress stage, written to <datadir>/onion-stage.json.
+
+The wallet only ever connects to the sequencer onion, so every onion event here is for it.
+Usage: medusa-tor-monitor <tor-data-dir> <control-port>
+"""
+import binascii
+import json
+import os
+import socket
+import sys
+import time
+
+datadir = sys.argv[1] if len(sys.argv) > 1 else ""
+port = int(sys.argv[2]) if len(sys.argv) > 2 else 9251
+out = os.path.join(datadir, "onion-stage.json")
+
+
+def write_stage(stage, pct):
+    try:
+        with open(out, "w") as f:
+            json.dump({"stage": stage, "pct": pct}, f)
+    except OSError:
+        pass
+
+
+def connect_control():
+    # wait for the control port + cookie to exist (Tor still starting)
+    cookie_path = os.path.join(datadir, "control_auth_cookie")
+    for _ in range(120):
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=3)
+            cookie = open(cookie_path, "rb").read()
+            s.sendall(b"AUTHENTICATE " + binascii.hexlify(cookie) + b"\r\n")
+            if b"250" not in s.recv(256):
+                s.close(); time.sleep(1); continue
+            s.sendall(b"SETEVENTS HS_DESC CIRC\r\n")
+            s.recv(256)
+            return s
+        except (OSError, ValueError):
+            time.sleep(1)
+    return None
+
+
+def main():
+    s = connect_control()
+    if not s:
+        return
+    f = s.makefile("r", encoding="utf-8", errors="ignore")
+    for line in f:
+        line = line.strip()
+        if line.startswith("650 HS_DESC REQUESTED"):
+            write_stage("Fetching onion descriptor", 64)
+        elif line.startswith("650 HS_DESC RECEIVED"):
+            write_stage("Onion descriptor received", 78)
+        elif line.startswith("650 HS_DESC FAILED"):
+            write_stage("Retrying onion descriptor…", 60)
+        elif line.startswith("650 CIRC") and "HS_CLIENT_REND" in line:
+            if " LAUNCHED" in line or " EXTENDED" in line:
+                write_stage("Building rendezvous circuit", 86)
+            elif " BUILT" in line:
+                write_stage("Rendezvous circuit ready", 94)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass

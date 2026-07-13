@@ -1,0 +1,846 @@
+#!/usr/bin/env python3
+"""Medusa wallet wrapper - normalises wallet-lez output to JSON + adds ergonomics.
+
+The Basecamp wallet module calls `~/.local/bin/wallet` (this script) for every
+operation and expects JSON back. wallet-lez prints human-readable text, so this
+wrapper adapts it and smooths over a couple of on-chain lifecycle quirks:
+
+  • `account list -l`  → a clean JSON array of the wallet's OWN accounts
+                          [{id, type, balance, initialized, label}], dropping the
+                          shared "Preconfigured" genesis accounts.
+  • `pinata claim`     → auto-registers the recipient first. The faucet program
+                          credits without claiming, so the chain rejects an
+                          unregistered (default-owned) recipient; we run
+                          `auth-transfer init` for it when needed, then claim.
+  • everything else    → JSON passed through; otherwise success text is wrapped as
+                          {"ok": true, "output": …} and failures as {"error": …}.
+
+It also sets the wallet home + dev proving mode and seeds a config if missing.
+Point $WALLET_LEZ at the real wallet binary; $LOGOS_SEQUENCER at the sequencer.
+"""
+import json
+import os
+import random
+import re
+import subprocess
+import sys
+import time
+
+def _wallet_lez():
+    # Find the real wallet binary: $WALLET_LEZ wins; else next to this wrapper (a self-contained
+    # bundled install keeps wallet-lez in the same bin/ dir); else the dev-staged ~/.local/bin.
+    if os.environ.get("WALLET_LEZ"):
+        return os.environ["WALLET_LEZ"]
+    here = os.path.dirname(os.path.realpath(__file__))
+    bundled = os.path.join(here, "wallet-lez")
+    if os.path.isfile(bundled) and os.access(bundled, os.X_OK):
+        return bundled
+    return os.path.expanduser("~/.local/bin/wallet-lez")
+
+
+WALLET = _wallet_lez()
+
+home = os.environ.setdefault(
+    "LEE_WALLET_HOME_DIR",
+    # honor the rc4 name if an old setup still exports it, so plugin + CLI agree on ONE home
+    os.environ.get("NSSA_WALLET_HOME_DIR")
+    or os.path.expanduser("~/.local/share/medusa-wallet-home"),
+)
+os.environ.setdefault("RISC0_DEV_MODE", "1")
+os.makedirs(home, exist_ok=True)
+cfg = os.path.join(home, "wallet_config.json")
+if not os.path.exists(cfg):
+    with open(cfg, "w") as f:
+        json.dump(
+            {
+                "sequencer_addr": os.environ.get("LOGOS_SEQUENCER", "http://127.0.0.1:3071/"),
+                # Confirm window must cover a 60s-block zone (seq-testnet), not just the 15s
+                # devnet, or the CLI reports "Transaction not found in preconfigured amount
+                # of blocks" for txs that land in the very next block.
+                "seq_poll_timeout": "20s",
+                "seq_tx_poll_max_blocks": 8,
+                "seq_poll_max_retries": 8,
+                "seq_block_poll_max_amount": 200,
+            },
+            f,
+        )
+
+# Real STARK proofs (RISC0_DEV_MODE=0) on a busy machine take 20-40+ min (measured on a
+# half-loaded 16-core box: native ~20-35 min, token ~40 min). 30 min killed real proofs
+# mid-flight, so the budget is 60 min, overridable for slower hardware.
+PROOF_TMO = int(os.environ.get("MEDUSA_PROOF_TIMEOUT_S", "3600"))
+
+args = sys.argv[1:]
+# The module pipes the session password (+ newline) on stdin; read it once so it can
+# be fed to every wallet-lez invocation (some wrapper commands run more than one).
+pw = "" if sys.stdin.isatty() else sys.stdin.read()
+
+# Cap proof parallelism (RISC0/Rayon) EARLY - before any verb block can exec a prover.
+# (token-shield/token-deshield emit()+exit inside their blocks and would skip a cap set
+# in the passthrough tail.) At full tilt the prover grabs ~all cores for minutes, starves
+# the bundled Tor + UI, and the circuit to the sequencer drops ("disconnected from zone")
+# → the submit then times out. Leave ~4 cores; explicit env overrides win (setdefault).
+_is_privacy = any("Private/" in a for a in args) \
+    or (args[:1] and args[0] in ("token-shield", "token-deshield"))
+if _is_privacy:
+    _ncpu = os.cpu_count() or 4
+    os.environ.setdefault("RAYON_NUM_THREADS", str(max(2, _ncpu - 4)))
+
+
+def run(cmd, timeout=90):
+    # A hard timeout so a stuck wallet-lez call (e.g. a token op polling a failed tx)
+    # can never hang the whole wrapper command.
+    try:
+        return subprocess.run([WALLET, *cmd], capture_output=True, text=True, input=pw, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        return subprocess.CompletedProcess(cmd, 124, e.stdout or "", "timed out")
+
+
+# ── Token registry (the chain has no holding-enumeration primitive, so we track the
+#    token definitions this wallet knows about and probe each with `ata list`). ──
+def reg_path():
+    # Per-zone registry: tokens are zone-scoped (zone_key() defined below). A bare
+    # token_registry.json (legacy) is migrated into the active zone on first use.
+    return os.path.join(home, "token_registry-%s.json" % zone_key())
+
+
+def load_reg():
+    # One-time migration: the legacy single-file registry belonged to the default devnet
+    # zone - move it there exactly once so it never leaks into other zones.
+    legacy = os.path.join(home, "token_registry.json")
+    devnet = os.path.join(home, "token_registry-devnet.json")
+    if os.path.exists(legacy) and not os.path.exists(devnet):
+        try:
+            os.rename(legacy, devnet)
+        except OSError:
+            pass
+    try:
+        with open(reg_path()) as f:
+            r = json.load(f)
+        r.setdefault("definitions", [])
+        r.setdefault("names", {})
+        r.setdefault("vaults", {})   # def -> bare id of the wallet's DIRECT holding (shieldable)
+        # Private accounts we have EVER successfully sent a private OUTPUT to. rc5 rejects a
+        # fresh output onto any non-default private account - even a same-def token top-up is
+        # silently dropped on-chain AFTER the full client proof (verified live) - so these are
+        # one-shot destinations and must never be offered/used again.
+        r.setdefault("privateDests", [])
+        return r
+    except (OSError, ValueError):
+        return {"definitions": [], "names": {}, "vaults": {}, "privateDests": []}
+
+
+def save_reg(r):
+    # Atomic replace - a claim job and a UI poll can both touch the registry; a torn write
+    # would lose the vault map.
+    tmp = reg_path() + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(r, f)
+    os.replace(tmp, reg_path())
+
+
+def record_private_dest(dest):
+    """Remember a successfully-submitted private OUTPUT destination (one-shot on rc5)."""
+    reg = load_reg()
+    if dest not in reg["privateDests"]:
+        reg["privateDests"].append(dest)
+        save_reg(reg)
+
+
+def submitted(proc):
+    """True once the CLI printed a tx hash - the tx is in the sequencer's hands regardless
+    of what happens to the confirm poll or this client afterwards."""
+    return "transaction hash" in ((proc.stdout or "") + (proc.stderr or "")).lower()
+
+
+def token_name(reg, defid):
+    """Resolve + cache a token definition's human name (definitions are immutable)."""
+    if defid in reg["names"]:
+        return reg["names"][defid]
+    g = run(["account", "get", "--account-id", "Public/" + defid])
+    m = re.search(r'"name"\s*:\s*"([^"]+)"', g.stdout or "")
+    name = m.group(1) if m else (defid[:6] + "…")
+    reg["names"][defid] = name
+    save_reg(reg)
+    return name
+
+
+# ── Token faucet treasury - a separate wallet that mints the whitelist tokens, holds
+#    their supplies, and gives each claimant a random amount of each on `pinata claim`
+#    (a user wallet can't mint tokens it doesn't own the supply of). ──
+TREASURY_HOME = os.environ.get(
+    "MEDUSA_TREASURY_HOME", os.path.expanduser("~/.local/share/medusa-treasury")
+)
+
+
+def active_seq():
+    """The sequencer the user wallet is currently pointed at (per the active network)."""
+    try:
+        with open(os.path.join(home, "wallet_config.json")) as f:
+            return json.load(f).get("sequencer_addr", "http://127.0.0.1:3071/")
+    except (OSError, ValueError):
+        return os.environ.get("LOGOS_SEQUENCER", "http://127.0.0.1:3071/")
+
+
+def active_port():
+    m = re.search(r":(\d+)", active_seq())
+    return m.group(1) if m else "3071"
+
+
+def zone_key():
+    """A stable per-zone key for scoping the token registry/whitelist. The module writes
+    the active zone id into wallet_config.json; fall back to the sequencer port (so older
+    per-port treasuries keep working)."""
+    try:
+        with open(os.path.join(home, "wallet_config.json")) as f:
+            z = json.load(f).get("zone")
+        if z:
+            return re.sub(r"[^A-Za-z0-9_.-]", "_", str(z))
+    except (OSError, ValueError):
+        pass
+    return active_port()
+
+
+def faucet_config():
+    # Each zone has its OWN treasury/token set (faucet_tokens-<zone>.json). Built-in LOCAL
+    # zones may fall back to the legacy per-port file so already-bootstrapped treasuries
+    # still resolve; remote zones must NOT (they share port 3080 → would collide).
+    zk = zone_key()
+    by_zone = os.path.join(TREASURY_HOME, "faucet_tokens-%s.json" % zk)
+    if os.path.exists(by_zone):
+        return by_zone
+    if zk in ("devnet", "diaphani", "3071", "3077"):
+        return os.path.join(TREASURY_HOME, "faucet_tokens-%s.json" % active_port())
+    return by_zone   # remote/unknown zone: its own (likely absent) file → empty whitelist
+
+
+def load_whitelist():
+    try:
+        with open(faucet_config()) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
+def run_treasury(cmd):
+    """Run a wallet command AS THE TREASURY wallet, pointed at the user's active sequencer."""
+    os.makedirs(TREASURY_HOME, exist_ok=True)
+    # keep the treasury on the same network the user is on
+    tcfg = os.path.join(TREASURY_HOME, "wallet_config.json")
+    try:
+        c = json.load(open(tcfg)) if os.path.exists(tcfg) else {}
+    except (OSError, ValueError):
+        c = {}
+    c["sequencer_addr"] = active_seq()
+    for k, v in {"seq_poll_timeout": "20s", "seq_tx_poll_max_blocks": 8,
+                 "seq_poll_max_retries": 8, "seq_block_poll_max_amount": 200}.items():
+        c.setdefault(k, v)
+    json.dump(c, open(tcfg, "w"))
+    env = dict(os.environ, LEE_WALLET_HOME_DIR=TREASURY_HOME, LOGOS_SEQUENCER=active_seq())
+    try:
+        return subprocess.run([WALLET, *cmd], capture_output=True, text=True, input="\n", env=env, timeout=90)
+    except subprocess.TimeoutExpired as e:
+        return subprocess.CompletedProcess(cmd, 124, e.stdout or "", "timed out")
+
+
+def seed_whitelist(reg):
+    """Ensure the user's registry knows the whitelist tokens so they always show up."""
+    changed = False
+    for t in load_whitelist():
+        d = t["def"]
+        if d not in reg["definitions"]:
+            reg["definitions"].append(d)
+            changed = True
+        if d not in reg["names"]:
+            reg["names"][d] = t["name"]
+            changed = True
+    if changed:
+        save_reg(reg)
+    return reg
+
+
+def ata_balance(user_bare, defb):
+    """Current balance of the user's ATA for a definition, or None if the ATA is absent."""
+    res = run(["ata", "list", "--owner", user_bare, "--token-definition", defb])
+    m = re.search(r"\bbalance\s*(\d+)", res.stdout or "")
+    return int(m.group(1)) if m else None
+
+
+def poll_ata(user_bare, defb, predicate, timeout=150):
+    """Poll the user's ATA until `predicate(balance)` holds (block time can exceed the
+    CLI's tx-poll window, so dependent txs must wait for the state, not just rc=0).
+    The default window covers two 60s blocks with margin."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        bal = ata_balance(user_bare, defb)
+        if predicate(bal):
+            return bal
+        time.sleep(3)
+    return ata_balance(user_bare, defb)
+
+
+def faucet_tokens(user_id):
+    """Send the claimant a random amount of each whitelist token. Delivery target, in
+    order of preference:
+      1. the wallet's INITIALIZED direct vault holding for the def (tokens arrive
+         SHIELDABLE - keytree-signed). Only an EXISTING holding can receive from the
+         treasury: a cross-wallet credit to a pristine account is REJECTED on-chain
+         (the claiming tx needs the recipient key's co-signature, which only the
+         recipient wallet has - verified live).
+      2. the user's ATA (derived, always creditable) - the classic flow. These tokens
+         cannot shield on rc5 until an upstream fix or issuer-assisted route.
+    Returns [{ticker, amount}] (a credit landing after the poll window is under-reported;
+    balances catch up)."""
+    given = []
+    user_bare = user_id.split("/")[-1]
+    seed_whitelist(load_reg())          # make sure `tokens` knows these defs
+    for t in load_whitelist():
+        defb, sup = t["def"], t["sup"]
+        amt = random.randint(int(t.get("min", 10)), int(t.get("max", 500)))
+        vault = vault_for(defb)
+        if vault and holding_state(vault)[0] == defb:
+            _d, before = holding_state(vault)
+            before = before or 0
+            run_treasury(["token", "send", "--from", "Public/" + sup,
+                          "--to", "Public/" + vault, "--amount", str(amt)])
+            landed = poll_holding(vault, defb, lambda b: b is not None and b > before)
+            if landed is not None and landed > before:
+                given.append({"ticker": t["name"], "amount": amt})
+            continue
+        # ATA fallback - recipient creates its OWN ATA (it holds the owner key); the
+        # treasury only spends the supply. `run` is the user's home (the claim runs there).
+        before = ata_balance(user_bare, defb) or 0
+        run(["ata", "create", "--owner", "Public/" + user_bare, "--token-definition", defb])
+        poll_ata(user_bare, defb, lambda b: b is not None)        # ATA exists (balance >= 0)
+        addr = run(["ata", "address", "--owner", user_bare, "--token-definition", defb])
+        m = re.search(r"([1-9A-HJ-NP-Za-km-z]{40,46})", addr.stdout or "")
+        if not m:
+            continue
+        run_treasury(["token", "send", "--from", "Public/" + sup,
+                      "--to", "Public/" + m.group(1), "--amount", str(amt)])
+        landed = poll_ata(user_bare, defb, lambda b: b is not None and b > before)
+        if landed is not None and landed > before:
+            given.append({"ticker": t["name"], "amount": amt})
+    return given
+
+
+def emit(proc):
+    out = (proc.stdout or "").strip()
+    try:
+        json.loads(out)
+        print(out)
+    except (json.JSONDecodeError, ValueError):
+        if proc.returncode != 0:
+            msg = (proc.stderr or "").strip() or out or f"wallet command failed (exit {proc.returncode})"
+            msg = msg.replace("Input password: ", "").replace("Input recovery phrase: ", "").strip()
+            print(json.dumps({"error": msg}))
+        else:
+            print(json.dumps({"ok": True, "output": out}))
+    sys.exit(proc.returncode)
+
+
+def id_arg():
+    for i, a in enumerate(args):
+        if a in ("--to", "--account-id") and i + 1 < len(args):
+            return args[i + 1]
+    return None
+
+
+# ── Token privacy (shield / deshield) ────────────────────────────────────────
+def owned_accounts():
+    """The wallet's own accounts as rc5's `account list --json` array (or [])."""
+    res = run(["account", "list", "--json"], timeout=45)
+    try:
+        a = json.loads((res.stdout or "").strip())
+        return a if isinstance(a, list) else []
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+
+def private_dest_block(dest):
+    """LEZ v0.2.0-rc5 rejects a private OUTPUT onto any non-default private account: the
+    native circuit guest-panics client-side, and a token output (even SAME-def) proves
+    fine locally but is silently dropped on-chain (verified live - vault balance never
+    moved). Refuse early. Two signals: our registry of past private destinations (catches
+    token-note accounts the native `account list` can't see), and the account list's
+    initialized/balance for native state. Foreign destinations pass through."""
+    if not dest.startswith("Private/"):
+        return None
+    if dest in (load_reg().get("privateDests") or []):
+        return ("this private account already received a private transfer - LEZ v0.2.0-rc5 "
+                "private accounts are one-shot recipients; create a fresh private account")
+    for a in owned_accounts():
+        if a.get("id") == dest and (a.get("initialized") or (a.get("balance") or 0) > 0):
+            return ("recipient private account already holds funds/state - LEZ v0.2.0-rc5 "
+                    "requires an EMPTY private recipient; create a fresh private account")
+    return None
+
+
+def direct_holding_for(defb, need):
+    """Find a direct-owned PUBLIC token-holding account of `defb` with balance >= need.
+    (A holding whose key IS in the keytree - e.g. a supply account from `token new`.
+    ATAs don't qualify: they are PDAs and cannot sign a private send.)
+    Returns (bare_id, None) on success, else (None, best_short_balance | None) so the
+    caller can tell "no holding at all" from "holding exists but short"."""
+    best = None
+    for h in direct_holdings_list():
+        if h["definitionId"] != defb:
+            continue
+        bal = int(h["balance"])
+        if bal >= need:
+            return h["account"], None
+        best = bal if best is None else max(best, bal)
+    return None, best
+
+
+def holding_state(bare):
+    """(definition_id, balance) if the account is a DIRECT token holding; ("", None) if
+    pristine/uninitialized (claimable by the token program on first credit); (None, None)
+    otherwise (another program's account / unreadable)."""
+    g = run(["account", "get", "--account-id", "Public/" + bare])
+    out = g.stdout or ""
+    if g.returncode != 0 and not out.strip():
+        return "?", None   # transient read failure - callers keep any prior designation
+    m = re.search(r'"definition_id"\s*:\s*"([^"]+)"\s*,\s*"balance"\s*:\s*(\d+)', out)
+    if "owned by token program" in out and m:
+        return m.group(1), int(m.group(2))
+    if "Uninitialized" in out:
+        return "", None
+    return None, None
+
+
+def poll_holding(bare, defb, predicate, timeout=150):
+    """Poll a direct holding's balance (None while not a holding of defb yet). The window
+    covers two 60s blocks with margin, like poll_ata."""
+    deadline = time.time() + timeout
+    val = None
+    while time.time() < deadline:
+        d, b = holding_state(bare)
+        val = b if d == defb else None
+        if predicate(val):
+            return val
+        time.sleep(3)
+    return val
+
+
+def direct_holdings_list():
+    """All DIRECT-owned token holdings: [{definitionId, ticker, balance, account}]."""
+    reg = load_reg()
+    out = []
+    for a in owned_accounts():
+        if (a.get("type") or "public") != "public":
+            continue
+        bare = (a.get("id") or "").split("/")[-1]
+        if not bare:
+            continue
+        d, b = holding_state(bare)
+        if d:
+            out.append({"definitionId": d, "ticker": token_name(reg, d),
+                        "balance": str(b), "account": bare})
+    return out
+
+
+def vault_for(defb):
+    """The wallet's designated DIRECT holding for a definition (registry-recorded; the
+    faucet prefers it so tokens arrive SHIELDABLE). Falls back to any existing direct
+    holding. Never mints one: a pristine account can only be claimed by a SAME-WALLET
+    `token send` from a direct holding (cross-wallet credits to pristine accounts are
+    rejected on-chain - the claim needs the recipient key's co-signature), so a wallet
+    without a direct holding cannot bootstrap a vault. Returns the bare id, or None."""
+    reg = load_reg()
+    bare = (reg.get("vaults") or {}).get(defb)
+    pristine = None
+    if bare:
+        d, _b = holding_state(bare)
+        if d == defb or d == "?":   # real holding of this def, or a transient read failure
+            return bare
+        if d == "":
+            pristine = bare         # recorded but never credited - an INITIALIZED holding
+                                    # of this def (scan below) must take precedence, or the
+                                    # pristine record shadows real funds forever
+    for h in direct_holdings_list():
+        if h["definitionId"] == defb:
+            reg.setdefault("vaults", {})[defb] = h["account"]
+            save_reg(reg)
+            return h["account"]
+    return pristine
+
+
+# `account list [-l]` → rc5's native --json array [{id,type,balance,initialized,label}].
+if len(args) >= 2 and args[0] == "account" and args[1] in ("list", "ls"):
+    # rc5 emits the clean JSON array directly with --json (balances fetched from the chain).
+    # Over a slow zone (diaphani/Tor) give it a generous window; the module calls this async.
+    res = run(["account", "list", "--json"], timeout=(45 if zone_key() == "diaphani" else 20))
+    out = (res.stdout or "").strip()
+    try:
+        json.loads(out)            # the wallet emitted the JSON array - pass it through
+        print(out)
+    except (json.JSONDecodeError, ValueError):
+        emit(res)                  # auth failure (wrong password) / unreachable - surface it
+    sys.exit(0)
+
+# `token new …` → run it, then record the new definition id so the wallet can show
+# holdings of it later (the chain can't enumerate them). The def account stays fresh.
+if len(args) >= 2 and args[0] == "token" and args[1] == "new":
+    proc = run(args)
+    for i, a in enumerate(args):
+        if a == "--definition-account-id" and i + 1 < len(args):
+            reg = load_reg()
+            defid = args[i + 1].split("/")[-1]
+            if defid not in reg["definitions"]:
+                reg["definitions"].append(defid)
+                save_reg(reg)
+    emit(proc)
+
+# `tokens <account-id>` (wrapper verb) → JSON array of the account's token holdings
+# across every registered definition: [{definitionId, ticker, balance}].
+if args and args[0] == "tokens":
+    reg = seed_whitelist(load_reg())
+    owner_bare = (args[1].split("/")[-1] if len(args) > 1 else "")
+    holdings = []
+    if owner_bare and reg["definitions"]:
+        res = run(["ata", "list", "--owner", owner_bare, "--token-definition", *reg["definitions"]])
+        balances = {}
+        for line in (res.stdout or "").splitlines():
+            m = re.match(r"\s*ATA\s+\S+\s+\(definition\s+(\S+)\):\s*balance\s*(\d+)", line)
+            if m:
+                balances[m.group(1)] = m.group(2)
+        # Return EVERY registered token (whitelist + manually added). The DESIGNATED vault
+        # (direct holding - where the faucet delivers, shieldable) counts toward the
+        # balance; the ATA remainder is reported separately so a consolidate can move it.
+        vaults = reg.get("vaults") or {}
+        for defid in reg["definitions"]:
+            ata_b = int(balances.get(defid, "0"))
+            v_b = 0
+            vb = vaults.get(defid)
+            if vb:
+                d, b = holding_state(vb)
+                if d == defid:
+                    v_b = b
+            holdings.append({"definitionId": defid, "ticker": token_name(reg, defid),
+                             "balance": str(ata_b + v_b),
+                             "ataBalance": str(ata_b), "vaultBalance": str(v_b)})
+    print(json.dumps(holdings))
+    sys.exit(0)
+
+# `whitelist` (wrapper verb) → the curated token list the treasury offers: [{name, def}].
+if args and args[0] == "whitelist":
+    print(json.dumps([{"name": t["name"], "def": t["def"]} for t in load_whitelist()]))
+    sys.exit(0)
+
+# `token-transfer <from-owner> <to-owner> <def> <amount>` → move a token from the sender's
+# ATA to the recipient's ATA: derive both ATAs, create the recipient's (permissionless,
+# idempotent), token-send from the sender's ATA, and WAIT for the balance to land.
+if args and args[0] == "token-transfer" and len(args) >= 5:
+    frm = args[1].split("/")[-1]
+    to = args[2].split("/")[-1]
+    defb = args[3].split("/")[-1]
+    amt = args[4]
+
+    def ata_addr(owner):
+        r = run(["ata", "address", "--owner", owner, "--token-definition", defb])
+        m = re.search(r"([1-9A-HJ-NP-Za-km-z]{40,46})", r.stdout or "")
+        return m.group(1) if m else None
+
+    # Ensure the recipient's ATA exists (permissionless, idempotent - the ATA stays the
+    # derivable "anyone can pay you" address for foreign recipients), then send: prefer
+    # the wallet's DIRECT vault as the source (`token send`, keytree-signed) and fall
+    # back to the sender-owner's ATA (`ata send`, owner-authorized - `token send --from
+    # <ATA>` fails because the PDA's key isn't in the keytree).
+    recip_ata = ata_addr(to)
+    if not recip_ata:
+        print(json.dumps({"error": "could not derive recipient token account"}))
+        sys.exit(1)
+    run(["ata", "create", "--owner", "Public/" + to, "--token-definition", defb])
+    if poll_ata(to, defb, lambda b: b is not None) is None:
+        print(json.dumps({"error": "recipient token account did not appear on-chain - "
+                                   "retry in a minute"}))
+        sys.exit(1)
+    before = ata_balance(to, defb) or 0
+    v = vault_for(defb)
+    vd, vb = holding_state(v) if v else (None, None)
+    vault_ok = (vd == defb)
+    vb = vb or 0
+    ata_src = ata_balance(frm, defb) or 0
+    try:
+        amt_n = int(amt)
+    except ValueError:
+        amt_n = None
+    if amt_n is not None and vault_ok and vb >= amt_n:
+        snd = run(["token", "send", "--from", "Public/" + v,
+                   "--to", "Public/" + recip_ata, "--amount", amt], timeout=300)
+    elif amt_n is not None and ata_src >= amt_n:
+        snd = run(["ata", "send", "--from", "Public/" + frm,
+                   "--token-definition", defb, "--to", recip_ata, "--amount", amt])
+    elif amt_n is not None and vault_ok and vb + ata_src >= amt_n:
+        # SPLIT balance - the UI advertises ATA+vault as one number, so honor it:
+        # consolidate the sender's ATA into the vault first, then send from the vault.
+        move = amt_n - vb
+        run(["ata", "send", "--from", "Public/" + frm, "--token-definition", defb,
+             "--to", v, "--amount", str(move)], timeout=300)
+        if poll_holding(v, defb, lambda b: b is not None and b >= vb + move) is None:
+            print(json.dumps({"error": "consolidating the split balance did not land - "
+                                       "retry in a minute"}))
+            sys.exit(1)
+        snd = run(["token", "send", "--from", "Public/" + v,
+                   "--to", "Public/" + recip_ata, "--amount", amt], timeout=300)
+    elif amt_n is not None:
+        print(json.dumps({"error": "insufficient token balance: vault %d + ATA %d < %d"
+                          % (vb if vault_ok else 0, ata_src, amt_n)}))
+        sys.exit(1)
+    else:
+        snd = run(["ata", "send", "--from", "Public/" + frm,
+                   "--token-definition", defb, "--to", recip_ata, "--amount", amt])
+    landed = poll_ata(to, defb, lambda b: b is not None and b > before)
+    if landed is not None and landed > before:
+        print(json.dumps({"ok": True, "output": "sent " + amt}))
+        sys.exit(0)
+    if submitted(snd):
+        # In the sequencer's hands - balances catch up. Reporting an error here invites a
+        # UI retry that would DOUBLE-SEND from the vault.
+        print(json.dumps({"ok": True, "output": "sent " + amt, "pending": True}))
+        sys.exit(0)
+    msg = (snd.stderr or snd.stdout or "token transfer did not land").strip()
+    print(json.dumps({"error": msg.replace("Input password: ", "").strip()}))
+    sys.exit(1)
+
+# `token-shield <from-owner> <to-private> <def> <amount>` → shield tokens into a private
+# account. The signing source must be a DIRECT-OWNED token holding (protocol limitation:
+# an ATA is a PDA and can't sign, and `ata send` only takes public recipients), so resolve
+# one; if the wallet has none, fail with the truth instead of a circuit guest-panic.
+# NOTE: <from-owner> is advisory (kept for the module's job record) - holdings are
+# wallet-global, so the ACTUAL debited account is the resolved direct holding.
+if args and args[0] == "token-shield" and len(args) >= 5:
+    dest = args[2] if args[2].startswith("Private/") else "Private/" + args[2].split("/")[-1]
+    defb = args[3].split("/")[-1]
+    try:
+        amt = int(args[4])
+    except ValueError:
+        print(json.dumps({"error": "amount must be a whole number"})); sys.exit(1)
+    blocked = private_dest_block(dest)
+    if blocked:
+        print(json.dumps({"error": blocked})); sys.exit(1)
+    src, short = direct_holding_for(defb, amt)
+    if not src:
+        # AUTO-CONSOLIDATE: the vault is short but the requesting owner's ATA may cover
+        # the difference - top the vault up with one public ata-send first, so a combined
+        # balance still shields in a single user action. The deficit is measured against
+        # the VAULT itself (not the largest holding - they differ on issuer wallets).
+        owner = args[1].split("/")[-1]
+        vault = vault_for(defb)
+        vd, vb = holding_state(vault) if vault else (None, None)
+        if vd == defb:
+            need = amt - (vb or 0)
+            ata_b = ata_balance(owner, defb) or 0
+            if 0 < need <= ata_b:
+                run(["ata", "send", "--from", "Public/" + owner, "--token-definition", defb,
+                     "--to", vault, "--amount", str(need)], timeout=300)
+                poll_holding(vault, defb, lambda b: b is not None and b >= (vb or 0) + need)
+                src, short = direct_holding_for(defb, amt)
+    if not src:
+        if short is not None:
+            msg = ("your directly-owned holding of this token has only %d - reduce the "
+                   "amount (tokens sitting in an ATA can't top it up for shielding on "
+                   "LEZ v0.2.0-rc5)" % short)
+        else:
+            msg = ("no directly-owned holding of this token - tokens held in an associated "
+                   "token account (ATA) cannot be shielded on LEZ v0.2.0-rc5 (an ATA cannot "
+                   "sign a private send and `ata send` is public-only); mint or receive the "
+                   "token into a direct holding first")
+        print(json.dumps({"error": msg})); sys.exit(1)
+    res = run(["token", "send", "--from", "Public/" + src, "--to", dest,
+               "--amount", str(amt)], timeout=PROOF_TMO)
+    if submitted(res):
+        record_private_dest(dest)   # one-shot recipient on rc5 - never offer it again
+    emit(res)
+
+# `token-deshield <from-private> <to-owner> <def> <amount>` → deshield tokens to the
+# recipient owner's ATA: sync the private tree, ensure the ATA exists (permissionless,
+# idempotent), then send from the private note to the ATA (proven recipient shape).
+if args and args[0] == "token-deshield" and len(args) >= 5:
+    frm = args[1] if args[1].startswith("Private/") else "Private/" + args[1].split("/")[-1]
+    to_owner = args[2].split("/")[-1]
+    defb = args[3].split("/")[-1]
+    amt = args[4]
+    run(["account", "sync-private"], timeout=900)
+    run(["ata", "create", "--owner", "Public/" + to_owner, "--token-definition", defb],
+        timeout=300)
+    if poll_ata(to_owner, defb, lambda b: b is not None) is None:
+        # A send to a non-existing holding is REJECTED on-chain - don't burn an hour-long
+        # proof on a doomed tx; fail truthfully at the poll window instead.
+        print(json.dumps({"error": "recipient token account did not appear on-chain "
+                                   "(ata create unconfirmed) - retry in a minute"}))
+        sys.exit(1)
+    addr = run(["ata", "address", "--owner", to_owner, "--token-definition", defb])
+    m = re.search(r"([1-9A-HJ-NP-Za-km-z]{40,46})", addr.stdout or "")
+    if not m:
+        print(json.dumps({"error": "could not derive recipient token account"})); sys.exit(1)
+    emit(run(["token", "send", "--from", frm, "--to", "Public/" + m.group(1),
+              "--amount", amt], timeout=PROOF_TMO))
+
+# `direct-holdings` (wrapper verb) → the wallet's DIRECT-owned token holdings (keytree-
+# signable, e.g. supply accounts from `token new`): [{definitionId, ticker, balance,
+# account}]. These are the only accounts that can SOURCE a token shield on rc5 - the UI's
+# shield asset picker is fed from this, so it never offers un-shieldable ATA balances.
+if args and args[0] == "direct-holdings":
+    reg = load_reg()
+    out = direct_holdings_list()
+    # Per-def ATA totals across owned public accounts - the "unshielded" remainder a
+    # consolidate (or the token-shield auto-top-up) can move into the vault.
+    defs = sorted({h["definitionId"] for h in out} | set(reg["definitions"]))
+    ata_tot = {}
+    if defs:
+        for a in owned_accounts():
+            if (a.get("type") or "public") != "public":
+                continue
+            bare = (a.get("id") or "").split("/")[-1]
+            if not bare:
+                continue
+            res = run(["ata", "list", "--owner", bare, "--token-definition", *defs])
+            for line in (res.stdout or "").splitlines():
+                m = re.match(r"\s*ATA\s+\S+\s+\(definition\s+(\S+)\):\s*balance\s*(\d+)", line)
+                if m:
+                    ata_tot[m.group(1)] = ata_tot.get(m.group(1), 0) + int(m.group(2))
+    for h in out:
+        h["ataTotal"] = str(ata_tot.get(h["definitionId"], 0))
+    print(json.dumps(out))
+    sys.exit(0)
+
+# `consolidate <owner> <def>` (wrapper verb) → move the owner's ATA balance of a token
+# into the wallet's direct vault holding, making it SHIELDABLE. The vault must already
+# EXIST as a holding (a faucet claim / any direct credit seeds it) - the chain rejects
+# ata-sends to non-holding accounts (verified).
+if args and args[0] == "consolidate" and len(args) >= 3:
+    owner = args[1].split("/")[-1]
+    defb = args[2].split("/")[-1]
+    bal = ata_balance(owner, defb) or 0
+    if bal <= 0:
+        print(json.dumps({"error": "no ATA balance of this token to consolidate"})); sys.exit(1)
+    vault = vault_for(defb)
+    if not vault or holding_state(vault)[0] != defb:
+        print(json.dumps({"error": "no initialized vault holding for this token yet - claim "
+                          "from the faucet (or receive a direct send) once, then retry"}))
+        sys.exit(1)
+    before = holding_state(vault)[1] or 0
+    snd = run(["ata", "send", "--from", "Public/" + owner, "--token-definition", defb,
+               "--to", vault, "--amount", str(bal)], timeout=300)
+    landed = poll_holding(vault, defb, lambda b: b is not None and b > before)
+    if landed is not None and landed > before:
+        print(json.dumps({"ok": True, "moved": bal, "vault": vault,
+                          "vaultBalance": str(landed)}))
+        sys.exit(0)
+    if submitted(snd):
+        print(json.dumps({"ok": True, "moved": bal, "vault": vault, "pending": True}))
+        sys.exit(0)
+    msg = (snd.stderr or snd.stdout or "consolidate did not land").strip()
+    print(json.dumps({"error": msg.replace("Input password: ", "").strip()})); sys.exit(1)
+
+# `token-registry list` / `token-registry add <def-id>` (wrapper verbs) → manage the
+# set of known token definitions (for tokens the user received but didn't mint).
+if args and args[0] == "token-registry":
+    reg = load_reg()
+    if len(args) >= 3 and args[1] == "add":
+        defid = args[2].split("/")[-1]
+        # 1) format: a base58-encoded 32-byte account id is ~32-44 chars, base58 alphabet.
+        if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,50}", defid):
+            print(json.dumps({"error": "not a valid token id (expected a base58 account id)"}))
+            sys.exit(1)
+        # 2) existence: the definition account must exist on this zone (best-effort - if the
+        #    sequencer can't be reached we don't block, but a definitively-absent id is rejected).
+        info = run(["account", "get", "--account-id", "Public/" + defid])
+        out = (info.stdout or "") + (info.stderr or "")
+        if info.returncode == 0 and "Uninitialized" in out:
+            print(json.dumps({"error": "no token with this id exists on this zone"}))
+            sys.exit(1)
+        if defid not in reg["definitions"]:
+            reg["definitions"].append(defid)
+            save_reg(reg)
+        print(json.dumps({"ok": True, "definitionId": defid}))
+        sys.exit(0)
+    print(json.dumps({"definitions": reg["definitions"], "names": reg["names"],
+                      "vaults": reg.get("vaults", {}),
+                      "privateDests": reg.get("privateDests", [])}))
+    sys.exit(0)
+
+# `pinata claim --to <id>` → register the recipient first if the chain has no record
+# of it yet (auth-transfer init is free + needs no proof), claim the native LEZ, then
+# have the treasury drop a random amount of each whitelist token on the same account.
+if len(args) >= 2 and args[0] == "pinata" and args[1] == "claim":
+    to = id_arg()
+    # The claim is a background job (30-min budget in the module), so the per-call cap here
+    # is the only artificial limit. Over Tor the init + the pinata PoW/submit/confirm each
+    # take a while, so give them generous windows instead of the default 90s.
+    if to:
+        got = run(["account", "get", "--account-id", to])
+        if "Uninitialized" in (got.stdout or ""):
+            run(["auth-transfer", "init", "--account-id", to], timeout=180)
+    claim = run(args, timeout=240)
+    out = (claim.stdout or "").strip()
+    # RESILIENCE: the PoW + tx submission happen BEFORE the confirmation poll. Once a
+    # "Transaction hash" is printed the tx is SUBMITTED - the sequencer will commit it
+    # regardless of what happens to this client afterwards. So a poll timeout / client
+    # disconnect must NOT be reported as failure: the claim "runs in the sequencer".
+    ok = (claim.returncode == 0) or submitted(claim)
+    # Token distribution is best-effort - never let it block or fail the LEZ claim.
+    try:
+        given = faucet_tokens(to) if (to and ok) else []
+    except Exception:
+        given = []
+    if ok:
+        res = {"ok": True, "output": out, "tokens": given}
+        if claim.returncode != 0:
+            res["pending"] = True   # submitted but not client-confirmed; the balance catches up
+        print(json.dumps(res))
+        sys.exit(0)
+    msg = (claim.stderr or "").strip() or out or "faucet claim failed"
+    print(json.dumps({"error": msg.replace("Input password: ", "").strip(), "tokens": given}))
+    sys.exit(claim.returncode)
+
+# A private SPEND (sending FROM a Private account: private→private or deshield) proves the
+# sender's commitment is in the on-chain tree. If the wallet's local tree is stale, that
+# membership proof is built against the wrong root and the sequencer rejects the tx with
+# InvalidPrivacyPreservingProof. So auto-sync the private state first (idempotent; the manual
+# "sync" button is easy to forget). A shield (--from Public/) needs no sync - it's a new commit.
+def _sends_from_private(a):
+    for i in range(len(a) - 1):
+        if a[i] == "--from" and a[i + 1].startswith("Private/"):
+            return True
+    return False
+
+# Refuse a private OUTPUT onto a non-default OWNED private account up front - the rc5
+# circuit guest-panics on it mid-proof otherwise (applies to shield and private→private,
+# native and token alike). Checked BEFORE the sync hook: rejecting a bad destination
+# must not cost the caller a multi-minute chain scan first.
+if "send" in args:
+    for _i in range(len(args) - 1):
+        if args[_i] == "--to" and args[_i + 1].startswith("Private/"):
+            _blocked = private_dest_block(args[_i + 1])
+            if _blocked:
+                print(json.dumps({"error": _blocked})); sys.exit(1)
+            break
+
+if "send" in args and _sends_from_private(args):
+    # scan+decrypt → tree matches the chain. A first FULL sync of a mature chain takes
+    # minutes (measured 353s on ~2700 blocks), so give it a proper budget.
+    run(["account", "sync-private"], timeout=900)
+
+# Everything else: pass JSON through; wrap text as {ok,output} / {error}.
+# (The Rayon proof-parallelism cap for privacy ops is applied at startup, near the top.)
+# Timeout budget: privacy send = real STARK (up to PROOF_TMO); public send = submit +
+# confirm-poll over Tor (+ maybe a recipient init), which can exceed 90s on a slow link;
+# a standalone private-state sync scans the whole chain (minutes); everything else 90s.
+if "send" in args:
+    _tmo = PROOF_TMO if _is_privacy else 300
+elif args[:2] == ["account", "sync-private"]:
+    _tmo = 900
+else:
+    _tmo = 90
+_res = run(args, timeout=_tmo)
+if "send" in args and submitted(_res):
+    # A submitted private OUTPUT makes its destination one-shot-used (see
+    # private_dest_block) - remember it so it is never offered/used again.
+    for _i in range(len(args) - 1):
+        if args[_i] == "--to" and args[_i + 1].startswith("Private/"):
+            record_private_dest(args[_i + 1])
+            break
+emit(_res)

@@ -1,0 +1,16 @@
+{
+  "name": "tip_jar",
+  "version": "0.2.0",
+  "type": "ui_qml",
+  "category": "blockchain",
+  "description": "Tip Jar: a Connect-with-Medusa SDK demo (connect + tip)",
+  "view": "qml/Main.qml",
+  "icon": "qml/medusa-logo.png",
+  "dependencies": ["medusa_core"],
+
+  "nix": {
+    "packages": { "build": [], "runtime": [] },
+    "external_libraries": [],
+    "cmake": { "find_packages": [], "extra_sources": [], "extra_include_dirs": [], "extra_link_libraries": [] }
+  }
+}

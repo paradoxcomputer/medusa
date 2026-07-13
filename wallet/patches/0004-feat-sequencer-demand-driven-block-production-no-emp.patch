@@ -1,0 +1,123 @@
+From d35ff92ae2186918d44dc4cfc47b93b8646cc427 Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Mon, 22 Jun 2026 14:40:48 +0000
+Subject: [PATCH 4/5] =?UTF-8?q?feat(sequencer):=20demand-driven=20block=20?=
+ =?UTF-8?q?production=20=E2=80=94=20no=20empty=20clock-only=20blocks?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+build_block_from_mempool returns None when there are no user transactions (checked before
+mutating state / advancing chain height); produce_new_block + the service main loop skip
+publishing in that case. This stops the channel from bloating with a clock-only block every
+3s, which had made wallet private-state syncs huge + slow over Tor (and crashed the app on
+the blocking sync). Blocks are now minted only on real activity (faucet/shield/transfer).
+Verified: 0 blocks in 20s idle; faucet still mints + lands (150 LEZ claimed).
+---
+ sequencer/core/src/lib.rs     | 24 ++++++++++++++++++------
+ sequencer/service/src/lib.rs  |  9 ++++-----
+ sequencer/service/src/main.rs |  2 +-
+ 3 files changed, 23 insertions(+), 12 deletions(-)
+
+diff --git a/sequencer/core/src/lib.rs b/sequencer/core/src/lib.rs
+index bce8151..2012bbc 100644
+--- a/sequencer/core/src/lib.rs
++++ b/sequencer/core/src/lib.rs
+@@ -197,10 +197,14 @@ impl<BP: BlockPublisherTrait> SequencerCore<BP> {
+     }
+ 
+     /// Produces a new block from mempool transactions and publishes it via zone-sdk.
+-    pub async fn produce_new_block(&mut self) -> Result<u64> {
+-        let block = self
++    /// Returns `None` when there were no user transactions (demand-driven - nothing minted).
++    pub async fn produce_new_block(&mut self) -> Result<Option<u64>> {
++        let Some(block) = self
+             .build_block_from_mempool()
+-            .context("Failed to build block from mempool transactions")?;
++            .context("Failed to build block from mempool transactions")?
++        else {
++            return Ok(None);
++        };
+ 
+         // TODO: Remove msg_id from store.update — it is no longer needed now that
+         // zone-sdk manages L1 settlement state via its own checkpoint.
+@@ -211,12 +215,14 @@ impl<BP: BlockPublisherTrait> SequencerCore<BP> {
+         }
+         self.store.update(&block, placeholder_msg_id, &self.state)?;
+ 
+-        Ok(self.chain_height)
++        Ok(Some(self.chain_height))
+     }
+ 
+     /// Builds a new block from transactions in the mempool.
+     /// Does NOT publish or store the block — the caller is responsible for that.
+-    pub fn build_block_from_mempool(&mut self) -> Result<Block> {
++    /// Returns `None` when there are no user transactions (demand-driven: we don't mint
++    /// clock-only empty blocks, which would bloat the channel + make wallet syncs huge).
++    pub fn build_block_from_mempool(&mut self) -> Result<Option<Block>> {
+         let now = Instant::now();
+ 
+         let new_block_height = self.next_block_id();
+@@ -293,6 +299,12 @@ impl<BP: BlockPublisherTrait> SequencerCore<BP> {
+             }
+         }
+ 
++        // Demand-driven: nothing real to include → produce no block (skip the clock-only
++        // empty block entirely, before mutating state or advancing the chain height).
++        if valid_transactions.is_empty() {
++            return Ok(None);
++        }
++
+         // Append the Clock Program invocation as the mandatory last transaction.
+         self.state
+             .transition_from_public_transaction(&clock_tx, new_block_height, new_block_timestamp)
+@@ -320,7 +332,7 @@ impl<BP: BlockPublisherTrait> SequencerCore<BP> {
+             hashable_data.transactions.len(),
+             now.elapsed().as_secs()
+         );
+-        Ok(block)
++        Ok(Some(block))
+     }
+ 
+     pub const fn state(&self) -> &nssa::V03State {
+diff --git a/sequencer/service/src/lib.rs b/sequencer/service/src/lib.rs
+index 319b75a..7cd7632 100644
+--- a/sequencer/service/src/lib.rs
++++ b/sequencer/service/src/lib.rs
+@@ -169,16 +169,15 @@ async fn main_loop(seq_core: Arc<Mutex<SequencerCore>>, block_timeout: Duration)
+     loop {
+         tokio::time::sleep(block_timeout).await;
+ 
+-        info!("Collecting transactions from mempool, block creation");
+-
+         let id = {
+             let mut state = seq_core.lock().await;
+ 
+             state.produce_new_block().await?
+         };
+ 
+-        info!("Block with id {id} created");
+-
+-        info!("Waiting for new transactions");
++        // Demand-driven: only announce when a block was actually minted (user txs present).
++        if let Some(id) = id {
++            info!("Block with id {id} created");
++        }
+     }
+ }
+diff --git a/sequencer/service/src/main.rs b/sequencer/service/src/main.rs
+index e78ad50..7181a5a 100644
+--- a/sequencer/service/src/main.rs
++++ b/sequencer/service/src/main.rs
+@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
+             info!("Shutting down sequencer...");
+         }
+         Err(err) = sequencer_handle.failed() => {
+-            error!("Sequencer failed unexpectedly: {err}");
++            error!("Sequencer failed unexpectedly: {err:#}");
+         }
+     }
+ 
+-- 
+2.34.1
+

@@ -1,0 +1,81 @@
+From 7c1a795293e46317f0683729b542896bd245cc53 Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Mon, 22 Jun 2026 22:24:31 +0000
+Subject: [PATCH 5/5] feat(sequencer): make demand-driven block production a
+ config flag (default off)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Previously the sequencer always skipped empty (clock-only) blocks - a hard fork of the
+upstream behavior. Now it's `demand_driven` in SequencerConfig (serde default false =
+upstream-standard: a block every block_create_timeout with the mandatory clock tx, even idle).
+Set demand_driven:true to opt into skipping empty intervals (keeps the channel lean for
+thin-client/over-Tor wallets, at the cost of the clock only advancing on real txs). The wire
+format / validation are unchanged, so the wallet works against either mode. Test configs pin
+demand_driven:false (standard) so existing produce_new_block tests keep their semantics.
+---
+ integration_tests/src/config.rs | 1 +
+ sequencer/core/src/config.rs    | 6 ++++++
+ sequencer/core/src/lib.rs       | 9 ++++++---
+ 3 files changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/integration_tests/src/config.rs b/integration_tests/src/config.rs
+index 7b3825d..55a78c5 100644
+--- a/integration_tests/src/config.rs
++++ b/integration_tests/src/config.rs
+@@ -186,6 +186,7 @@ pub fn sequencer_config(
+         mempool_max_size,
+         block_create_timeout,
+         retry_pending_blocks_timeout: Duration::from_secs(5),
++        demand_driven: false,
+         initial_public_accounts: Some(initial_data.sequencer_initial_public_accounts()),
+         initial_private_accounts: Some(initial_data.sequencer_initial_private_accounts()),
+         signing_key: [37; 32],
+diff --git a/sequencer/core/src/config.rs b/sequencer/core/src/config.rs
+index b33dd69..07a202f 100644
+--- a/sequencer/core/src/config.rs
++++ b/sequencer/core/src/config.rs
+@@ -41,6 +41,12 @@ pub struct SequencerConfig {
+     pub signing_key: [u8; 32],
+     /// Bedrock configuration options.
+     pub bedrock_config: BedrockConfig,
++    /// Demand-driven block production. When `true`, no block is produced for an interval that
++    /// has no user transactions (avoids empty clock-only blocks bloating the channel). When
++    /// `false` (default, upstream-standard), a block is minted every `block_create_timeout`
++    /// with the mandatory clock transaction even while idle.
++    #[serde(default)]
++    pub demand_driven: bool,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub initial_public_accounts: Option<Vec<PublicAccountPublicInitialData>>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+diff --git a/sequencer/core/src/lib.rs b/sequencer/core/src/lib.rs
+index 2012bbc..0a14ea6 100644
+--- a/sequencer/core/src/lib.rs
++++ b/sequencer/core/src/lib.rs
+@@ -299,9 +299,11 @@ impl<BP: BlockPublisherTrait> SequencerCore<BP> {
+             }
+         }
+ 
+-        // Demand-driven: nothing real to include → produce no block (skip the clock-only
+-        // empty block entirely, before mutating state or advancing the chain height).
+-        if valid_transactions.is_empty() {
++        // Demand-driven (opt-in): nothing real to include → produce no block (skip the
++        // clock-only empty block entirely, before mutating state or advancing the chain
++        // height). With the default upstream-standard config this is off, so an idle interval
++        // still mints a clock-only block.
++        if self.sequencer_config.demand_driven && valid_transactions.is_empty() {
+             return Ok(None);
+         }
+ 
+@@ -449,6 +451,7 @@ mod tests {
+                 auth: None,
+             },
+             retry_pending_blocks_timeout: Duration::from_mins(4),
++            demand_driven: false,
+             initial_public_accounts: None,
+             initial_private_accounts: None,
+         }
+-- 
+2.34.1
+

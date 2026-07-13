@@ -1,0 +1,50 @@
+{
+  "name": "@paradoxcomputer/medusa-connect",
+  "version": "0.2.0",
+  "description": "Connect with Medusa - dApp SDK for the Medusa privacy wallet on Logos Basecamp. Request a wallet connection and submit transfers / shields / deshields through the user's wallet, with per-action approval in the wallet UI.",
+  "license": "GPL-3.0-only",
+  "main": "medusa-connect.js",
+  "types": "medusa-connect.d.ts",
+  "exports": {
+    ".": {
+      "types": "./medusa-connect.d.ts",
+      "default": "./medusa-connect.js"
+    }
+  },
+  "files": [
+    "medusa-connect.js",
+    "medusa-connect.d.ts",
+    "medusa-logo.png",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node medusa-connect.test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/paradoxcomputer/medusa.git",
+    "directory": "sdk"
+  },
+  "homepage": "https://github.com/paradoxcomputer/medusa#connect-with-medusa-build-a-dapp",
+  "bugs": {
+    "url": "https://github.com/paradoxcomputer/medusa/issues"
+  },
+  "keywords": [
+    "medusa",
+    "logos",
+    "basecamp",
+    "wallet",
+    "privacy",
+    "dapp",
+    "sdk",
+    "connect",
+    "wallet-connect"
+  ],
+  "author": "Paradox Computer",
+  "engines": {
+    "node": ">=14"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,91 @@
+From cbe5524168649d10b54ff11006b2466c227adfc0 Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Fri, 19 Jun 2026 15:53:12 +0000
+Subject: [PATCH 2/5] feat(wallet): account list --json (clean machine-readable
+ output)
+
+---
+ wallet/src/cli/account.rs | 53 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 52 insertions(+), 1 deletion(-)
+
+diff --git a/wallet/src/cli/account.rs b/wallet/src/cli/account.rs
+index ecf422e..f356d74 100644
+--- a/wallet/src/cli/account.rs
++++ b/wallet/src/cli/account.rs
+@@ -50,6 +50,9 @@ pub enum AccountSubcommand {
+         /// Show detailed account information (like `account get`).
+         #[arg(short, long)]
+         long: bool,
++        /// Emit a JSON array: [{id, privacy, preconfigured, initialized, balance, label}].
++        #[arg(long)]
++        json: bool,
+     },
+     /// Set a label for an account.
+     Label {
+@@ -335,7 +338,7 @@ impl WalletSubcommand for AccountSubcommand {
+                 wallet_core.sync_to_block(curr_last_block).await?;
+                 Ok(SubcommandReturnValue::SyncedToBlock(curr_last_block))
+             }
+-            Self::List { long } => {
++            Self::List { long, json } => {
+                 let user_data = &wallet_core.storage.user_data;
+                 let labels = &wallet_core.storage.labels;
+ 
+@@ -346,6 +349,54 @@ impl WalletSubcommand for AccountSubcommand {
+                         .map_or_else(|| prefix.to_owned(), |label| format!("{prefix} [{label}]"))
+                 };
+ 
++                if json {
++                    use serde_json::json;
++                    let label_of =
++                        |id: nssa::AccountId| labels.get(&id.to_string()).map(ToString::to_string);
++                    let pub_pre: Vec<_> =
++                        user_data.default_pub_account_signing_keys.keys().copied().collect();
++                    let priv_pre: Vec<_> =
++                        user_data.default_user_private_accounts.keys().copied().collect();
++                    let pub_own: Vec<_> =
++                        user_data.public_key_tree.account_id_map.keys().copied().collect();
++                    let priv_own: Vec<_> =
++                        user_data.private_key_tree.account_id_map.keys().copied().collect();
++
++                    let mut out: Vec<serde_json::Value> = Vec::new();
++                    for (id, preconfigured) in pub_pre
++                        .iter()
++                        .map(|i| (*i, true))
++                        .chain(pub_own.iter().map(|i| (*i, false)))
++                    {
++                        let acc = wallet_core.get_account_public(id).await.ok();
++                        let (init, bal) = acc
++                            .as_ref()
++                            .map_or((false, 0_u128), |a| (*a != Account::default(), a.balance));
++                        out.push(json!({
++                            "id": format!("Public/{id}"), "privacy": "public",
++                            "preconfigured": preconfigured, "initialized": init,
++                            "balance": bal.to_string(), "label": label_of(id),
++                        }));
++                    }
++                    for (id, preconfigured) in priv_pre
++                        .iter()
++                        .map(|i| (*i, true))
++                        .chain(priv_own.iter().map(|i| (*i, false)))
++                    {
++                        let acc = wallet_core.get_account_private(id);
++                        let (init, bal) = acc
++                            .as_ref()
++                            .map_or((false, 0_u128), |a| (*a != Account::default(), a.balance));
++                        out.push(json!({
++                            "id": format!("Private/{id}"), "privacy": "private",
++                            "preconfigured": preconfigured, "initialized": init,
++                            "balance": bal.to_string(), "label": label_of(id),
++                        }));
++                    }
++                    println!("{}", serde_json::to_string(&out)?);
++                    return Ok(SubcommandReturnValue::Empty);
++                }
++
+                 if !long {
+                     let accounts =
+                         user_data
+-- 
+2.34.1
+

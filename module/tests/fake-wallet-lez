@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""Offline stand-in for wallet-lez, for wrapper_test.py.
+
+Chain state lives in the JSON file at $FAKE_CHAIN and mimics the EXACT rules verified
+live on the 8888 zone (2026-07-03..05):
+  - `token send` from a direct holding to a pristine account CLAIMS it (same-"wallet"
+    only - the fake is single-wallet, so claims always succeed here);
+  - `ata send` requires the RECIPIENT to be an existing holding, else the tx "submits"
+    (prints a hash) and never lands (no state change) - the silent on-chain rejection;
+  - `token send --from <ATA>` fails "Sender authorization is missing" (PDA, no key);
+  - private OUTPUTS always "submit" (hash printed); the fake does not model private
+    balances - the wrapper's own registry guard is what is under test.
+
+State shape:
+  {"accounts": [ {id,type,balance,initialized,label}, ... ],   # `account list --json`
+   "chain":   { "<bare>": {"kind":"holding","def":D,"balance":N,"pda":bool}
+              | {"kind":"definition","name":S,"supply":N} },
+   "seq": 0 }
+"""
+import hashlib
+import json
+import os
+import sys
+
+STATE = os.environ["FAKE_CHAIN"]
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def load():
+    with open(STATE) as f:
+        return json.load(f)
+
+
+def save(st):
+    with open(STATE, "w") as f:
+        json.dump(st, f)
+
+
+def bare(x):
+    return x.split("/")[-1]
+
+
+def ata_addr(owner, defb):
+    h = hashlib.md5((owner + ":" + defb).encode()).hexdigest()
+    return "".join(B58[int(c, 16) % len(B58)] for c in (h + h)[:44])
+
+
+def arg(flag, default=None):
+    a = sys.argv[1:]
+    return a[a.index(flag) + 1] if flag in a else default
+
+
+def tx_hash(st):
+    st["seq"] += 1
+    return hashlib.md5(("tx%d" % st["seq"]).encode()).hexdigest()
+
+
+def main():
+    a = sys.argv[1:]
+    # the wrapper pipes the password on stdin to every call - drain it
+    if not sys.stdin.isatty():
+        sys.stdin.read()
+    st = load()
+
+    if a[:2] == ["account", "list"]:
+        print(json.dumps(st["accounts"]))
+        return 0
+
+    if a[:2] == ["account", "get"]:
+        acc = st["chain"].get(bare(arg("--account-id", "")))
+        if not acc:
+            print("Account is Uninitialized")
+        elif acc["kind"] == "definition":
+            print("Definition account owned by token program")
+            print(json.dumps({"Fungible": {"name": acc["name"],
+                                           "total_supply": acc.get("supply", 0),
+                                           "metadata_id": None}}))
+        else:
+            print("Holding account owned by token program")
+            print(json.dumps({"Fungible": {"definition_id": acc["def"],
+                                           "balance": acc["balance"]}}))
+        return 0
+
+    if a[:3] == ["account", "new", "public"]:
+        st["seq"] += 1
+        nid = ("FAKE%d" % st["seq"]).ljust(40, "x")
+        st["accounts"].append({"id": "Public/" + nid, "type": "public", "balance": 0,
+                               "initialized": False, "label": None})
+        save(st)
+        print("Generated new account with account_id Public/%s at path /%d" % (nid, st["seq"]))
+        return 0
+
+    if a[:2] == ["account", "sync-private"]:
+        print("Synced to block 1 in 0.01s")
+        return 0
+
+    if a[:2] == ["ata", "address"]:
+        print("ATA " + ata_addr(bare(arg("--owner", "")), arg("--token-definition", "")))
+        return 0
+
+    if a[:2] == ["ata", "create"]:
+        addr = ata_addr(bare(arg("--owner", "")), arg("--token-definition", ""))
+        st["chain"].setdefault(addr, {"kind": "holding", "def": arg("--token-definition"),
+                                      "balance": 0, "pda": True})
+        save(st)
+        print("Transaction hash is " + tx_hash(st)); save(st)
+        return 0
+
+    if a[:2] == ["ata", "list"]:
+        owner = bare(arg("--owner", ""))
+        i = a.index("--token-definition")
+        for defb in a[i + 1:]:
+            addr = ata_addr(owner, defb)
+            acc = st["chain"].get(addr)
+            if acc:
+                print("  ATA %s (definition %s): balance %d" % (addr, defb, acc["balance"]))
+        return 0
+
+    if a[:2] == ["ata", "send"]:
+        owner, defb = bare(arg("--from", "")), arg("--token-definition", "")
+        src = st["chain"].get(ata_addr(owner, defb))
+        dst = st["chain"].get(bare(arg("--to", "")))
+        amt = int(arg("--amount", "0"))
+        h = tx_hash(st)
+        if not src or src["balance"] < amt:
+            save(st); print("Error: insufficient balance", file=sys.stderr); return 1
+        if not dst or dst["kind"] != "holding":
+            # VERIFIED CHAIN RULE: submits, silently never lands
+            save(st); print("Transaction hash is " + h)
+            print("Error: Transaction not found in preconfigured amount of blocks",
+                  file=sys.stderr)
+            return 1
+        src["balance"] -= amt
+        dst["balance"] += amt
+        save(st)
+        print("Transaction hash is " + h)
+        return 0
+
+    if a[:2] == ["token", "send"]:
+        frm, to = bare(arg("--from", "")), arg("--to", "")
+        amt = int(arg("--amount", "0"))
+        src = st["chain"].get(frm)
+        h = tx_hash(st)
+        if not src or src["kind"] != "holding":
+            save(st)
+            print("Error: Guest panicked: Invalid sender data", file=sys.stderr); return 1
+        if src.get("pda"):
+            save(st)
+            print("Error: Guest panicked: Sender authorization is missing", file=sys.stderr)
+            return 1
+        if to.startswith("Private/"):
+            # private output: fake always "submits"; the wrapper's guard is the subject
+            src["balance"] -= amt
+            save(st); print("Transaction hash is " + h); return 0
+        dst = st["chain"].get(bare(to))
+        if dst is None:
+            # same-wallet pristine claim (verified rule) - the fake is single-wallet
+            st["chain"][bare(to)] = {"kind": "holding", "def": src["def"], "balance": amt}
+        elif dst["kind"] != "holding":
+            save(st)
+            print("Error: Guest panicked: Invalid recipient data", file=sys.stderr); return 1
+        else:
+            dst["balance"] += amt
+        src["balance"] -= amt
+        save(st)
+        print("Transaction hash is " + h)
+        return 0
+
+    print("Error: unknown fake command: %s" % " ".join(a), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

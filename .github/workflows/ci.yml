@@ -1,0 +1,21 @@
+# Minimal CI: the two suites that run anywhere (no Qt, no chain, no proofs).
+# The C++ plugin suite needs the Logos SDK + Qt dev env and is not wired here yet.
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: SDK self-test (mock bridge, incl. requestZone + token guards)
+        run: node sdk/medusa-connect.test.js
+      - name: Wrapper syntax
+        run: python3 -m py_compile module/scripts/wallet-wrapper
+      - name: Wrapper suite (fake wallet-lez, verified on-chain rules)
+        run: python3 module/tests/wrapper_test.py

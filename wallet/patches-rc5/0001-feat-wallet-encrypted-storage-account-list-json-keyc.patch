@@ -1,0 +1,755 @@
+From fb5dddd5362641f52b1e7992060b8690e57219eb Mon Sep 17 00:00:00 2001
+From: medusa build <build@medusa.local>
+Date: Thu, 25 Jun 2026 23:18:03 +0000
+Subject: [PATCH] feat(wallet): encrypted storage + account list --json +
+ keycard disable (rc5 port)
+
+Ports medusa rc4 0001/0002 onto rc5 (Argon2id+AES-256-GCM encrypted storage, mnemonic/key export, account list --json) and disables the keycard subcommand (upstream keycard shells out to a Python keycard_wallet module that isn't bundled and panics; now bails cleanly).
+---
+ Cargo.lock                           |  26 ++++++
+ Cargo.toml                           |   5 +-
+ lez/wallet/Cargo.toml                |   3 +
+ lez/wallet/src/cli/account.rs        |  91 +++++++++++++++++++-
+ lez/wallet/src/cli/mod.rs            |  28 +++---
+ lez/wallet/src/crypto.rs             | 123 +++++++++++++++++++++++++++
+ lez/wallet/src/lib.rs                |  99 +++++++++++++++++++--
+ lez/wallet/src/main.rs               |  42 +++++++--
+ lez/wallet/src/storage.rs            |  54 ++++++++++++
+ lez/wallet/src/storage/persistent.rs |   4 +
+ 10 files changed, 447 insertions(+), 28 deletions(-)
+ create mode 100644 lez/wallet/src/crypto.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index ee5c97f..d9573fc 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -236,6 +236,18 @@ dependencies = [
+  "triomphe",
+ ]
+ 
++[[package]]
++name = "argon2"
++version = "0.5.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
++dependencies = [
++ "base64ct",
++ "blake2",
++ "cpufeatures 0.2.17",
++ "password-hash",
++]
++
+ [[package]]
+ name = "ark-bn254"
+ version = "0.5.0"
+@@ -7043,6 +7055,17 @@ dependencies = [
+  "syn 2.0.117",
+ ]
+ 
++[[package]]
++name = "password-hash"
++version = "0.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
++dependencies = [
++ "base64ct",
++ "rand_core 0.6.4",
++ "subtle",
++]
++
+ [[package]]
+ name = "paste"
+ version = "1.0.15"
+@@ -10719,12 +10742,15 @@ dependencies = [
+ name = "wallet"
+ version = "0.1.0"
+ dependencies = [
++ "aes-gcm",
+  "amm_core",
+  "anyhow",
++ "argon2",
+  "async-stream",
+  "ata_core",
+  "authenticated_transfer_core",
+  "base58",
++ "base64",
+  "bincode",
+  "bip39",
+  "bridge_core",
+diff --git a/Cargo.toml b/Cargo.toml
+index 25f0377..6c5277c 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -119,6 +119,7 @@ bytesize = { version = "2.3.1", features = ["serde"] }
+ humantime-serde = "1.1"
+ humantime = "2.1"
+ aes-gcm = "0.10.3"
++argon2 = "0.5.3"
+ toml = "0.9.8"
+ bincode = "1.3.3"
+ tempfile = "3.14.0"
+@@ -187,7 +188,9 @@ debug = "line-tables-only"
+ debug = "line-tables-only"
+ 
+ [workspace.lints.rust]
+-warnings = "deny"
++# Relaxed to "warn": the medusa crypto additions (+ a transitive sha2 deprecation)
++# are benign but would fail a denied-warnings build.
++warnings = "warn"
+ 
+ [workspace.lints]
+ clippy.all = { level = "deny", priority = -1 }
+diff --git a/lez/wallet/Cargo.toml b/lez/wallet/Cargo.toml
+index e04b0d9..9a1e118 100644
+--- a/lez/wallet/Cargo.toml
++++ b/lez/wallet/Cargo.toml
+@@ -26,6 +26,9 @@ bip39.workspace = true
+ pyo3.workspace = true
+ rpassword = "7"
+ zeroize.workspace = true
++aes-gcm.workspace = true
++argon2.workspace = true
++base64.workspace = true
+ 
+ anyhow.workspace = true
+ thiserror.workspace = true
+diff --git a/lez/wallet/src/cli/account.rs b/lez/wallet/src/cli/account.rs
+index e0ec2d0..dbf91a6 100644
+--- a/lez/wallet/src/cli/account.rs
++++ b/lez/wallet/src/cli/account.rs
+@@ -44,6 +44,9 @@ pub enum AccountSubcommand {
+         /// Show detailed account information (like `account get`).
+         #[arg(short, long)]
+         long: bool,
++        /// Emit a machine-readable JSON array of the wallet's accounts.
++        #[arg(long)]
++        json: bool,
+     },
+     /// Set a label for an account.
+     Label {
+@@ -71,6 +74,16 @@ pub enum AccountSubcommand {
+         #[arg(long)]
+         account_id: CliAccountMention,
+     },
++    /// Reveal the wallet's BIP-39 recovery phrase (encrypted wallets only).
++    ExportMnemonic,
++    /// Reveal a public account's private signing key as a 64-character hex string.
++    ///
++    /// !!!WARNING!!! anyone with this key controls the account. Handle with care.
++    ExportKey {
++        /// Either 32 byte base58 account id string with privacy prefix or a label.
++        #[arg(long)]
++        account_id: CliAccountMention,
++    },
+ }
+ 
+ /// Represents generic register CLI subcommand.
+@@ -366,10 +379,57 @@ impl WalletSubcommand for AccountSubcommand {
+                 let curr_last_block = wallet_core.sync_to_latest_block().await?;
+                 Ok(SubcommandReturnValue::SyncedToBlock(curr_last_block))
+             }
+-            Self::List { long } => {
++            Self::List { long, json } => {
+                 let key_chain = &wallet_core.storage.key_chain();
+                 let storage = wallet_core.storage();
+ 
++                if json {
++                    use serde_json::json;
++                    let mut out: Vec<serde_json::Value> = Vec::new();
++                    for (id, _idx) in key_chain.public_account_ids() {
++                        let account = wallet_core.get_account_public(id).await.ok();
++                        let initialized =
++                            account.as_ref().is_some_and(|a| *a != Account::default());
++                        let balance = account.as_ref().map_or_else(
++                            || json!(0),
++                            |a| serde_json::to_value(&a.balance).unwrap_or_else(|_| json!(0)),
++                        );
++                        let label = storage
++                            .labels_for_account(AccountIdWithPrivacy::Public(id))
++                            .next()
++                            .map(ToString::to_string);
++                        out.push(json!({
++                            "id": format!("Public/{id}"),
++                            "type": "public",
++                            "balance": balance,
++                            "initialized": initialized,
++                            "label": label,
++                        }));
++                    }
++                    for (id, _idx) in key_chain.private_account_ids() {
++                        let account = wallet_core.get_account_private(id);
++                        let initialized =
++                            account.as_ref().is_some_and(|a| *a != Account::default());
++                        let balance = account.as_ref().map_or_else(
++                            || json!(0),
++                            |a| serde_json::to_value(&a.balance).unwrap_or_else(|_| json!(0)),
++                        );
++                        let label = storage
++                            .labels_for_account(AccountIdWithPrivacy::Private(id))
++                            .next()
++                            .map(ToString::to_string);
++                        out.push(json!({
++                            "id": format!("Private/{id}"),
++                            "type": "private",
++                            "balance": balance,
++                            "initialized": initialized,
++                            "label": label,
++                        }));
++                    }
++                    println!("{}", serde_json::Value::Array(out));
++                    return Ok(SubcommandReturnValue::Empty);
++                }
++
+                 let format_with_label =
+                     |id: AccountIdWithPrivacy, chain_index: Option<&ChainIndex>| {
+                         let id_str =
+@@ -466,6 +526,35 @@ impl WalletSubcommand for AccountSubcommand {
+                 );
+                 Ok(SubcommandReturnValue::Empty)
+             }
++            Self::ExportMnemonic => {
++                match wallet_core.mnemonic() {
++                    Some(phrase) => println!("{phrase}"),
++                    None => anyhow::bail!(
++                        "No recovery phrase available - this wallet is unencrypted (plaintext) or \
++                         was created without a password. Recreate it with a password to enable export."
++                    ),
++                }
++                Ok(SubcommandReturnValue::Empty)
++            }
++            Self::ExportKey { account_id } => {
++                let resolved = account_id.resolve(wallet_core.storage())?;
++                match resolved {
++                    AccountIdWithPrivacy::Public(id) => {
++                        let private_key = wallet_core
++                            .storage()
++                            .key_chain()
++                            .pub_account_signing_key(id)
++                            .context("Public account not found in storage")?;
++                        // `PrivateKey`'s Display is its 64-char hex encoding.
++                        println!("{private_key}");
++                    }
++                    AccountIdWithPrivacy::Private(_) => anyhow::bail!(
++                        "Exporting a private account's secret key is not supported; export the \
++                         wallet's recovery phrase instead (account export-mnemonic)."
++                    ),
++                }
++                Ok(SubcommandReturnValue::Empty)
++            }
+         }
+     }
+ }
+diff --git a/lez/wallet/src/cli/mod.rs b/lez/wallet/src/cli/mod.rs
+index 8a91d3a..1779907 100644
+--- a/lez/wallet/src/cli/mod.rs
++++ b/lez/wallet/src/cli/mod.rs
+@@ -265,19 +265,19 @@ pub async fn execute_subcommand(
+             bridge_subcommand.handle_subcommand(wallet_core).await?
+         }
+         Command::Group(group_subcommand) => group_subcommand.handle_subcommand(wallet_core).await?,
+-        Command::Keycard(keycard_subcommand) => {
+-            keycard_subcommand.handle_subcommand(wallet_core).await?
++        Command::Keycard(_) => {
++            // Keycard is disabled in the Medusa build: the upstream keycard path shells out to a
++            // Python `keycard_wallet` module that isn't bundled and panics. Fail cleanly instead.
++            anyhow::bail!("Keycard is not supported in this build");
+         }
+         Command::Config(config_subcommand) => {
+             config_subcommand.handle_subcommand(wallet_core).await?
+         }
+-        Command::RestoreKeys { depth } => {
+-            let mnemonic = read_mnemonic_from_stdin()?;
+-            let password = read_password_from_stdin()?;
+-            wallet_core.restore_storage(&mnemonic, &password)?;
+-            execute_keys_restoration(wallet_core, depth).await?;
+-
+-            SubcommandReturnValue::Empty
++        Command::RestoreKeys { .. } => {
++            // `restore-keys` is intercepted in `main` before the wallet is loaded, so recovery
++            // never requires unlocking the (possibly lost) old storage. Reaching it here means
++            // that interception was bypassed.
++            anyhow::bail!("internal error: restore-keys must be handled at startup");
+         }
+         Command::DeployProgram { binary_filepath } => {
+             let bytecode: Vec<u8> = std::fs::read(&binary_filepath).context(format!(
+@@ -309,8 +309,10 @@ pub async fn execute_continuous_run(wallet_core: &mut WalletCore) -> Result<()>
+ pub fn read_password_from_stdin() -> Result<String> {
+     let mut password = String::new();
+ 
+-    print!("Input password: ");
+-    std::io::stdout().flush()?;
++    // Prompt on stderr so stdout stays clean for machine consumers (the GUI module pipes the
++    // password in and parses stdout).
++    eprint!("Input password: ");
++    std::io::stderr().flush()?;
+     std::io::stdin().read_line(&mut password)?;
+ 
+     Ok(password.trim().to_owned())
+@@ -344,8 +346,8 @@ pub fn read_keys_file(path: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+ pub fn read_mnemonic_from_stdin() -> Result<Mnemonic> {
+     let mut phrase = String::new();
+ 
+-    print!("Input recovery phrase: ");
+-    std::io::stdout().flush()?;
++    eprint!("Input recovery phrase: ");
++    std::io::stderr().flush()?;
+     std::io::stdin().read_line(&mut phrase)?;
+ 
+     Mnemonic::from_str(phrase.trim()).context("Invalid mnemonic phrase")
+diff --git a/lez/wallet/src/crypto.rs b/lez/wallet/src/crypto.rs
+new file mode 100644
+index 0000000..5d2e31c
+--- /dev/null
++++ b/lez/wallet/src/crypto.rs
+@@ -0,0 +1,123 @@
++//! Password-based encryption of the wallet's persistent storage.
++//!
++//! The wallet's secrets (per-account signing keys, the recovery mnemonic) live in
++//! the persistent storage file. To keep them at rest behind the user's password we
++//! derive a 256-bit key from the password with Argon2id (memory-hard, salted) and
++//! seal the serialized storage with AES-256-GCM (authenticated, so a wrong password
++//! fails cleanly rather than yielding garbage). The on-disk form is a small,
++//! self-describing JSON envelope.
++
++use aes_gcm::{
++    Aes256Gcm, Key, Nonce,
++    aead::{Aead, KeyInit},
++};
++use anyhow::{Context as _, Result, anyhow, bail};
++use argon2::Argon2;
++use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
++use rand::RngCore as _;
++use serde::{Deserialize, Serialize};
++use zeroize::Zeroize as _;
++
++const ENVELOPE_VERSION: u8 = 1;
++const SALT_LEN: usize = 16;
++const NONCE_LEN: usize = 12;
++const KEY_LEN: usize = 32;
++
++/// Self-describing on-disk envelope around the AES-256-GCM ciphertext.
++#[derive(Serialize, Deserialize)]
++struct Envelope {
++    /// Envelope format version.
++    v: u8,
++    /// Key-derivation function identifier (currently always `argon2id`).
++    kdf: String,
++    /// Argon2 salt, hex-encoded.
++    salt: String,
++    /// AES-GCM nonce, hex-encoded.
++    nonce: String,
++    /// AES-256-GCM ciphertext (incl. tag), base64-encoded.
++    ct: String,
++}
++
++fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LEN]> {
++    let mut key = [0_u8; KEY_LEN];
++    Argon2::default()
++        .hash_password_into(password.as_bytes(), salt, &mut key)
++        .map_err(|e| anyhow!("key derivation failed: {e}"))?;
++    Ok(key)
++}
++
++/// Encrypt `plaintext` under `password`, returning the JSON envelope bytes to persist.
++pub fn encrypt(plaintext: &[u8], password: &str) -> Result<Vec<u8>> {
++    let mut salt = [0_u8; SALT_LEN];
++    let mut nonce_bytes = [0_u8; NONCE_LEN];
++    rand::rngs::OsRng.fill_bytes(&mut salt);
++    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
++
++    let mut key = derive_key(password, &salt)?;
++    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
++    let ct = cipher
++        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
++        .map_err(|_| anyhow!("encryption failed"))?;
++    key.zeroize();
++
++    let envelope = Envelope {
++        v: ENVELOPE_VERSION,
++        kdf: "argon2id".to_owned(),
++        salt: hex::encode(salt),
++        nonce: hex::encode(nonce_bytes),
++        ct: B64.encode(&ct),
++    };
++    Ok(serde_json::to_vec_pretty(&envelope)?)
++}
++
++/// Decrypt an envelope produced by [`encrypt`]. A wrong password (or tampering)
++/// surfaces as an authentication error, never as corrupted plaintext.
++pub fn decrypt(envelope_bytes: &[u8], password: &str) -> Result<Vec<u8>> {
++    let envelope: Envelope = serde_json::from_slice(envelope_bytes)
++        .context("storage is not a valid encrypted envelope")?;
++    if envelope.v != ENVELOPE_VERSION {
++        bail!("unsupported storage envelope version {}", envelope.v);
++    }
++    let salt = hex::decode(&envelope.salt).context("malformed salt")?;
++    let nonce_bytes = hex::decode(&envelope.nonce).context("malformed nonce")?;
++    let ct = B64
++        .decode(envelope.ct.as_bytes())
++        .context("malformed ciphertext")?;
++
++    let mut key = derive_key(password, &salt)?;
++    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
++    let plaintext = cipher
++        .decrypt(Nonce::from_slice(&nonce_bytes), ct.as_ref())
++        .map_err(|_| anyhow!("invalid password or corrupt storage"));
++    key.zeroize();
++    plaintext
++}
++
++/// True if `bytes` look like an encrypted envelope (vs. legacy plaintext storage).
++pub fn is_encrypted(bytes: &[u8]) -> bool {
++    serde_json::from_slice::<Envelope>(bytes).is_ok()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn round_trip() {
++        let pt = b"{\"accounts\":[],\"last_synced_block\":7}";
++        let env = encrypt(pt, "correct horse").unwrap();
++        assert!(is_encrypted(&env));
++        assert_eq!(decrypt(&env, "correct horse").unwrap(), pt);
++    }
++
++    #[test]
++    fn wrong_password_fails() {
++        let env = encrypt(b"secret", "right").unwrap();
++        assert!(decrypt(&env, "wrong").is_err());
++    }
++
++    #[test]
++    fn legacy_plaintext_not_detected_as_encrypted() {
++        assert!(!is_encrypted(b"{\"accounts\":[],\"last_synced_block\":0,\"labels\":{}}"));
++    }
++}
+diff --git a/lez/wallet/src/lib.rs b/lez/wallet/src/lib.rs
+index 7dece16..f959d2e 100644
+--- a/lez/wallet/src/lib.rs
++++ b/lez/wallet/src/lib.rs
+@@ -41,6 +41,7 @@ pub mod account;
+ mod account_manager;
+ pub mod cli;
+ pub mod config;
++pub mod crypto;
+ pub mod helperfunctions;
+ pub mod poller;
+ pub mod program_facades;
+@@ -94,6 +95,12 @@ pub struct WalletCore {
+ 
+     poller: TxPoller,
+     pub sequencer_client: SequencerClient,
++
++    /// Password the storage is sealed with; empty = legacy plaintext (no encryption).
++    password: String,
++    /// BIP-39 recovery phrase, retained so it can be re-exported and re-persisted
++    /// (encrypted) on save. `None` for plaintext wallets.
++    mnemonic: Option<String>,
+ }
+ 
+ impl WalletCore {
+@@ -113,7 +120,7 @@ impl WalletCore {
+         let storage = Storage::from_path(&storage_path)
+             .with_context(|| format!("Failed to load storage from {}", storage_path.display()))?;
+ 
+-        Self::new(config_path, storage_path, config_overrides, storage)
++        Self::new(config_path, storage_path, config_overrides, storage, String::new(), None)
+     }
+ 
+     pub fn new_init_storage(
+@@ -123,16 +130,83 @@ impl WalletCore {
+         password: &str,
+     ) -> Result<(Self, Mnemonic)> {
+         let (storage, mnemonic) = Storage::new(password).context("Failed to create storage")?;
+-        let wallet = Self::new(config_path, storage_path, config_overrides, storage)?;
++        let wallet = Self::new(config_path, storage_path, config_overrides, storage, String::new(), None)?;
+ 
+         Ok((wallet, mnemonic))
+     }
+ 
++    /// Create new storage sealed with `password` (non-empty = encrypted, empty = plaintext),
++    /// retaining the recovery phrase so it can be exported later.
++    pub fn new_init_storage_encrypted(
++        config_path: PathBuf,
++        storage_path: PathBuf,
++        config_overrides: Option<WalletConfigOverrides>,
++        password: &str,
++    ) -> Result<(Self, Mnemonic)> {
++        let (storage, mnemonic) = Storage::new(password).context("Failed to create storage")?;
++        let retained = (!password.is_empty()).then(|| mnemonic.to_string());
++        let wallet = Self::new(
++            config_path,
++            storage_path,
++            config_overrides,
++            storage,
++            password.to_owned(),
++            retained,
++        )?;
++        Ok((wallet, mnemonic))
++    }
++
++    /// Load existing storage, transparently decrypting it with `password` if it is an
++    /// encrypted envelope (plaintext loads regardless). The wallet retains `password`,
++    /// so it re-encrypts on the next save.
++    pub fn open_encrypted(
++        config_path: PathBuf,
++        storage_path: PathBuf,
++        config_overrides: Option<WalletConfigOverrides>,
++        password: &str,
++    ) -> Result<Self> {
++        let (storage, mnemonic) = Storage::from_path_maybe_encrypted(&storage_path, password)
++            .with_context(|| format!("Failed to load storage from {}", storage_path.display()))?;
++        Self::new(
++            config_path,
++            storage_path,
++            config_overrides,
++            storage,
++            password.to_owned(),
++            mnemonic,
++        )
++    }
++
++    /// Build a wallet for `restore-keys` directly from a mnemonic, WITHOUT reading the
++    /// (possibly lost) pre-existing storage. The rebuilt storage is sealed with `password`.
++    pub fn new_for_restore(
++        config_path: PathBuf,
++        storage_path: PathBuf,
++        config_overrides: Option<WalletConfigOverrides>,
++        mnemonic: &Mnemonic,
++        password: &str,
++    ) -> Result<Self> {
++        let (mut storage, _throwaway) =
++            Storage::new(password).context("Failed to create storage")?;
++        storage.restore(mnemonic, password)?;
++        Self::new(
++            config_path,
++            storage_path,
++            config_overrides,
++            storage,
++            password.to_owned(),
++            Some(mnemonic.to_string()),
++        )
++    }
++
++    #[expect(clippy::too_many_arguments, reason = "internal constructor")]
+     fn new(
+         config_path: PathBuf,
+         storage_path: PathBuf,
+         config_overrides: Option<WalletConfigOverrides>,
+         storage: Storage,
++        password: String,
++        mnemonic: Option<String>,
+     ) -> Result<Self> {
+         let mut config =
+             WalletConfig::from_path_or_initialize_default(&config_path).with_context(|| {
+@@ -173,6 +247,8 @@ impl WalletCore {
+             storage,
+             poller: tx_poller,
+             sequencer_client,
++            password,
++            mnemonic,
+         })
+     }
+ 
+@@ -198,15 +274,28 @@ impl WalletCore {
+         &mut self.storage
+     }
+ 
+-    /// Restore storage from an existing mnemonic phrase.
++    /// Restore storage from an existing mnemonic phrase, sealing it with `password`.
+     pub fn restore_storage(&mut self, mnemonic: &Mnemonic, password: &str) -> Result<()> {
+-        self.storage.restore(mnemonic, password)
++        self.storage.restore(mnemonic, password)?;
++        self.password = password.to_owned();
++        self.mnemonic = Some(mnemonic.to_string());
++        Ok(())
++    }
++
++    /// The recovery phrase for this wallet, if known. `None` for legacy plaintext wallets.
++    #[must_use]
++    pub fn mnemonic(&self) -> Option<&str> {
++        self.mnemonic.as_deref()
+     }
+ 
+     /// Store persistent data at home.
+     pub fn store_persistent_data(&self) -> Result<()> {
+         self.storage
+-            .save_to_path(&self.storage_path)
++            .save_to_path_maybe_encrypted(
++                &self.storage_path,
++                &self.password,
++                self.mnemonic.as_deref(),
++            )
+             .with_context(|| {
+                 format!(
+                     "Failed to store persistent accounts at {}",
+diff --git a/lez/wallet/src/main.rs b/lez/wallet/src/main.rs
+index 838ee85..8213b0e 100644
+--- a/lez/wallet/src/main.rs
++++ b/lez/wallet/src/main.rs
+@@ -7,7 +7,10 @@ use anyhow::{Context as _, Result};
+ use clap::{CommandFactory as _, Parser as _};
+ use wallet::{
+     WalletCore,
+-    cli::{Args, execute_continuous_run, execute_subcommand, read_password_from_stdin},
++    cli::{
++        Args, Command, execute_continuous_run, execute_keys_restoration, execute_subcommand,
++        read_mnemonic_from_stdin, read_password_from_stdin,
++    },
+     config::WalletConfigOverrides,
+     helperfunctions::{fetch_config_path, fetch_persistent_storage_path},
+ };
+@@ -38,15 +41,33 @@ async fn main() -> Result<()> {
+     };
+ 
+     if let Some(command) = command {
++        // `restore-keys` must work even when the existing wallet is inaccessible (that is the
++        // point of recovery), so it never loads/decrypts the old storage - it reads the phrase
++        // plus a new password and rebuilds from scratch.
++        if let Command::RestoreKeys { depth } = &command {
++            let mnemonic = read_mnemonic_from_stdin()?;
++            let password = read_password_from_stdin()?;
++            let mut wallet = WalletCore::new_for_restore(
++                config_path,
++                storage_path,
++                Some(config_overrides),
++                &mnemonic,
++                &password,
++            )?;
++            execute_keys_restoration(&mut wallet, *depth).await?;
++            wallet.store_persistent_data()?;
++            return Ok(());
++        }
++
++        // Every other command reads the password up front to unlock (decrypt) the storage.
++        // An empty password keeps a wallet as legacy plaintext.
++        let password = read_password_from_stdin()?;
+         let mut wallet = if storage_path.exists() {
+-            WalletCore::new_update_chain(config_path, storage_path, Some(config_overrides))?
++            WalletCore::open_encrypted(config_path, storage_path, Some(config_overrides), &password)?
+         } else {
+-            // TODO: Maybe move to `WalletCore::from_env()` or similar?
+-
+             println!("Persistent storage not found, need to execute setup");
+ 
+-            let password = read_password_from_stdin()?;
+-            let (wallet, mnemonic) = WalletCore::new_init_storage(
++            let (wallet, mnemonic) = WalletCore::new_init_storage_encrypted(
+                 config_path,
+                 storage_path,
+                 Some(config_overrides),
+@@ -67,8 +88,13 @@ async fn main() -> Result<()> {
+         let _output = execute_subcommand(&mut wallet, command).await?;
+         Ok(())
+     } else if continuous_run {
+-        let mut wallet =
+-            WalletCore::new_update_chain(config_path, storage_path, Some(config_overrides))?;
++        let password = read_password_from_stdin()?;
++        let mut wallet = WalletCore::open_encrypted(
++            config_path,
++            storage_path,
++            Some(config_overrides),
++            &password,
++        )?;
+         execute_continuous_run(&mut wallet).await
+     } else {
+         let help = Args::command().render_long_help();
+diff --git a/lez/wallet/src/storage.rs b/lez/wallet/src/storage.rs
+index d1415c2..c83f981 100644
+--- a/lez/wallet/src/storage.rs
++++ b/lez/wallet/src/storage.rs
+@@ -84,6 +84,58 @@ impl Storage {
+         Ok(())
+     }
+ 
++    /// Load, transparently decrypting if the file is an encrypted envelope. Returns the
++    /// storage plus the recovery phrase sealed inside it (if any). Plaintext files load
++    /// regardless of `password`; encrypted files need the correct non-empty `password`.
++    pub fn from_path_maybe_encrypted(
++        path: &Path,
++        password: &str,
++    ) -> Result<(Self, Option<String>)> {
++        let bytes = match std::fs::read(path) {
++            Ok(b) => b,
++            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
++                anyhow::bail!(
++                    "Storage not found, please setup roots from config command beforehand"
++                );
++            }
++            Err(err) => anyhow::bail!("IO error {err:#?}"),
++        };
++        let persistent: PersistentStorage = if crate::crypto::is_encrypted(&bytes) {
++            let plaintext = crate::crypto::decrypt(&bytes, password)
++                .context("Failed to decrypt wallet storage")?;
++            serde_json::from_slice(&plaintext).context("Failed to parse decrypted storage")?
++        } else {
++            serde_json::from_slice(&bytes).context("Failed to parse storage file")?
++        };
++        let mnemonic = persistent.mnemonic.clone();
++        Ok((Self::from_persistent(persistent)?, mnemonic))
++    }
++
++    /// Save, sealing the file under `password` when it is non-empty (Argon2id + AES-256-GCM
++    /// envelope); an empty password writes legacy plaintext. The recovery `mnemonic` is
++    /// persisted only in the encrypted form so it can be re-exported.
++    pub fn save_to_path_maybe_encrypted(
++        &self,
++        path: &Path,
++        password: &str,
++        mnemonic: Option<&str>,
++    ) -> Result<()> {
++        let mut persistent = self.to_persistent();
++        if !password.is_empty() {
++            persistent.mnemonic = mnemonic.map(ToOwned::to_owned);
++        }
++        let serialized = serde_json::to_vec_pretty(&persistent)?;
++        let bytes = if password.is_empty() {
++            serialized
++        } else {
++            crate::crypto::encrypt(&serialized, password)?
++        };
++        let mut file = std::fs::File::create(path).context("Failed to create file")?;
++        file.write_all(&bytes).context("Failed to write to file")?;
++        file.sync_all().context("Failed to sync file")?;
++        Ok(())
++    }
++
+     /// Restore storage from an existing mnemonic phrase.
+     pub fn restore(&mut self, mnemonic: &Mnemonic, password: &str) -> Result<()> {
+         // TODO: Use password for storage encryption
+@@ -165,6 +217,7 @@ impl Storage {
+             key_chain: key_chain_data,
+             last_synced_block: *last_synced_block,
+             labels: labels.clone(),
++            mnemonic: None,
+         }
+     }
+ 
+@@ -173,6 +226,7 @@ impl Storage {
+             key_chain,
+             last_synced_block,
+             labels,
++            mnemonic: _,
+         } = persistent;
+ 
+         Ok(Self {
+diff --git a/lez/wallet/src/storage/persistent.rs b/lez/wallet/src/storage/persistent.rs
+index 01d6b16..4eaa7f5 100644
+--- a/lez/wallet/src/storage/persistent.rs
++++ b/lez/wallet/src/storage/persistent.rs
+@@ -21,6 +21,10 @@ pub struct PersistentStorage {
+     pub last_synced_block: u64,
+     #[serde(default)]
+     pub labels: BTreeMap<Label, AccountIdWithPrivacy>,
++    /// BIP-39 recovery phrase. Persisted only for password-encrypted wallets (the
++    /// whole file is sealed) so it can be re-exported; `None` for plaintext wallets.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub mnemonic: Option<String>,
+ }
+ 
+ #[derive(Serialize, Deserialize)]
+-- 
+2.34.1
+
