@@ -1,6 +1,6 @@
 {
   "name": "medusa_core",
-  "version": "0.2.0",
+  "version": "0.2.4",
   "type": "core",
   "category": "blockchain",
   "description": "Native token wallet: accounts, faucet, keycard-gated transfers",
