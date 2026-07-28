@@ -1,0 +1,273 @@
+From fb77d1ef07a61c3a04d637fa294f3414bd8fca5d Mon Sep 17 00:00:00 2001
+From: medusa build <build@medusa.local>
+Date: Tue, 28 Jul 2026 04:33:56 +0000
+Subject: fix(wallet): make pyo3/keycard_wallet an opt-in cargo feature
+
+wallet-lez links libpython purely for Status Keycard support, which patch
+0001 already disables at the CLI dispatch level. pyo3-ffi emits
+`-lpython3.X` for the CPython of whatever machine ran the build, and the
+live `Python::attach` call in account_manager.rs survives --gc-sections /
+--as-needed, so the shipped binary records a hard dependency on that exact
+CPython minor version:
+
+  linux : `libpython3.10.so.1.0: cannot open shared object file`
+  macOS : `dyld: Library not loaded: /Library/Frameworks/Python.framework/
+           Versions/3.14/Python`
+
+This fails at process-load time, before main(), so EVERY wallet subcommand
+dies - including `account new public`, which is what the "Create your wallet"
+dialog runs. Reported as paradoxcomputer/medusa#1.
+
+Put `pyo3` and `keycard_wallet` behind a new, non-default `keycard` feature
+and cfg-gate the five keycard call sites. With the feature off the binary has
+no libpython dependency at all; `keycard`/`keycard-debug` builds are
+unchanged. Cargo.lock is untouched (optional deps stay in the lock file).
+
+Behaviour with the feature off:
+  - `wallet keycard ...`          -> "Keycard is not supported in this build"
+  - an `m/...` key-path account   -> clean error instead of a keycard prompt
+  - signing with a keycard state  -> hard error, never a silently under-signed
+                                     signature set
+---
+ lez/wallet/Cargo.toml             | 10 ++++--
+ lez/wallet/src/account_manager.rs | 59 +++++++++++++++++++------------
+ lez/wallet/src/cli/mod.rs         | 40 +++++++++++++++------
+ lez/wallet/src/lib.rs             |  5 +--
+ 4 files changed, 77 insertions(+), 37 deletions(-)
+
+diff --git a/lez/wallet/Cargo.toml b/lez/wallet/Cargo.toml
+index 9a1e118..2c09fc2 100644
+--- a/lez/wallet/Cargo.toml
++++ b/lez/wallet/Cargo.toml
+@@ -20,10 +20,10 @@ token_core.workspace = true
+ ata_core.workspace = true
+ vault_core.workspace = true
+ bridge_core.workspace = true
+-keycard_wallet.workspace = true
++keycard_wallet = { workspace = true, optional = true }
+ 
+ bip39.workspace = true
+-pyo3.workspace = true
++pyo3 = { workspace = true, optional = true }
+ rpassword = "7"
+ zeroize.workspace = true
+ aes-gcm.workspace = true
+@@ -53,9 +53,13 @@ url.workspace = true
+ derive_more = { workspace = true, features = ["display"] }
+ 
+ [features]
++# Keycard (Status hardware wallet) support. OFF by default: it embeds CPython via pyo3,
++# which makes the produced binary hard-link libpython3.X of the BUILD host.
++keycard = ["dep:keycard_wallet", "dep:pyo3"]
++
+ # Enables `keycard get-private-keys` command that prints sensitive secret keys to terminal.
+ # Never enable in production builds.
+-keycard-debug = []
++keycard-debug = ["keycard"]
+ 
+ [dev-dependencies]
+ tempfile.workspace = true
+diff --git a/lez/wallet/src/account_manager.rs b/lez/wallet/src/account_manager.rs
+index ce9d183..6a880a9 100644
+--- a/lez/wallet/src/account_manager.rs
++++ b/lez/wallet/src/account_manager.rs
+@@ -2,6 +2,7 @@ use core::fmt;
+ 
+ use anyhow::Result;
+ use key_protocol::key_management::ephemeral_key_holder::EphemeralKeyHolder;
++#[cfg(feature = "keycard")]
+ use keycard_wallet::{KeycardWallet, python_path};
+ use lee::{AccountId, PrivateKey, PublicKey, Signature};
+ use lee_core::{
+@@ -186,6 +187,10 @@ enum State {
+ 
+ pub struct AccountManager {
+     states: Vec<State>,
++    #[cfg_attr(
++        not(feature = "keycard"),
++        allow(dead_code, reason = "only read by the keycard signer")
++    )]
+     pin: Option<String>,
+ }
+ 
+@@ -225,30 +230,33 @@ impl AccountManager {
+                     account_id,
+                     key_path,
+                 } => {
+-                    let acc = wallet
+-                        .get_account_public(account_id)
+-                        .await
+-                        .map_err(ExecutionFailureKind::SequencerError)?;
+-
+-                    let account = AccountWithMetadata::new(acc.clone(), true, account_id);
+-
+-                    if pin.is_none() {
+-                        pin = Some(
+-                            crate::helperfunctions::read_pin()
+-                                .map_err(|e| {
+-                                    ExecutionFailureKind::KeycardError(pyo3::PyErr::new::<
+-                                        pyo3::exceptions::PyRuntimeError,
+-                                        _,
+-                                    >(
+-                                        e.to_string()
+-                                    ))
+-                                })?
+-                                .as_str()
+-                                .to_owned(),
+-                        );
++                    #[cfg(not(feature = "keycard"))]
++                    {
++                        let _ = (account_id, key_path);
++                        return Err(ExecutionFailureKind::KeycardError(
++                            "keycard accounts are not supported in this build".to_owned(),
++                        ))
+                     }
++                    #[cfg(feature = "keycard")]
++                    {
++                        let acc = wallet
++                            .get_account_public(account_id)
++                            .await
++                            .map_err(ExecutionFailureKind::SequencerError)?;
++
++                        let account = AccountWithMetadata::new(acc.clone(), true, account_id);
++
++                        if pin.is_none() {
++                            pin = Some(
++                                crate::helperfunctions::read_pin()
++                                    .map_err(|e| ExecutionFailureKind::KeycardError(e.to_string()))?
++                                    .as_str()
++                                    .to_owned(),
++                            );
++                        }
+ 
+-                    State::PublicKeycard { account, key_path }
++                        State::PublicKeycard { account, key_path }
++                    }
+                 }
+                 AccountIdentity::PrivateOwned(account_id) => {
+                     let pre = private_key_tree_acc_preparation(wallet, account_id, false).await?;
+@@ -480,6 +488,13 @@ impl AccountManager {
+             })
+             .collect();
+ 
++        #[cfg(not(feature = "keycard"))]
++        if !keycard_paths.is_empty() {
++            // Never silently return an under-signed signature set.
++            anyhow::bail!("keycard accounts are not supported in this build");
++        }
++
++        #[cfg(feature = "keycard")]
+         if let Some(pin) = self.pin.clone() {
+             pyo3::Python::attach(|py| -> pyo3::PyResult<()> {
+                 python_path::add_python_path(py)?;
+diff --git a/lez/wallet/src/cli/mod.rs b/lez/wallet/src/cli/mod.rs
+index 1779907..96e60fe 100644
+--- a/lez/wallet/src/cli/mod.rs
++++ b/lez/wallet/src/cli/mod.rs
+@@ -18,7 +18,6 @@ use crate::{
+         chain::ChainSubcommand,
+         config::ConfigSubcommand,
+         group::GroupSubcommand,
+-        keycard::KeycardSubcommand,
+         programs::{
+             amm::AmmProgramAgnosticSubcommand, ata::AtaSubcommand, bridge::BridgeSubcommand,
+             native_token_transfer::AuthTransferSubcommand, pinata::PinataProgramAgnosticSubcommand,
+@@ -32,6 +31,7 @@ pub mod account;
+ pub mod chain;
+ pub mod config;
+ pub mod group;
++#[cfg(feature = "keycard")]
+ pub mod keycard;
+ pub mod programs;
+ 
+@@ -91,8 +91,15 @@ pub enum Command {
+     /// Deploy a program.
+     DeployProgram { binary_filepath: PathBuf },
+     /// Keycard hardware wallet management.
++    #[cfg(feature = "keycard")]
+     #[command(subcommand)]
+-    Keycard(KeycardSubcommand),
++    Keycard(keycard::KeycardSubcommand),
++    /// Keycard hardware wallet management (not supported in this build).
++    #[cfg(not(feature = "keycard"))]
++    Keycard {
++        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
++        args: Vec<String>,
++    },
+ }
+ 
+ /// To execute commands, env var `LEE_WALLET_HOME_DIR` must be set into directory with config.
+@@ -142,14 +149,19 @@ impl CliAccountMention {
+                 .resolve_label(label)
+                 .ok_or_else(|| anyhow::anyhow!("No account found for label `{label}`")),
+             Self::KeyPath(path) => {
+-                let pin = read_pin()?;
+-                let id_str =
+-                    keycard_wallet::KeycardWallet::get_public_account_id_for_path_with_connect(
+-                        &pin, path,
+-                    )
+-                    .map_err(anyhow::Error::from)?;
+-                AccountIdWithPrivacy::from_str(&id_str)
+-                    .map_err(|e| anyhow::anyhow!("Invalid account id from keycard: {e}"))
++                #[cfg(feature = "keycard")]
++                {
++                    let pin = read_pin()?;
++                    let id_str =
++                        keycard_wallet::KeycardWallet::get_public_account_id_for_path_with_connect(
++                            &pin, path,
++                        )
++                        .map_err(anyhow::Error::from)?;
++                    AccountIdWithPrivacy::from_str(&id_str)
++                        .map_err(|e| anyhow::anyhow!("Invalid account id from keycard: {e}"))
++                }
++                #[cfg(not(feature = "keycard"))]
++                anyhow::bail!("Keycard key path `{path}` is not supported in this build")
+             }
+         }
+     }
+@@ -265,11 +277,19 @@ pub async fn execute_subcommand(
+             bridge_subcommand.handle_subcommand(wallet_core).await?
+         }
+         Command::Group(group_subcommand) => group_subcommand.handle_subcommand(wallet_core).await?,
++        #[cfg(feature = "keycard")]
+         Command::Keycard(_) => {
+             // Keycard is disabled in the Medusa build: the upstream keycard path shells out to a
+             // Python `keycard_wallet` module that isn't bundled and panics. Fail cleanly instead.
+             anyhow::bail!("Keycard is not supported in this build");
+         }
++        #[cfg(not(feature = "keycard"))]
++        Command::Keycard { .. } => {
++            // Keycard is not compiled into the Medusa build: upstream links CPython via pyo3
++            // purely for keycard support, which makes the binary depend on the build host's
++            // libpython. Fail cleanly instead.
++            anyhow::bail!("Keycard is not supported in this build");
++        }
+         Command::Config(config_subcommand) => {
+             config_subcommand.handle_subcommand(wallet_core).await?
+         }
+diff --git a/lez/wallet/src/lib.rs b/lez/wallet/src/lib.rs
+index f959d2e..2d1711e 100644
+--- a/lez/wallet/src/lib.rs
++++ b/lez/wallet/src/lib.rs
+@@ -45,6 +45,7 @@ pub mod crypto;
+ pub mod helperfunctions;
+ pub mod poller;
+ pub mod program_facades;
++#[cfg(feature = "keycard")]
+ pub mod signing;
+ pub mod storage;
+ 
+@@ -80,8 +81,8 @@ pub enum ExecutionFailureKind {
+     TransactionBuildError(#[from] lee::error::LeeError),
+     #[error("Failed to sign transaction: {0}")]
+     SignError(anyhow::Error),
+-    #[error(transparent)]
+-    KeycardError(#[from] pyo3::PyErr),
++    #[error("keycard error: {0}")]
++    KeycardError(String),
+ }
+ 
+ #[expect(clippy::partial_pub_fields, reason = "TODO: make all fields private")]
+-- 
+2.43.0
+

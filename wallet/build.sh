@@ -6,6 +6,9 @@
 #
 # Patch (rc5 series) reconstructs the deployed wallet customisations:
 #   0001 encrypted storage (Argon2id + AES-256-GCM) + account list --json + mnemonic/key export
+#   0002 pyo3/keycard_wallet behind an opt-in "keycard" feature, so the wallet no longer links
+#        the build host's libpython (medusa#1). The feature is OFF by default, so the plain
+#        `cargo build` below already builds it out - no extra flags needed here.
 # (rc4's 0003/0006 are obsolete on rc5 - logos-blockchain is already pinned and token ops
 #  already print hashes; 0004/0005 demand-driven sequencer are deferred.)
 #
