@@ -80,13 +80,36 @@ jobs:
           nix-store --realise "$drv" --add-root "$PWD/lgx-cli" >/dev/null
           echo "LGX=$PWD/lgx-cli/bin/lgx" >> "$GITHUB_ENV"
 
-      - name: Bundle the engine into the ${{ matrix.variant }} medusa_core
+      - name: Bundle the engine into every linux variant of medusa_core
         run: |
           set -euo pipefail
           mc="$LINOUT/medusa_core.lgx"
-          stg="$PWD/mc-stage"; mkdir -p "$stg/bin"
-          # extract the linux variant payload (the .so + its bundled libs)
-          python3 - "$mc" "$stg" "${{ matrix.variant }}" <<'PY'
+          cp "$mc" medusa_core-selfcontained.lgx; chmod u+w medusa_core-selfcontained.lgx
+
+          # Bundle Tor once so the Paradox·Tor zone works with no external install
+          # (make-release.sh does the same). Non-fatal: resolveTorBin falls back to a system tor.
+          sudo apt-get update -qq && sudo apt-get install -y -qq tor || true
+          tor_bin="$(command -v tor || true)"
+
+          # Every linux variant the nix build emitted, not just linux-amd64. The Nix DEV build of
+          # Basecamp only loads "-dev" variants (see module/scripts/install-dev.sh), so bundling
+          # the engine into linux-amd64 alone would ship those users a plugin with no engine
+          # under bin/ and every wallet op would fail "wallet CLI not found".
+          variants=$(python3 - "$mc" <<'PY'
+          import sys,gzip,io,tarfile
+          tf=tarfile.open(fileobj=io.BytesIO(gzip.open(sys.argv[1],'rb').read()))
+          vs={p[1] for p in (m.name.split('/') for m in tf.getmembers())
+              if len(p) > 2 and p[0] == 'variants' and p[1].startswith('linux-')}
+          print('\n'.join(sorted(vs)))
+          PY
+          )
+          [ -n "$variants" ] || { echo "ERROR: no linux variants found in $mc"; exit 1; }
+          echo "bundling engine into:" $variants
+
+          for v in $variants; do
+            stg="$PWD/mc-stage-$v"; mkdir -p "$stg/bin"
+            # extract this variant's payload (the .so + its bundled libs)
+            python3 - "$mc" "$stg" "$v" <<'PY'
           import sys,gzip,io,tarfile,os
           src,stg,var=sys.argv[1],sys.argv[2],sys.argv[3]; pre=f"variants/{var}/"
           tf=tarfile.open(fileobj=io.BytesIO(gzip.open(src,'rb').read()))
@@ -95,22 +118,32 @@ jobs:
                   dst=os.path.join(stg,m.name[len(pre):]); os.makedirs(os.path.dirname(dst) or '.',exist_ok=True)
                   open(dst,'wb').write(tf.extractfile(m).read())
           PY
-          # engine binaries under bin/ (resolveBin looks at <module>/bin/<name> first):
-          install -m755 "$LEZ/wallet"                 "$stg/bin/wallet-lez"
-          install -m755 module/scripts/wallet-wrapper  "$stg/bin/wallet"
-          install -m755 "$LEZ/sequencer_service"       "$stg/bin/sequencer_service"
-          install -m755 "$LEZ/sequencer_service_l1"    "$stg/bin/sequencer_service_l1"
-          install -m755 "$DIA/diaphani-forward"        "$stg/bin/diaphani-forward" || true
-          install -m755 module/scripts/medusa-tor-monitor "$stg/bin/medusa-tor-monitor"
-          # Bundle Tor so the Paradox·Tor zone works with no external install (make-release.sh
-          # does the same). Non-fatal: resolveTorBin falls back to a system tor.
-          sudo apt-get update -qq && sudo apt-get install -y -qq tor || true
-          tor_bin="$(command -v tor || true)"
-          if [ -n "$tor_bin" ]; then install -m755 "$(readlink -f "$tor_bin")" "$stg/bin/medusa-tor"; fi
-          mainfile=$(basename "$(ls "$stg"/*.so 2>/dev/null || ls "$stg"/*plugin* | head -1)")
-          cp "$mc" medusa_core-selfcontained.lgx; chmod u+w medusa_core-selfcontained.lgx
-          "$LGX" add medusa_core-selfcontained.lgx -v "${{ matrix.variant }}" -f "$stg" --main "$mainfile" -y
+            # engine binaries under bin/ (resolveBin looks at <module>/bin/<name> first):
+            install -m755 "$LEZ/wallet"                     "$stg/bin/wallet-lez"
+            install -m755 module/scripts/wallet-wrapper      "$stg/bin/wallet"
+            install -m755 "$LEZ/sequencer_service"           "$stg/bin/sequencer_service"
+            install -m755 "$LEZ/sequencer_service_l1"        "$stg/bin/sequencer_service_l1"
+            install -m755 "$DIA/diaphani-forward"            "$stg/bin/diaphani-forward" || true
+            install -m755 module/scripts/medusa-tor-monitor  "$stg/bin/medusa-tor-monitor"
+            if [ -n "$tor_bin" ]; then install -m755 "$(readlink -f "$tor_bin")" "$stg/bin/medusa-tor"; fi
+            mainfile=$(basename "$(ls "$stg"/*.so 2>/dev/null || ls "$stg"/*plugin* | head -1)")
+            "$LGX" add medusa_core-selfcontained.lgx -v "$v" -f "$stg" --main "$mainfile" -y
+          done
           "$LGX" verify medusa_core-selfcontained.lgx
+
+          # Guard the regression this step exists to prevent: every linux variant must carry the
+          # engine, or a whole class of Basecamp install silently gets a wallet-less module.
+          python3 - medusa_core-selfcontained.lgx <<'PY'
+          import sys,gzip,io,tarfile
+          tf=tarfile.open(fileobj=io.BytesIO(gzip.open(sys.argv[1],'rb').read()))
+          names=[m.name for m in tf.getmembers()]
+          vs={n.split('/')[1] for n in names
+              if n.startswith('variants/') and len(n.split('/')) > 2 and n.split('/')[1].startswith('linux-')}
+          bad=[v for v in vs if f"variants/{v}/bin/wallet-lez" not in names]
+          if bad:
+              sys.exit("ERROR: linux variants missing bin/wallet-lez: %s" % ", ".join(sorted(bad)))
+          print("ok: engine bundled into", ", ".join(sorted(vs)))
+          PY
 
       - name: Collect artifacts
         run: |
