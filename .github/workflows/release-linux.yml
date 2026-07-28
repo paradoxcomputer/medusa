@@ -14,8 +14,14 @@ name: release-linux
 
 on:
   push:
-    tags: ["v*"]
+    # "publish-<version>" re-runs just this job (mac is v* only), so the merge+upload step
+    # below can be redone without paying for another macOS build.
+    tags: ["v*", "publish-*"]
   workflow_dispatch:
+
+permissions:
+  contents: write   # upload the finished .lgx to the release
+  actions: read     # pull the darwin artifact from the release-macos run
 
 jobs:
   build:
@@ -157,3 +163,46 @@ jobs:
         with:
           name: linux-lgx-${{ matrix.variant }}
           path: artifacts/*.lgx
+
+      # Merge with the darwin build and publish, so a release needs no local tooling. The linux
+      # runner already has the lgx CLI from the step above, and macOS cannot be built here, so
+      # this side does the merge: pull the newest successful release-macos artifact, merge each
+      # package into one multi-variant .lgx, and attach it to the release.
+      - name: Merge with darwin and attach the .lgx to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ver=$(python3 -c "import json;print(json.load(open('module/modules/medusa_core/manifest.json'))['version'])")
+          tag="v$ver"
+          echo "release tag: $tag"
+
+          mac_run=$(gh run list --workflow release-macos.yml --status success \
+                      --limit 1 --json databaseId -q '.[0].databaseId' || true)
+          if [ -z "$mac_run" ]; then
+            echo "::warning::no successful release-macos run found - publishing linux-only packages"
+          else
+            echo "merging with darwin artifacts from run $mac_run"
+            mkdir -p macdl && gh run download "$mac_run" -D macdl
+          fi
+
+          mkdir -p publish
+          for pkg in medusa_core medusa_ui tip_jar; do
+            lin="artifacts/$pkg-${{ matrix.variant }}.lgx"
+            [ -f "$lin" ] || { echo "::warning::$lin missing, skipping"; continue; }
+            mac=$(find macdl -name "$pkg-darwin-*.lgx" 2>/dev/null | head -1 || true)
+            out="publish/$pkg-$ver.lgx"
+            if [ -n "$mac" ]; then
+              "$LGX" merge "$lin" "$mac" -o "$out" -y
+            else
+              cp "$lin" "$out"
+            fi
+            "$LGX" verify "$out"
+          done
+          ls -la publish
+
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            echo "::error::release $tag does not exist - create it first"; exit 1
+          fi
+          gh release upload "$tag" publish/*.lgx --clobber
+          echo "attached $(ls publish | tr '\n' ' ')to $tag"
