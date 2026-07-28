@@ -1,0 +1,126 @@
+# Build the SELF-CONTAINED linux-amd64 Medusa apps (.lgx) in CI.
+#
+# The linux counterpart of release-macos.yml. Until now the linux .lgx was only ever produced
+# by running module/scripts/make-release.sh by hand on a machine with Nix + Rust, which meant a
+# release could not be cut without that machine. This builds the same artifacts on a GitHub
+# runner so a tag produces BOTH variants.
+#
+# Output: a self-contained `linux-amd64` medusa_core (engine + sequencers + Tor + Tor-forward
+# bundled under bin/) plus medusa_ui + tip_jar. These are merged with the darwin .lgx into the
+# multi-variant packages served by the module catalog.
+#
+# Trigger: a release tag (v*) or manual dispatch, matching release-macos.yml.
+name: release-linux
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            variant: linux-amd64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }   # tags, for a reproducible engine build
+
+      - name: Install Nix (flakes)
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Rust toolchain (+ risc0)
+        run: |
+          rustup default stable || true
+          # The LEZ wallet builds risc0 guest programs - install the zkVM toolchain.
+          # (If the crate vendors/pins its own, this is a harmless no-op.)
+          cargo install cargo-risczero || true
+          cargo risczero install || true
+
+      - name: Build the LEZ engine (patched rc5 source)
+        run: |
+          # clones logos-execution-zone@v0.2.0-rc5, applies wallet/patches-rc5/*, builds:
+          #   wallet (→ wallet-lez), sequencer_service (standalone), sequencer_service_l1 (L1),
+          #   diaphani-forward (Tor forwarder).
+          # patches-rc5/0002 keeps the `keycard` cargo feature OFF, so the wallet links no
+          # libpython - see the linkage assertion below.
+          bash wallet/build.sh
+          echo "LEZ=$PWD/wallet/.lez-build/target/release"     >> "$GITHUB_ENV"
+          echo "DIA=$PWD/wallet/.diaphani-build/target/release" >> "$GITHUB_ENV"
+
+      - name: Assert the engine has no build-host Python dependency
+        run: |
+          set -euo pipefail
+          # medusa#1: wallet-lez used to link the build host's libpython and died at load time
+          # on every other machine. Fail the build here rather than shipping that again.
+          for b in wallet sequencer_service sequencer_service_l1; do
+            out=$(readelf -d "$LEZ/$b" || true)
+            case "$out" in
+              *libpython*) echo "ERROR: $b links libpython - keycard feature leaked back in"; exit 1 ;;
+            esac
+          done
+          echo "ok: no libpython in the engine binaries"
+
+      - name: Build module .lgx (native linux, self-contained .so)
+        run: |
+          set -euo pipefail
+          out="$PWD/lin-out"; mkdir -p "$out"
+          ( cd module                   && nix build .#lgx-portable -o result-portable ); cp module/result-portable/*.lgx                   "$out/medusa_core.lgx"
+          ( cd module/plugins/medusa_ui && nix build .#lgx-portable -o result-portable ); cp module/plugins/medusa_ui/result-portable/*.lgx "$out/medusa_ui.lgx"
+          ( cd examples/tip-jar         && nix build .#lgx-portable -o result-portable ); cp examples/tip-jar/result-portable/*.lgx         "$out/tip_jar.lgx"
+          echo "LINOUT=$out" >> "$GITHUB_ENV"
+
+      - name: Obtain the lgx CLI (built as a nix dep; pin against GC)
+        run: |
+          drv=$(ls -t /nix/store/*-lgx-0.1.0.drv | grep -vE 'logos|module' | head -1)
+          nix-store --realise "$drv" --add-root "$PWD/lgx-cli" >/dev/null
+          echo "LGX=$PWD/lgx-cli/bin/lgx" >> "$GITHUB_ENV"
+
+      - name: Bundle the engine into the ${{ matrix.variant }} medusa_core
+        run: |
+          set -euo pipefail
+          mc="$LINOUT/medusa_core.lgx"
+          stg="$PWD/mc-stage"; mkdir -p "$stg/bin"
+          # extract the linux variant payload (the .so + its bundled libs)
+          python3 - "$mc" "$stg" "${{ matrix.variant }}" <<'PY'
+          import sys,gzip,io,tarfile,os
+          src,stg,var=sys.argv[1],sys.argv[2],sys.argv[3]; pre=f"variants/{var}/"
+          tf=tarfile.open(fileobj=io.BytesIO(gzip.open(src,'rb').read()))
+          for m in tf.getmembers():
+              if m.name.startswith(pre) and not m.isdir():
+                  dst=os.path.join(stg,m.name[len(pre):]); os.makedirs(os.path.dirname(dst) or '.',exist_ok=True)
+                  open(dst,'wb').write(tf.extractfile(m).read())
+          PY
+          # engine binaries under bin/ (resolveBin looks at <module>/bin/<name> first):
+          install -m755 "$LEZ/wallet"                 "$stg/bin/wallet-lez"
+          install -m755 module/scripts/wallet-wrapper  "$stg/bin/wallet"
+          install -m755 "$LEZ/sequencer_service"       "$stg/bin/sequencer_service"
+          install -m755 "$LEZ/sequencer_service_l1"    "$stg/bin/sequencer_service_l1"
+          install -m755 "$DIA/diaphani-forward"        "$stg/bin/diaphani-forward" || true
+          install -m755 module/scripts/medusa-tor-monitor "$stg/bin/medusa-tor-monitor"
+          # Bundle Tor so the Paradox·Tor zone works with no external install (make-release.sh
+          # does the same). Non-fatal: resolveTorBin falls back to a system tor.
+          sudo apt-get update -qq && sudo apt-get install -y -qq tor || true
+          tor_bin="$(command -v tor || true)"
+          if [ -n "$tor_bin" ]; then install -m755 "$(readlink -f "$tor_bin")" "$stg/bin/medusa-tor"; fi
+          mainfile=$(basename "$(ls "$stg"/*.so 2>/dev/null || ls "$stg"/*plugin* | head -1)")
+          cp "$mc" medusa_core-selfcontained.lgx; chmod u+w medusa_core-selfcontained.lgx
+          "$LGX" add medusa_core-selfcontained.lgx -v "${{ matrix.variant }}" -f "$stg" --main "$mainfile" -y
+          "$LGX" verify medusa_core-selfcontained.lgx
+
+      - name: Collect artifacts
+        run: |
+          dst="$PWD/artifacts"; mkdir -p "$dst"
+          cp medusa_core-selfcontained.lgx "$dst/medusa_core-${{ matrix.variant }}.lgx"
+          cp "$LINOUT"/medusa_ui.lgx "$dst/medusa_ui-${{ matrix.variant }}.lgx"
+          cp "$LINOUT"/tip_jar.lgx   "$dst/tip_jar-${{ matrix.variant }}.lgx"
+          ls -la "$dst"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-lgx-${{ matrix.variant }}
+          path: artifacts/*.lgx
