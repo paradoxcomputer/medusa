@@ -46,6 +46,10 @@ jobs:
 
       - name: Build the LEZ engine (patched rc5 source)
         run: |
+          # build.sh replays the patch series with `git am`, which needs a committer identity.
+          # The macOS image happens to supply one today; don't depend on that.
+          git config --global user.name  "medusa build"
+          git config --global user.email "build@medusa.local"
           # clones logos-execution-zone@v0.2.0-rc5, applies wallet/patches-rc5/*, builds:
           #   wallet (→ wallet-lez), sequencer_service (standalone), sequencer_service_l1 (L1),
           #   diaphani-forward (Tor forwarder). Produces native darwin binaries.

@@ -39,16 +39,30 @@ jobs:
       - name: Install Nix (flakes)
         uses: DeterminateSystems/nix-installer-action@main
 
+      # cargo-risczero is a ~30 minute source build, which dominated the first run's wall clock.
+      # Cache the resulting binaries so retries start at the part that matters.
+      - name: Cache risc0 toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-risczero
+            ~/.cargo/bin/r0vm
+          key: risc0-${{ runner.os }}-cargo-risczero
+
       - name: Rust toolchain (+ risc0)
         run: |
           rustup default stable || true
           # The LEZ wallet builds risc0 guest programs - install the zkVM toolchain.
           # (If the crate vendors/pins its own, this is a harmless no-op.)
-          cargo install cargo-risczero || true
+          command -v cargo-risczero >/dev/null || cargo install cargo-risczero || true
           cargo risczero install || true
 
       - name: Build the LEZ engine (patched rc5 source)
         run: |
+          # wallet/build.sh replays the patch series with `git am`, which refuses to run without a
+          # committer identity. GitHub's ubuntu image ships none, so set one for this checkout.
+          git config --global user.name  "medusa build"
+          git config --global user.email "build@medusa.local"
           # clones logos-execution-zone@v0.2.0-rc5, applies wallet/patches-rc5/*, builds:
           #   wallet (→ wallet-lez), sequencer_service (standalone), sequencer_service_l1 (L1),
           #   diaphani-forward (Tor forwarder).
