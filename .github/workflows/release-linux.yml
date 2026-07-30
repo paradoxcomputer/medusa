@@ -200,12 +200,32 @@ jobs:
             mkdir -p macdl && gh run download "$mac_run" -D macdl
           fi
 
+          # lgx merge requires every manifest field except `main` to match, so a darwin artifact
+          # from an older release cannot be merged into this one. Detect that here and say so,
+          # rather than letting merge fail with a field-by-field diff.
+          macver=""
+          if [ -n "$mac_run" ]; then
+            maccore=$(find macdl -name "medusa_core-darwin-*.lgx" | head -1 || true)
+            if [ -n "$maccore" ]; then
+              macver=$(python3 -c "import sys,gzip,io,tarfile,json;tf=tarfile.open(fileobj=io.BytesIO(gzip.open(sys.argv[1],'rb').read()));print(json.load(tf.extractfile('manifest.json'))['version'])" "$maccore")
+              echo "darwin artifact version: $macver (this build: $ver)"
+              if [ "$macver" != "$ver" ]; then
+                echo "::error::darwin artifacts are v$macver but this build is v$ver."
+                echo "::error::Push tag v$ver to rebuild macOS, then re-run this workflow."
+                exit 1
+              fi
+            fi
+          fi
+
           mkdir -p publish
           for pkg in medusa_core medusa_ui tip_jar; do
             lin="artifacts/$pkg-${{ matrix.variant }}.lgx"
             [ -f "$lin" ] || { echo "::warning::$lin missing, skipping"; continue; }
             mac=$(find macdl -name "$pkg-darwin-*.lgx" 2>/dev/null | head -1 || true)
-            out="publish/$pkg-$ver.lgx"
+            # name each file after ITS OWN manifest version, so the catalog's generated index
+            # never advertises a version that disagrees with the package it points at
+            pkgver=$(python3 -c "import sys,gzip,io,tarfile,json;tf=tarfile.open(fileobj=io.BytesIO(gzip.open(sys.argv[1],'rb').read()));print(json.load(tf.extractfile('manifest.json'))['version'])" "$lin")
+            out="publish/$pkg-$pkgver.lgx"
             if [ -n "$mac" ]; then
               "$LGX" merge "$lin" "$mac" -o "$out" -y
             else
@@ -215,8 +235,11 @@ jobs:
           done
           ls -la publish
 
+          # Create the release if it does not exist yet, so cutting one needs no manual step.
           if ! gh release view "$tag" >/dev/null 2>&1; then
-            echo "::error::release $tag does not exist - create it first"; exit 1
+            echo "creating release $tag"
+            gh release create "$tag" --title "Medusa $ver" \
+              --notes "Automated build of $ver. See the commit log for changes." || true
           fi
           gh release upload "$tag" publish/*.lgx --clobber
           echo "attached $(ls publish | tr '\n' ' ')to $tag"
