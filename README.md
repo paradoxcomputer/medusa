@@ -4,7 +4,7 @@ A privacy wallet for [Logos](https://logos.co) **Basecamp** - and **Connect with
 
 Medusa is a Basecamp **module**: a self-custody wallet for a Logos execution zone (LEZ). It does **public** transfers, **private** transfers (shield · deshield · private), and tokens - and your keys never leave the wallet. **Connect with Medusa** is the dApp side: a tiny SDK so another Basecamp module can connect to the wallet and have the user approve a transfer - think "Connect Wallet" / WalletConnect, but for Basecamp.
 
-> Status: **v0.2.0** (testnet, LEZ v0.2.0-rc5). Licensed **GPL-3.0** (see `LICENSE`).
+> Status: **v0.3.0** (testnet, LEZ v0.2.0). Licensed **GPL-3.0** (see `LICENSE`).
 
 ---
 
@@ -13,7 +13,7 @@ Medusa is a Basecamp **module**: a self-custody wallet for a Logos execution zon
 | Path | What it is |
 |------|------------|
 | `module/` | The Basecamp module - C++ backend (`medusa_core`) + the QML wallet UI |
-| `wallet/` | The wallet core (upstream zone @ `v0.2.0-rc5` + Medusa patches) + `build.sh` |
+| `wallet/` | The wallet core (upstream zone @ `v0.2.0` + Medusa patches) + `build.sh` |
 | `sdk/` | **Connect with Medusa** - the JS SDK (`@paradoxcomputer/medusa-connect`) |
 | `examples/tip-jar/` | A small, runnable demo module that uses the SDK |
 
@@ -108,12 +108,12 @@ Permissions: `accounts · send · shield · deshield · private · zone` - reque
 
 ## How it's built (reproducibility)
 
-- `wallet/build.sh` rebuilds the wallet from a **pinned** upstream clone + `wallet/patches-rc5/*.patch` - no machine-local checkout. It also builds the Tor forwarder (from the pinned Diaphani repo) used only by the optional Paradox · Tor zone.
+- `wallet/build.sh` rebuilds the wallet from a **pinned** upstream clone + `wallet/patches-v020/*.patch` - no machine-local checkout. It also builds the Tor forwarder (from the pinned Diaphani repo) used only by the optional Paradox · Tor zone.
 - `module/scripts/install-dev.sh` builds the module via Nix and stages everything. Flags: `--qml-only` (re-copy just the UI, instant) · `--launch` (restart Basecamp).
 
 ## Known limitations (testnet)
 
-- **Token shielding is issuer-only on LEZ v0.2.0-rc5** - a token shield must be sourced from a
+- **Token shielding is issuer-only on LEZ v0.2.0** - a token shield must be sourced from a
   direct-owned holding (e.g. a token you minted). Tokens in regular (ATA) balances cannot be
   shielded, and non-issuers cannot obtain a direct holding on this protocol version (verified
   on-chain; needs an upstream fix). Native LEZ shielding is unaffected.

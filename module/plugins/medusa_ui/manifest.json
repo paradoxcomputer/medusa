@@ -8,6 +8,6 @@
   "manifestVersion": "0.2.0",
   "name": "medusa_ui",
   "type": "ui_qml",
-  "version": "0.2.5",
+  "version": "0.3.0",
   "view": "qml/Main.qml"
 }

@@ -18,7 +18,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"      # module/
 ROOT="$(cd "$REPO/.." && pwd)"                # medusa/
 NIX="${NIX:-/nix/var/nix/profiles/default/bin/nix}"
-VERSION="${VERSION:-0.2.5}"
+VERSION="${VERSION:-0.3.0}"
 PLATFORM="${PLATFORM:-linux-amd64}"
 WB="${WALLET_BUILD:-$ROOT/wallet/.lez-build/target/release}"
 FWD_BUILD="${FWD_BUILD:-$ROOT/wallet/.diaphani-build/target/release}"

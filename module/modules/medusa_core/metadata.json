@@ -1,6 +1,6 @@
 {
   "name": "medusa_core",
-  "version": "0.2.5",
+  "version": "0.3.0",
   "description": "Native token wallet - accounts, faucet, keycard-gated transfers",
   "author": "Logos Wallet",
   "type": "core",

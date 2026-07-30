@@ -1,6 +1,6 @@
 # LEZ v0.2.0 migration notes
 
-Status: patch series ported and compiling; NOT yet the shipping default.
+Status: DEFAULT as of 0.3.0. wallet/build.sh targets v0.2.0 + patches-v020.
 
 Build with the v0.2.0 engine:
 
@@ -30,9 +30,24 @@ So an in-place upgrade would silently run a v0.2.0 binary against an rc5 chain. 
 now epoch-suffixed to prevent that. `kEngineEpoch` is "" today (paths unchanged for rc5 users);
 set it to "v020" in the SAME commit that flips build.sh's defaults.
 
-## Still to do before cutover
+## Done in the cutover
 
-- flip `LEZ_BASE_REV` / `PATCH_DIR` defaults in wallet/build.sh, and set kEngineEpoch="v020"
-- update rc5 references in release-linux.yml, release-macos.yml, README.md
-- the Paradox sequencer must upgrade at the same time: a v0.2.0 wallet cannot transact against
-  an rc5 zone, because the wallet embeds the program ImageIDs it proves against
+- build.sh defaults flipped to v0.2.0 / patches-v020 (rc5 still buildable via the env vars above)
+- kEngineEpoch = "v020", so local zones start from a fresh genesis instead of an rc5 rocksdb
+- rc5 references updated in release-linux.yml, release-macos.yml, README.md and the four
+  user-facing wrapper messages (the quirks they describe still exist in v0.2.0 - only the
+  version string was stale)
+- `account export-key` now passes --account-id (the patch declares no short form, so -a was
+  always rejected) and `import-key`, which never existed upstream, is now
+  `account import public --private-key` with the label applied via `account label`
+- the token verbs (tokens / direct-holdings / token-shield / consolidate) are gated on a
+  `wallet check-health` probe, which compares local program ImageIDs against the sequencer's.
+  Previously a mismatched zone made them return empty arrays and zero balances silently.
+
+## STILL REQUIRED BEFORE RELEASING 0.3.0
+
+The Paradox sequencer must be upgraded to v0.2.0 AT THE SAME TIME. Program ImageIDs are a hash
+of the program binary, identical across installations of a given tag but different between
+tags, and the wallet proves against the ids it was compiled with. A 0.3.0 wallet therefore
+cannot transact against the current rc5 zone at all - the probe above will refuse, by design.
+Do not publish 0.3.0 to the catalog until seq-testnet.paradox.computer runs v0.2.0.
