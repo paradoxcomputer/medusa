@@ -358,7 +358,7 @@ def owned_accounts():
 
 
 def private_dest_block(dest):
-    """LEZ v0.2.0-rc5 rejects a private OUTPUT onto any non-default private account: the
+    """LEZ v0.2.0 rejects a private OUTPUT onto any non-default private account: the
     native circuit guest-panics client-side, and a token output (even SAME-def) proves
     fine locally but is silently dropped on-chain (verified live - vault balance never
     moved). Refuse early. Two signals: our registry of past private destinations (catches
@@ -367,11 +367,11 @@ def private_dest_block(dest):
     if not dest.startswith("Private/"):
         return None
     if dest in (load_reg().get("privateDests") or []):
-        return ("this private account already received a private transfer - LEZ v0.2.0-rc5 "
+        return ("this private account already received a private transfer - LEZ v0.2.0 "
                 "private accounts are one-shot recipients; create a fresh private account")
     for a in owned_accounts():
         if a.get("id") == dest and (a.get("initialized") or (a.get("balance") or 0) > 0):
-            return ("recipient private account already holds funds/state - LEZ v0.2.0-rc5 "
+            return ("recipient private account already holds funds/state - LEZ v0.2.0 "
                     "requires an EMPTY private recipient; create a fresh private account")
     return None
 
@@ -641,10 +641,10 @@ if args and args[0] == "token-shield" and len(args) >= 5:
         if short is not None:
             msg = ("your directly-owned holding of this token has only %d - reduce the "
                    "amount (tokens sitting in an ATA can't top it up for shielding on "
-                   "LEZ v0.2.0-rc5)" % short)
+                   "LEZ v0.2.0)" % short)
         else:
             msg = ("no directly-owned holding of this token - tokens held in an associated "
-                   "token account (ATA) cannot be shielded on LEZ v0.2.0-rc5 (an ATA cannot "
+                   "token account (ATA) cannot be shielded on LEZ v0.2.0 (an ATA cannot "
                    "sign a private send and `ata send` is public-only); mint or receive the "
                    "token into a direct holding first")
         print(json.dumps({"error": msg})); sys.exit(1)

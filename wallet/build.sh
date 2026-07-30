@@ -2,7 +2,7 @@
 # Build the Medusa custom wallet + L1 sequencer, reproducibly, from a CLONE of the
 # upstream logos-execution-zone "rc5" tag + our patches - no machine-local checkout needed.
 #
-#   deployed source  ==  logos-execution-zone @ v0.2.0-rc5  +  wallet/patches-rc5/*.patch
+#   deployed source  ==  logos-execution-zone @ v0.2.0  +  wallet/patches-v020/*.patch
 #
 # Patch (rc5 series) reconstructs the deployed wallet customisations:
 #   0001 encrypted storage (Argon2id + AES-256-GCM) + account list --json + mnemonic/key export
@@ -18,13 +18,13 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 REPO="${LEZ_REPO:-https://github.com/logos-blockchain/logos-execution-zone.git}"
-BASE_REV="${LEZ_BASE_REV:-v0.2.0-rc5}"          # tag 27360cb - the rc5 base the patches apply onto
-# The patch series must match the base tag. rc5 is still the shipping default; the v0.2.0 (final)
-# series lives alongside it for the in-progress migration:
-#   LEZ_BASE_REV=v0.2.0 LEZ_PATCH_DIR=patches-v020 bash wallet/build.sh
+BASE_REV="${LEZ_BASE_REV:-v0.2.0}"              # tag a58fbce - what testnet.lez.logos.co runs
+# The patch series must match the base tag. v0.2.0 is the default; the superseded rc5 series is
+# kept alongside it and can still be built explicitly:
+#   LEZ_BASE_REV=v0.2.0-rc5 LEZ_PATCH_DIR=patches-rc5 bash wallet/build.sh   # the old engine
 # v0.2.0 is what the official public testnet (testnet.lez.logos.co) runs; rc5 is what the Paradox
 # zone runs. Wallet and zone must move together - the risc0 program ImageIDs differ between them.
-PATCH_DIR="${LEZ_PATCH_DIR:-patches-rc5}"
+PATCH_DIR="${LEZ_PATCH_DIR:-patches-v020}"
 SRC="${LEZ_SRC:-$HERE/.lez-build}"              # default: a repo-local (gitignored) clone
 
 # 1) obtain the source by CLONE (reproducible) unless an existing checkout was provided

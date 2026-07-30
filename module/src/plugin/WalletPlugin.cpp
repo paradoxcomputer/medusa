@@ -463,7 +463,7 @@ int WalletPlugin::netPort() const
 // EMPTY for the rc5 engine so existing homes keep their current path and their chain state.
 // Set this to "v020" in the SAME commit that flips wallet/build.sh to LEZ_BASE_REV=v0.2.0 +
 // PATCH_DIR=patches-v020; the two must move together or the epoch stops describing the engine.
-static constexpr const char* kEngineEpoch = "";
+static constexpr const char* kEngineEpoch = "v020";
 
 QString WalletPlugin::seqHome() const
 {
@@ -2698,7 +2698,8 @@ QString WalletPlugin::exportKey(const QString& accountId)
 
     const QString result = runWalletCommand({
         QStringLiteral("account"), QStringLiteral("export-key"),
-        QStringLiteral("-a"), accountId.trimmed()
+        // the patch declares account_id as #[arg(long)] with no short form; "-a" is rejected
+        QStringLiteral("--account-id"), accountId.trimmed()
     });
     const QJsonObject o = QJsonDocument::fromJson(result.toUtf8()).object();
     if (o.contains(QStringLiteral("error")))
@@ -2716,11 +2717,12 @@ QString WalletPlugin::importKey(const QString& privateKey, const QString& label)
     if (privateKey.trimmed().isEmpty())
         return errorJson(QStringLiteral("private key is required"));
 
-    QStringList args{ QStringLiteral("account"), QStringLiteral("import-key"), privateKey.trimmed() };
-    if (!label.trimmed().isEmpty())
-        args << QStringLiteral("--label") << label.trimmed();
-
-    const QString result = runWalletCommand(args);
+    // Upstream has no `import-key`: it is `account import public --private-key <hex>`, which
+    // takes no --label, so a label is applied afterwards with `account label`.
+    const QString result = runWalletCommand({
+        QStringLiteral("account"), QStringLiteral("import"), QStringLiteral("public"),
+        QStringLiteral("--private-key"), privateKey.trimmed()
+    });
     const QJsonObject o = QJsonDocument::fromJson(result.toUtf8()).object();
     if (o.contains(QStringLiteral("error")))
         return result;
@@ -2728,5 +2730,11 @@ QString WalletPlugin::importKey(const QString& privateKey, const QString& label)
     QJsonObject out;
     out[QStringLiteral("ok")] = true;
     enrichFromOutput(result, out);   // parses the imported "account_id Public/<id>"
+
+    const QString id = out.value(QStringLiteral("accountId")).toString();
+    if (!label.trimmed().isEmpty() && !id.isEmpty())
+        runWalletCommand({ QStringLiteral("account"), QStringLiteral("label"),
+                           QStringLiteral("--account-id"), id,
+                           QStringLiteral("--label"), label.trimmed() });
     return QJsonDocument(out).toJson(QJsonDocument::Compact);
 }
