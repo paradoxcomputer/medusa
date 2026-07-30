@@ -19,6 +19,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 REPO="${LEZ_REPO:-https://github.com/logos-blockchain/logos-execution-zone.git}"
 BASE_REV="${LEZ_BASE_REV:-v0.2.0-rc5}"          # tag 27360cb - the rc5 base the patches apply onto
+# The patch series must match the base tag. rc5 is still the shipping default; the v0.2.0 (final)
+# series lives alongside it for the in-progress migration:
+#   LEZ_BASE_REV=v0.2.0 LEZ_PATCH_DIR=patches-v020 bash wallet/build.sh
+# v0.2.0 is what the official public testnet (testnet.lez.logos.co) runs; rc5 is what the Paradox
+# zone runs. Wallet and zone must move together - the risc0 program ImageIDs differ between them.
+PATCH_DIR="${LEZ_PATCH_DIR:-patches-rc5}"
 SRC="${LEZ_SRC:-$HERE/.lez-build}"              # default: a repo-local (gitignored) clone
 
 # 1) obtain the source by CLONE (reproducible) unless an existing checkout was provided
@@ -32,8 +38,8 @@ git fetch --tags --force origin 2>/dev/null || true
 # 2) reset to the rc4 base + (re)apply the medusa patch series
 git am --abort 2>/dev/null || true
 git checkout -f -B medusa-build "$BASE_REV"
-echo ">> applying $(ls -1 "$HERE"/patches-rc5/*.patch | wc -l) medusa patches onto $BASE_REV"
-git am "$HERE"/patches-rc5/*.patch
+echo ">> applying $(ls -1 "$HERE/$PATCH_DIR"/*.patch | wc -l) medusa patches ($PATCH_DIR) onto $BASE_REV"
+git am "$HERE/$PATCH_DIR"/*.patch
 
 # 3) build the binaries from the patched tree. The sequencer has TWO builds from the same
 #    crate (one cargo output path), so build sequentially and copy each out:
