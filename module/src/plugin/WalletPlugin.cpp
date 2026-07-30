@@ -454,10 +454,24 @@ int WalletPlugin::netPort() const
     return 3080;                                         // remote+tor: local diaphani-forward listen port
 }
 
+// Bumped whenever the LEZ engine changes in a way that makes an existing chain db unusable.
+// v0.2.0 rebuilt every risc0 program, so the ImageIDs, the derived faucet/bridge system account
+// ids, and the genesis commitment tree all differ from rc5. SequencerCore::start_from_config
+// reuses an existing rocksdb with NO version check, and writeSeqConfig() below deliberately keeps
+// the old home across runs, so without this suffix a v0.2.0 binary would silently start on an
+// rc5 chain whose accounts are owned by program ids it no longer knows.
+// EMPTY for the rc5 engine so existing homes keep their current path and their chain state.
+// Set this to "v020" in the SAME commit that flips wallet/build.sh to LEZ_BASE_REV=v0.2.0 +
+// PATCH_DIR=patches-v020; the two must move together or the epoch stops describing the engine.
+static constexpr const char* kEngineEpoch = "";
+
 QString WalletPlugin::seqHome() const
 {
-    // Per-zone home (only local zones keep chain state here).
-    return walletHome() + QStringLiteral("/sequencer-") + netId();
+    // Per-zone, per-engine-epoch home (only local zones keep chain state here). A new epoch
+    // starts from a fresh genesis instead of inheriting a chain the new engine cannot read.
+    const QString epoch = QLatin1String(kEngineEpoch);
+    return walletHome() + QStringLiteral("/sequencer-") + netId()
+         + (epoch.isEmpty() ? QString() : QStringLiteral("-") + epoch);
 }
 
 bool WalletPlugin::seqHealthyUrl(const QString& url, int timeoutMs)
