@@ -21,12 +21,15 @@ static constexpr const char* kCliPathKey = "medusa-wallet/cliPath";
 static constexpr const char* kNetworkKey = "medusa-wallet/network";   // active zone id
 static constexpr const char* kZonesKey   = "medusa-wallet/zones";     // user-added remote zones (JSON)
 
-// Operator endpoints for the built-in "Paradox Computer" zones are NOT baked into the public
-// build - they are supplied at runtime so no production address ever ships in source:
+// Operator endpoints for the built-in "Paradox Computer" zones, resolved at runtime:
 //   • "Paradox Computer · Tor"      sequencer .onion: env MEDUSA_SEQ_ONION     | ~/.config/medusa-sequencer.onion
 //   • "Paradox Computer · clearnet" sequencer URL:    env MEDUSA_CLEARNET_URL  | ~/.config/medusa-clearnet.url
-// When unset, those zones are simply unavailable; the self-contained local "devnet" zone is
-// the default and needs no external infrastructure.
+// The .onion is never baked in - when unset, the Tor zone is simply unavailable.
+// The clearnet sequencer IS baked in (below): it is public infrastructure, already published in
+// examples/tip-jar (preferredZone) and sdk/medusa-connect.test.js, and without it the built-in
+// clearnet zone was selectable but resolved to an empty URL, which wrote "sequencer_addr":"" into
+// wallet_config.json and broke every subsequent wallet call with
+//   Failed to deserialize wallet config ... relative URL without a base: ""
 static QString endpointFromConfig(const char* envVar, const QString& cfgFile)
 {
     const QString env = qEnvironmentVariable(envVar).trimmed();
@@ -34,6 +37,13 @@ static QString endpointFromConfig(const char* envVar, const QString& cfgFile)
     QFile f(QDir::homePath() + QStringLiteral("/.config/") + cfgFile);
     if (f.open(QIODevice::ReadOnly)) return QString::fromUtf8(f.readAll()).trimmed();
     return QString();
+}
+// Default clearnet sequencer, overridden by env / ~/.config as above.
+static constexpr const char* kDefaultClearnetUrl = "https://seq-testnet.paradox.computer/";
+static QString clearnetUrl()
+{
+    const QString u = endpointFromConfig("MEDUSA_CLEARNET_URL", QStringLiteral("medusa-clearnet.url"));
+    return u.isEmpty() ? QString::fromLatin1(kDefaultClearnetUrl) : u;
 }
 // Bundled-Tor SOCKS port (distinct from a system Tor on 9050, so the two never clash).
 static constexpr int kTorSocksPort = 9250;
@@ -384,14 +394,11 @@ QString WalletPlugin::seqPath() const
 QString WalletPlugin::netId() const   // the active zone id
 {
     QSettings s;
-    // Default: the hosted "Paradox Computer · clearnet" zone whenever its operator endpoint
-    // is configured (env / ~/.config - see top of file). Only a pristine public build with
-    // no endpoint falls back to the self-contained local "devnet" sandbox, which needs no
-    // external infrastructure.
-    const QString def = endpointFromConfig("MEDUSA_CLEARNET_URL",
-                                           QStringLiteral("medusa-clearnet.url")).isEmpty()
-                      ? QStringLiteral("devnet")
-                      : QStringLiteral("paradox-clearnet");
+    // Default for a FRESH install: the hosted "Paradox Computer · clearnet" zone, which now
+    // always has an endpoint (clearnetUrl() falls back to the baked default). An existing
+    // install keeps whatever zone the user last selected, since that is stored in QSettings.
+    const QString def = clearnetUrl().isEmpty() ? QStringLiteral("devnet")
+                                                : QStringLiteral("paradox-clearnet");
     return s.value(QLatin1String(kNetworkKey), def).toString();
 }
 
@@ -409,7 +416,7 @@ QJsonObject WalletPlugin::zoneObj(const QString& id) const
         QJsonObject o;
         o[QStringLiteral("id")]    = id;
         o[QStringLiteral("name")]  = QStringLiteral("Paradox Computer · clearnet");
-        o[QStringLiteral("url")]   = endpointFromConfig("MEDUSA_CLEARNET_URL", QStringLiteral("medusa-clearnet.url"));
+        o[QStringLiteral("url")]   = clearnetUrl();
         o[QStringLiteral("onion")] = QString();
         o[QStringLiteral("tor")]   = false;
         return o;
@@ -752,6 +759,16 @@ QString WalletPlugin::applySequencer()
         addr = QStringLiteral("http://127.0.0.1:%1/").arg(netPort());
     }
 
+    // Never persist an empty sequencer_addr. wallet-lez parses it with the `url` crate, so a ""
+    // makes EVERY later call fail with "Failed to deserialize wallet config ... relative URL
+    // without a base" - not just the connect - and it stays broken until the file is repaired.
+    // Leave the previous config untouched and report the misconfiguration instead.
+    if (addr.isEmpty()) {
+        appendLog(QStringLiteral("zone: %1 (%2) -> no sequencer endpoint configured, config left unchanged")
+                      .arg(id, kind));
+        return QString();
+    }
+
     // read-merge-write so the wrapper's seq_* tuning keys survive
     const QString cfgp = walletHome() + QStringLiteral("/wallet_config.json");
     QJsonObject cfg;
@@ -817,7 +834,7 @@ QString WalletPlugin::getZones() const
         QJsonObject o = builtin(QStringLiteral("paradox-clearnet"),
                                 QStringLiteral("Paradox Computer · clearnet"),
                                 QStringLiteral("remote"));
-        o[QStringLiteral("endpoint")] = endpointFromConfig("MEDUSA_CLEARNET_URL", QStringLiteral("medusa-clearnet.url"));
+        o[QStringLiteral("endpoint")] = clearnetUrl();
         out.append(o);
     }
     // User zones.

@@ -119,7 +119,7 @@ Rectangle {
     // Navigation: which full screen is showing. "main" = the wallet home.
     property string screen:              "main"      // main | accounts | security | settings | network | addtoken | send | receive | privacy
     property string activeTab:           "tokens"    // tokens | activity
-    property string network:             "diaphani"  // active zone id (default: Paradox Computer · Tor)
+    property string network:             "paradox-clearnet"  // active zone id (default: Paradox Computer · clearnet)
     property var    zones:               []          // [{id,name,kind,endpoint,tor,builtin}]
     property bool   addZoneOpen:         false       // add/edit-zone form in the Zones screen
     property string editingZoneId:       ""          // non-empty → the form edits this zone

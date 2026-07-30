@@ -1,6 +1,6 @@
 {
   "name": "medusa_ui",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "type": "ui_qml",
   "category": "blockchain",
   "description": "Native token wallet UI: accounts, faucet, keycard-gated transfers",

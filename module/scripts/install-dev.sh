@@ -57,7 +57,7 @@ write_core_manifest() {
   "icon": "",
   "main": { "linux-amd64": "medusa_core_plugin.so", "linux-amd64-dev": "medusa_core_plugin.so",
             "linux-x86_64-dev": "medusa_core_plugin.so", "darwin-arm64": "medusa_core_plugin.dylib" },
-  "manifestVersion": "0.2.0", "name": "medusa_core", "type": "core", "version": "0.2.4"
+  "manifestVersion": "0.2.0", "name": "medusa_core", "type": "core", "version": "0.2.5"
 }
 MANIFEST
 }
@@ -66,7 +66,7 @@ write_ui_manifest() {
 {
   "author": "Paradox Computer", "category": "blockchain", "dependencies": ["medusa_core"],
   "description": "Medusa wallet UI", "icon": "icons/medusa-icon.png", "main": {},
-  "manifestVersion": "0.2.0", "name": "medusa_ui", "type": "ui_qml", "version": "0.2.4",
+  "manifestVersion": "0.2.0", "name": "medusa_ui", "type": "ui_qml", "version": "0.2.5",
   "view": "qml/Main.qml"
 }
 MANIFEST
