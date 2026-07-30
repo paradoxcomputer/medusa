@@ -62,6 +62,16 @@ def main():
         sys.stdin.read()
     st = load()
 
+    # The real CLI compares its compiled program ImageIDs against the sequencer's
+    # getProgramIds and asserts. The wrapper gates its token verbs on this, so the fake
+    # must answer it; $FAKE_ZONE_MISMATCH=1 simulates a wallet pointed at a foreign zone.
+    if a[:1] == ["check-health"]:
+        if os.environ.get("FAKE_ZONE_MISMATCH") == "1":
+            print("Local ID for token program is different from remote", file=sys.stderr)
+            return 1
+        print("All looks good")
+        return 0
+
     if a[:2] == ["account", "list"]:
         print(json.dumps(st["accounts"]))
         return 0

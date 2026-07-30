@@ -159,10 +159,39 @@ def token_name(reg, defid):
         return reg["names"][defid]
     g = run(["account", "get", "--account-id", "Public/" + defid])
     m = re.search(r'"name"\s*:\s*"([^"]+)"', g.stdout or "")
-    name = m.group(1) if m else (defid[:6] + "…")
-    reg["names"][defid] = name
+    if not m:
+        # Don't cache: a miss here is usually transient (or a zone/binary program-id mismatch,
+        # where `account get` silently stops reporting token holdings). Caching the placeholder
+        # would pin a wrong ticker forever, since definitions are otherwise immutable.
+        return defid[:6] + "…"
+    reg["names"][defid] = m.group(1)
     save_reg(reg)
-    return name
+    return m.group(1)
+
+
+# ── Zone/binary compatibility ────────────────────────────────────────────────────────
+# The wallet proves against the risc0 program ImageIDs it was COMPILED with. Point it at a
+# zone running a different LEZ build and nothing errors: `account get` stops recognising token
+# holdings, so the token verbs below would return empty arrays and zero balances - a silent
+# wrong answer. `wallet check-health` compares local ids against the sequencer's getProgramIds
+# and asserts, so any non-zero exit means "incompatible". Cached per process; the module calls
+# us once per operation.
+_zone_ok = None
+
+
+def zone_compatible():
+    global _zone_ok
+    if _zone_ok is None:
+        try:
+            r = run(["check-health"], timeout=45)
+            _zone_ok = (r.returncode == 0)
+        except Exception:
+            _zone_ok = False
+    return _zone_ok
+
+
+ZONE_MISMATCH = ("this zone runs a different LEZ build than this wallet (program ids differ) - "
+                 "switch zone, or install a Medusa built for it")
 
 
 # ── Token faucet treasury - a separate wallet that mints the whitelist tokens, holds
@@ -495,6 +524,8 @@ if len(args) >= 2 and args[0] == "token" and args[1] == "new":
 # `tokens <account-id>` (wrapper verb) → JSON array of the account's token holdings
 # across every registered definition: [{definitionId, ticker, balance}].
 if args and args[0] == "tokens":
+    if not zone_compatible():
+        print(json.dumps({"error": ZONE_MISMATCH})); sys.exit(1)
     reg = seed_whitelist(load_reg())
     owner_bare = (args[1].split("/")[-1] if len(args) > 1 else "")
     holdings = []
@@ -611,6 +642,8 @@ if args and args[0] == "token-transfer" and len(args) >= 5:
 # NOTE: <from-owner> is advisory (kept for the module's job record) - holdings are
 # wallet-global, so the ACTUAL debited account is the resolved direct holding.
 if args and args[0] == "token-shield" and len(args) >= 5:
+    if not zone_compatible():
+        print(json.dumps({"error": ZONE_MISMATCH})); sys.exit(1)
     dest = args[2] if args[2].startswith("Private/") else "Private/" + args[2].split("/")[-1]
     defb = args[3].split("/")[-1]
     try:
@@ -683,6 +716,8 @@ if args and args[0] == "token-deshield" and len(args) >= 5:
 # account}]. These are the only accounts that can SOURCE a token shield on rc5 - the UI's
 # shield asset picker is fed from this, so it never offers un-shieldable ATA balances.
 if args and args[0] == "direct-holdings":
+    if not zone_compatible():
+        print(json.dumps({"error": ZONE_MISMATCH})); sys.exit(1)
     reg = load_reg()
     out = direct_holdings_list()
     # Per-def ATA totals across owned public accounts - the "unshielded" remainder a
@@ -711,6 +746,8 @@ if args and args[0] == "direct-holdings":
 # EXIST as a holding (a faucet claim / any direct credit seeds it) - the chain rejects
 # ata-sends to non-holding accounts (verified).
 if args and args[0] == "consolidate" and len(args) >= 3:
+    if not zone_compatible():
+        print(json.dumps({"error": ZONE_MISMATCH})); sys.exit(1)
     owner = args[1].split("/")[-1]
     defb = args[2].split("/")[-1]
     bal = ata_balance(owner, defb) or 0
