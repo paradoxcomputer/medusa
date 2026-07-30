@@ -45,6 +45,16 @@ static QString clearnetUrl()
     const QString u = endpointFromConfig("MEDUSA_CLEARNET_URL", QStringLiteral("medusa-clearnet.url"));
     return u.isEmpty() ? QString::fromLatin1(kDefaultClearnetUrl) : u;
 }
+// The official Logos public testnet (logos-co). Runs LEZ v0.2.0, the same engine this build is
+// compiled against, so the program ImageIDs match and the wallet can transact there. Kept as a
+// separate preset zone: accounts/keys are shared across zones but balances are per-zone.
+static constexpr const char* kDefaultLogosTestnetUrl = "https://testnet.lez.logos.co/";
+static QString logosTestnetUrl()
+{
+    const QString u = endpointFromConfig("MEDUSA_LOGOS_TESTNET_URL",
+                                         QStringLiteral("medusa-logos-testnet.url"));
+    return u.isEmpty() ? QString::fromLatin1(kDefaultLogosTestnetUrl) : u;
+}
 // Bundled-Tor SOCKS port (distinct from a system Tor on 9050, so the two never clash).
 static constexpr int kTorSocksPort = 9250;
 // Bundled-Tor control port (for the onion-connection-stage monitor).
@@ -417,6 +427,16 @@ QJsonObject WalletPlugin::zoneObj(const QString& id) const
         o[QStringLiteral("id")]    = id;
         o[QStringLiteral("name")]  = QStringLiteral("Paradox Computer · clearnet");
         o[QStringLiteral("url")]   = clearnetUrl();
+        o[QStringLiteral("onion")] = QString();
+        o[QStringLiteral("tor")]   = false;
+        return o;
+    }
+    // Built-in remote zone: the official Logos public testnet (logos-co, LEZ v0.2.0).
+    if (id == QStringLiteral("logos-testnet")) {
+        QJsonObject o;
+        o[QStringLiteral("id")]    = id;
+        o[QStringLiteral("name")]  = QStringLiteral("Logos · public testnet");
+        o[QStringLiteral("url")]   = logosTestnetUrl();
         o[QStringLiteral("onion")] = QString();
         o[QStringLiteral("tor")]   = false;
         return o;
@@ -849,6 +869,14 @@ QString WalletPlugin::getZones() const
                                 QStringLiteral("Paradox Computer · clearnet"),
                                 QStringLiteral("remote"));
         o[QStringLiteral("endpoint")] = clearnetUrl();
+        out.append(o);
+    }
+    // The official Logos public testnet (logos-co). Same LEZ v0.2.0 engine as this build.
+    {
+        QJsonObject o = builtin(QStringLiteral("logos-testnet"),
+                                QStringLiteral("Logos · public testnet"),
+                                QStringLiteral("remote"));
+        o[QStringLiteral("endpoint")] = logosTestnetUrl();
         out.append(o);
     }
     // User zones.
