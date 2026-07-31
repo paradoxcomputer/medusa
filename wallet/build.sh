@@ -54,7 +54,27 @@ echo ">> wallet:                       $SRC/target/release/wallet"
 echo ">> sequencer (standalone/devnet): $SRC/target/release/sequencer_service"
 echo ">> sequencer (L1/diaphani):       $SRC/target/release/sequencer_service_l1"
 
-# 4) diaphani-forward - the Tor TCP-forwarder for the "Paradox Computer · Tor" zone. It lives in
+# 4) medusa-faucet-client - operator client for the medusa_faucet LEZ program
+#    (deploy / init-treasury / claim). Builds against the SAME patched tree via
+#    path-deps, so it inherits the pyo3-free wallet crate (medusa#1).
+echo ">> building medusa-faucet-client (release)…"
+cargo build --release --manifest-path "$HERE/faucet/client/Cargo.toml"
+echo ">> medusa-faucet-client:          $HERE/faucet/client/target/release/medusa-faucet-client"
+#    The faucet GUEST (the on-chain risc0 program) is NOT built here: the reproducible
+#    build runs in docker via cargo-risczero and is an explicit operator step:
+#        cargo risczero build --manifest-path wallet/faucet/guest/Cargo.toml
+#    The resulting .bin path + its ImageID are recorded in wallet/faucet/README.md,
+#    and deploying it to any zone is likewise a separate, explicit operator step.
+
+# 4b) medusa-l1 - phase-1 Bedrock L1 client (node-side custody; read-only by default,
+#     writes gated behind MEDUSA_L1_ALLOW_WRITES=1). Builds against the pinned
+#     logos-blockchain client crates (the same git rev the LEZ tree pins), NOT the
+#     patched LEZ tree - it talks HTTP to a Bedrock node, not to a zone sequencer.
+echo ">> building medusa-l1 (release)…"
+cargo build --release --manifest-path "$HERE/l1/Cargo.toml"
+echo ">> medusa-l1:                    $HERE/l1/target/release/medusa-l1"
+
+# 5) diaphani-forward - the Tor TCP-forwarder for the "Paradox Computer · Tor" zone. It lives in
 #    the separate Diaphani project (Apache-2.0/MIT), so build it from a pinned clone like the
 #    wallet. Only needed for the Paradox·Tor zone; the default devnet zone needs no forward.
 #    Override: DIAPHANI_SRC=~/dedicated-checkout (reused as-is) or DIAPHANI_REV=<tag/rev>.
