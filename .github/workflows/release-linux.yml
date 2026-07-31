@@ -29,33 +29,65 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
+          # NOT ubuntu-latest: the image behind that label changes under us, and this job bundles
+          # an apt package (tor) into a shipped artifact, so the base image is a release input.
+          - runner: ubuntu-24.04
             variant: linux-amd64
     runs-on: ${{ matrix.runner }}
+    env:
+      # Pinned toolchain. Floating `stable` and an unversioned `cargo install` silently change
+      # the compiler and the zkVM prover under the wallet engine between runs.
+      RUST_TOOLCHAIN: "1.94.0"            # == wallet/.lez-build/rust-toolchain.toml
+      RISC0_VERSION: "3.0.5"              # == risc0-zkvm in wallet/.lez-build/Cargo.lock
+      # tor is installed into the SHIPPED medusa_core as bin/medusa-tor, so it is a release
+      # artifact and not a build tool. Exact package version, asserted after install. Bump this
+      # deliberately; a build that fails here is the control working.
+      TOR_APT_VERSION: "0.4.8.10-1build2" # the only tor published for noble/amd64
+      # sha256 of that binary. Empty = record it in PROVENANCE only. Fill this in from the first
+      # pinned run's PROVENANCE file to turn it into a hard pre-bundle assertion.
+      TOR_SHA256: ""
     steps:
-      - uses: actions/checkout@v4
+      # Every `uses:` is pinned to a full commit sha with the tag in a trailing comment.
+      # nix-installer-action was tracking @main: a branch on a third-party org that runs first
+      # and installs the build system. The rest were on mutable major tags. Dependabot updates
+      # sha pins fine.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }   # tags, for a reproducible engine build
 
       - name: Install Nix (flakes)
-        uses: DeterminateSystems/nix-installer-action@main
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
       # cargo-risczero is a ~30 minute source build, which dominated the first run's wall clock.
-      # Cache the resulting binaries so retries start at the part that matters.
+      # Cache the resulting binaries so retries start at the part that matters. The key names the
+      # versions, so a pin bump cannot silently keep serving the old executables.
       - name: Cache risc0 toolchain
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/bin/cargo-risczero
             ~/.cargo/bin/r0vm
-          key: risc0-${{ runner.os }}-cargo-risczero
+          key: risc0-${{ runner.os }}-cargo-risczero-${{ env.RISC0_VERSION }}-rust-${{ env.RUST_TOOLCHAIN }}
 
       - name: Rust toolchain (+ risc0)
         run: |
-          rustup default stable || true
-          # The LEZ wallet builds risc0 guest programs - install the zkVM toolchain.
-          # (If the crate vendors/pins its own, this is a harmless no-op.)
-          command -v cargo-risczero >/dev/null || cargo install cargo-risczero || true
-          cargo risczero install || true
+          set -euo pipefail
+          # Pinned, not `stable`. The LEZ tree's own rust-toolchain.toml already asks for this
+          # version inside wallet/.lez-build; this pins the same compiler for the crates built
+          # outside it (wallet/faucet/client, wallet/l1).
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+          # A restored cache is untrusted input: revalidate the executable against the pin and
+          # reinstall on any mismatch, rather than trusting whatever the cache handed back.
+          if ! cargo risczero --version 2>/dev/null | grep -qF "$RISC0_VERSION"; then
+            cargo install cargo-risczero --version "$RISC0_VERSION" --locked --force
+          fi
+          cargo risczero --version
+          # NOTE: at risc0 3.x `cargo risczero install` only errors with "Run `rzup install`
+          # instead" (risc0 v3.0.5, risc0/cargo-risczero/src/commands/install.rs), so it is a
+          # no-op here. Kept and pinned for older RISC0_VERSION pins. The zkVM guest programs
+          # this build needs are prebuilt .bin artifacts committed in the LEZ tree and included
+          # by build_utils::include_artifacts, so nothing compiles a guest on this runner.
+          cargo risczero install --version "$RISC0_VERSION" || true
 
       - name: Build the LEZ engine (patched v0.2.0 source)
         run: |
@@ -107,9 +139,22 @@ jobs:
           cp "$mc" medusa_core-selfcontained.lgx; chmod u+w medusa_core-selfcontained.lgx
 
           # Bundle Tor once so the Paradox·Tor zone works with no external install
-          # (make-release.sh does the same). Non-fatal: resolveTorBin falls back to a system tor.
-          sudo apt-get update -qq && sudo apt-get install -y -qq tor || true
-          tor_bin="$(command -v tor || true)"
+          # (make-release.sh does the same). This binary is SHIPPED, so it is pinned to an exact
+          # package version, asserted after install, and its sha256 recorded into PROVENANCE
+          # (and asserted, once TOR_SHA256 is filled in). Fail closed: this used to be `|| true`,
+          # which silently published a medusa_core with no Tor in it.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq "tor=$TOR_APT_VERSION"
+          got_tor="$(dpkg-query -W -f='${Version}' tor)"
+          [ "$got_tor" = "$TOR_APT_VERSION" ] || {
+            echo "ERROR: installed tor is $got_tor, expected $TOR_APT_VERSION"; exit 1; }
+          tor_bin="$(readlink -f "$(command -v tor)")"
+          tor_sha="$(sha256sum "$tor_bin" | cut -d' ' -f1)"
+          echo "bundling tor $got_tor  sha256=$tor_sha  ($tor_bin)"
+          if [ -n "${TOR_SHA256:-}" ] && [ "$tor_sha" != "${TOR_SHA256}" ]; then
+            echo "ERROR: tor sha256 $tor_sha does not match the pinned ${TOR_SHA256}"; exit 1
+          fi
+          echo "TOR_BIN=$tor_bin" >> "$GITHUB_ENV"
 
           # Every linux variant the nix build emitted, not just linux-amd64. The Nix DEV build of
           # Basecamp only loads "-dev" variants (see module/scripts/install-dev.sh), so bundling
@@ -143,9 +188,11 @@ jobs:
             install -m755 module/scripts/wallet-wrapper      "$stg/bin/wallet"
             install -m755 "$LEZ/sequencer_service"           "$stg/bin/sequencer_service"
             install -m755 "$LEZ/sequencer_service_l1"        "$stg/bin/sequencer_service_l1"
-            install -m755 "$DIA/diaphani-forward"            "$stg/bin/diaphani-forward" || true
+            # No `|| true` here: wallet/build.sh now fails closed if the pinned diaphani commit
+            # cannot be checked out, so a missing binary means the pin check was bypassed.
+            install -m755 "$DIA/diaphani-forward"            "$stg/bin/diaphani-forward"
             install -m755 module/scripts/medusa-tor-monitor  "$stg/bin/medusa-tor-monitor"
-            if [ -n "$tor_bin" ]; then install -m755 "$(readlink -f "$tor_bin")" "$stg/bin/medusa-tor"; fi
+            install -m755 "$tor_bin"                         "$stg/bin/medusa-tor"
             mainfile=$(basename "$(ls "$stg"/*.so 2>/dev/null || ls "$stg"/*plugin* | head -1)")
             "$LGX" add medusa_core-selfcontained.lgx -v "$v" -f "$stg" --main "$mainfile" -y
           done
@@ -173,10 +220,21 @@ jobs:
           cp "$LINOUT"/tip_jar.lgx   "$dst/tip_jar-${{ matrix.variant }}.lgx"
           ls -la "$dst"
 
-      - uses: actions/upload-artifact@v4
+      # Without this, identifying which engine a published .lgx contains means fingerprinting a
+      # risc0 circuit source path inside the binary. Record the upstream commit, every patch's
+      # sha256 and every artifact's sha256 instead.
+      - name: Record provenance
+        run: |
+          set -euo pipefail
+          bash scripts/gen-provenance.sh "$PWD/PROVENANCE.txt" artifacts
+          cp PROVENANCE.txt "artifacts/PROVENANCE-${{ matrix.variant }}.txt"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-lgx-${{ matrix.variant }}
-          path: artifacts/*.lgx
+          path: |
+            artifacts/*.lgx
+            artifacts/PROVENANCE-*.txt
 
       # Merge with the darwin build and publish, so a release needs no local tooling. The linux
       # runner already has the lgx CLI from the step above, and macOS cannot be built here, so
@@ -191,10 +249,16 @@ jobs:
           tag="v$ver"
           echo "release tag: $tag"
 
+          # Bound to THIS commit. Without --commit this took the newest successful release-macos
+          # run on any ref, so a workflow_dispatch from any branch could feed darwin binaries
+          # into the published multi-variant .lgx as long as the version string happened to
+          # match. The version guard below is kept as a second check, not the only one.
           mac_run=$(gh run list --workflow release-macos.yml --status success \
+                      --commit "$GITHUB_SHA" \
                       --limit 1 --json databaseId -q '.[0].databaseId' || true)
           if [ -z "$mac_run" ]; then
-            echo "::warning::no successful release-macos run found - publishing linux-only packages"
+            echo "::warning::no successful release-macos run for commit $GITHUB_SHA - publishing linux-only packages"
+            echo "::warning::(macOS builds on v* tags only; a publish-* tag must point at the same commit)"
           else
             echo "merging with darwin artifacts from run $mac_run"
             mkdir -p macdl && gh run download "$mac_run" -D macdl
@@ -235,11 +299,15 @@ jobs:
           done
           ls -la publish
 
+          # Provenance for exactly what users download: the merged, published packages.
+          bash scripts/gen-provenance.sh "$PWD/PROVENANCE-$ver.txt" publish
+          cp "PROVENANCE-$ver.txt" "publish/PROVENANCE-$ver.txt"
+
           # Create the release if it does not exist yet, so cutting one needs no manual step.
           if ! gh release view "$tag" >/dev/null 2>&1; then
             echo "creating release $tag"
             gh release create "$tag" --title "Medusa $ver" \
               --notes "Automated build of $ver. See the commit log for changes." || true
           fi
-          gh release upload "$tag" publish/*.lgx --clobber
+          gh release upload "$tag" publish/*.lgx "publish/PROVENANCE-$ver.txt" --clobber
           echo "attached $(ls publish | tr '\n' ' ')to $tag"

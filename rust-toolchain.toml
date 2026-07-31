@@ -1,0 +1,13 @@
+# Pin the Rust compiler for everything built out of this repo, so a shipped binary is not a
+# function of whatever `stable` happened to be on the build machine that day:
+#   wallet/faucet/client, wallet/l1  - operator tools
+#   wallet/.diaphani-build           - ships as bin/diaphani-forward inside medusa_core
+# The LEZ engine clone under wallet/.lez-build carries its own rust-toolchain.toml asking for
+# the same version, and the nearest file wins, so this cannot move the engine's compiler behind
+# upstream's back.
+#
+# Keep in sync with RUST_TOOLCHAIN in .github/workflows/release-linux.yml and release-macos.yml.
+
+[toolchain]
+channel = "1.94.0"
+profile = "default"

@@ -28,21 +28,35 @@ jobs:
             arch:   aarch64-apple-darwin
             variant: darwin-arm64
     runs-on: ${{ matrix.runner }}
+    env:
+      # Same pins as release-linux.yml - the two variants of one package must be built by the
+      # same compiler and the same prover version.
+      RUST_TOOLCHAIN: "1.94.0"            # == wallet/.lez-build/rust-toolchain.toml
+      RISC0_VERSION: "3.0.5"              # == risc0-zkvm in wallet/.lez-build/Cargo.lock
     steps:
-      - uses: actions/checkout@v4
+      # Every `uses:` is pinned to a full commit sha with the tag in a trailing comment.
+      # nix-installer-action was tracking @main: a branch on a third-party org that runs first
+      # and installs the build system. Dependabot updates sha pins fine.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }   # tags, for a reproducible engine build
 
       - name: Install Nix (flakes)
-        uses: DeterminateSystems/nix-installer-action@main
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
       - name: Rust toolchain (+ risc0)
         run: |
-          rustup default stable || true
-          rustup target add ${{ matrix.arch }} || true
-          # The LEZ wallet builds risc0 guest programs - install the zkVM toolchain.
-          # (If the crate vendors/pins its own, this is a harmless no-op.)
-          cargo install cargo-risczero || true
-          cargo risczero install || true
+          set -euo pipefail
+          # Pinned, not `stable`: see the note in release-linux.yml.
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+          rustup target add ${{ matrix.arch }}
+          if ! cargo risczero --version 2>/dev/null | grep -qF "$RISC0_VERSION"; then
+            cargo install cargo-risczero --version "$RISC0_VERSION" --locked --force
+          fi
+          cargo risczero --version
+          # NOTE: at risc0 3.x this only errors with "Run `rzup install` instead", so it is a
+          # no-op; the zkVM guests are prebuilt .bin artifacts committed in the LEZ tree.
+          cargo risczero install --version "$RISC0_VERSION" || true
 
       - name: Build the LEZ engine (patched v0.2.0 source)
         run: |
@@ -92,7 +106,9 @@ jobs:
           install -m755 module/scripts/wallet-wrapper "$stg/bin/wallet"
           install -m755 "$LEZ/sequencer_service"      "$stg/bin/sequencer_service"
           install -m755 "$LEZ/sequencer_service_l1"   "$stg/bin/sequencer_service_l1"
-          install -m755 "$DIA/diaphani-forward"        "$stg/bin/diaphani-forward" || true
+          # No `|| true`: wallet/build.sh now fails closed on an unresolvable diaphani pin, so a
+          # missing binary here means that check was bypassed.
+          install -m755 "$DIA/diaphani-forward"       "$stg/bin/diaphani-forward"
           # NOTE: medusa-tor is not built here - on mac the wallet falls back to a system `tor`
           #       (resolveTorBin), and the "no Tor" disclaimer covers a machine without it.
           mainfile=$(basename "$(ls "$stg"/*.dylib 2>/dev/null || ls "$stg"/*plugin* | head -1)")
@@ -108,10 +124,19 @@ jobs:
           cp "$MACOUT"/tip_jar.lgx   "$dst/tip_jar-${{ matrix.variant }}.lgx"
           ls -la "$dst"
 
-      - uses: actions/upload-artifact@v4
+      # Same record as the linux side: upstream commit, patch hashes, artifact hashes.
+      - name: Record provenance
+        run: |
+          set -euo pipefail
+          bash scripts/gen-provenance.sh "$PWD/PROVENANCE.txt" artifacts
+          cp PROVENANCE.txt "artifacts/PROVENANCE-${{ matrix.variant }}.txt"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mac-lgx-${{ matrix.variant }}
-          path: artifacts/*.lgx
+          path: |
+            artifacts/*.lgx
+            artifacts/PROVENANCE-*.txt
 
   # ── next step (do in paradox-modules-repo's release workflow) ──────────────
   # Download these mac artifacts + the linux .lgx, then for each package:
