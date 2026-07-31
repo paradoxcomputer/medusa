@@ -200,7 +200,8 @@ Rectangle {
 
     // Stop waiting on an approval. A connect-cancel returns to idle; a tip/zone-cancel returns
     // to the connected state. NOTE: cancel only stops OUR polling - the abandoned request stays
-    // approvable in the wallet for ~5 min (its TTL); approving it there still executes it.
+    // approvable in the wallet for ~15 min (its TTL, WalletPlugin.h kReqTtlMs); approving it
+    // there still executes it. Past the TTL, status() flips to rejected "approval timed out".
     function doCancel() {
         connectPoll.stop(); actionPoll.stop(); zonePoll.stop()
         root.phase = (root.sessionId && root.account) ? "connected" : "idle"

@@ -1,7 +1,7 @@
-// Connect with Medusa - SDK (JS, QML-importable wrapper over the Basecamp `logos.callModule` bridge).
+// Connect with Medusa, SDK (JS, QML-importable wrapper over the Basecamp `logos.callModule` bridge).
 //
 // Mental model: window.ethereum / WalletConnect, but for the Medusa wallet inside Basecamp.
-// Keys never cross the bridge - the SDK only ever sees account ids + results, and every connect
+// Keys never cross the bridge, the SDK only ever sees account ids + results, and every connect
 // and every write is approved by the user IN THE WALLET UI.
 //
 // Usage from a Basecamp ui_qml module:
@@ -49,7 +49,7 @@ Medusa.prototype._invoke = function (method, args) {
     return _parse(this._call(this.module, method, args || []));
 };
 
-// LEZ has no decimals - reject non-whole amounts client-side (the wallet re-validates too).
+// LEZ has no decimals, reject non-whole amounts client-side (the wallet re-validates too).
 Medusa.prototype.isWholeAmount = function (a) { return /^[0-9]+$/.test(String(a)); };
 
 // ── connect ────────────────────────────────────────────────────────────────
@@ -72,7 +72,7 @@ Medusa.prototype.status = function (requestId) { return this._invoke("actionStat
 Medusa.prototype.session = function (sessionId) { return this._invoke("sessionInfo", [sessionId]); };
 
 // ── reads ────────────────────────────────────────────────────────────────────
-// Granted account ids for the session (needs the "accounts" permission - without it the wallet
+// Granted account ids for the session (needs the "accounts" permission, without it the wallet
 // returns an empty list). Returns { accounts: [...] } | { error }.
 Medusa.prototype.getAccounts = function (sessionId) {
     var s = this.session(sessionId);
@@ -87,7 +87,7 @@ Medusa.prototype.getTokens = function (sessionId, accountId) { return this._invo
 // state !== "running" to surface the on-chain txId (the poll-style "awaitJob").
 Medusa.prototype.getJob = function (sessionId, jobId) { return this._invoke("getJob", [jobId]); };
 // True while the session is still live (the user hasn't disconnected/revoked). Poll to detect
-// disconnect - session() returns { error } once revoked.
+// disconnect, session() returns { error } once revoked.
 Medusa.prototype.isConnected = function (sessionId) {
     var s = this.session(sessionId);
     return !!(s && !s.error && s.active);
@@ -102,9 +102,9 @@ Medusa.prototype.isConnected = function (sessionId) {
 Medusa.prototype.send = function (sessionId, action) {
     action = action || {};
     if (!this.isWholeAmount(action.amount))
-        return { error: "amounts are whole numbers - no decimals" };
+        return { error: "amounts are whole numbers, no decimals" };
     // Token send/shield/deshield REQUIRE the definition id (the wallet rejects them at
-    // approval otherwise - fail here instead, before the user is even prompted). Private
+    // approval otherwise, fail here instead, before the user is even prompted). Private
     // transfers are exempt: the private note carries its own definition.
     var isPrivateOp = action.op === "private"
         || (!action.op && String(action.from || "").indexOf("Private/") === 0
@@ -133,6 +133,6 @@ Medusa.prototype.requestZone = function (sessionId, zone) {
 // ── teardown ───────────────────────────────────────────────────────────────
 Medusa.prototype.disconnect = function (sessionId) { return this._invoke("revokeSession", [sessionId]); };
 
-// CommonJS export for the node test harness - `typeof module` is "undefined" in the QML JS
+// CommonJS export for the node test harness, `typeof module` is "undefined" in the QML JS
 // engine, so this block is inert when imported into a Basecamp ui_qml module.
 if (typeof module !== "undefined" && module.exports) module.exports = { create: create, Medusa: Medusa, _parse: _parse };
