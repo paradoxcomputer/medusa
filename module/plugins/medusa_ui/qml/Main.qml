@@ -118,6 +118,16 @@ Rectangle {
     // ── State ─────────────────────────────────────────────────────────────────
     // Navigation: which full screen is showing. "main" = the wallet home.
     property string screen:              "main"      // main | accounts | security | settings | network | addtoken | send | receive | privacy
+    // INVARIANT 4 - A DEGRADED WALLET ALWAYS HAS A VISIBLE WAY OUT.
+    // The onboarding/lock screen owns the window whenever the wallet is not ready, which used to
+    // make the two panels that can rescue such a user unreachable: Security & Backup (unlock,
+    // restore from a recovery phrase, erase and start over) was gated on walletState === "ready",
+    // and Settings (which names the wallet binary that has to exist for ANY of this to work) was
+    // painted underneath. Their icons in the top bar are always live, so deliberately opening one
+    // now hands it the window. The backup screen is excluded: nothing may cover an unwritten
+    // recovery phrase.
+    readonly property bool escapeScreenOpen: (screen === "security" || screen === "settings")
+                                             && walletState !== "backup" && walletState !== "loading"
     property string activeTab:           "tokens"    // tokens | activity
     property string network:             "paradox-clearnet"  // active zone id (default: Paradox Computer · clearnet)
     property var    zones:               []          // [{id,name,kind,endpoint,tor,builtin}]
@@ -228,15 +238,124 @@ Rectangle {
     // ── Security & backup (encrypted storage, import/export) ───────────────────
     property bool   walletLocked:  false      // encrypted store + no/again password
     property bool   resetArmed:    false       // two-tap guard for "erase wallet"
-    // Onboarding state machine: loading | new | plaintext | locked | backup | ready
+    // Onboarding state machine: loading | new | locked | backup | ready.
+    // There is deliberately no "unencrypted" state: an unencrypted store is a REACHABLE wallet and
+    // not a locked one (its accounts, balances, faucet, receive, import, restore and erase all
+    // work, and there is no password to prompt for), so it routes to "ready" and the fact is
+    // carried by storeUnprotected instead. Making it a state was what stranded users in round 2.
+    // What "ready" does NOT mean is "every verb works": the core's gate refuses every GATED verb
+    // on a plaintext store, so the controls behind those verbs are disabled in that state (see
+    // signingBlocked) rather than offered and then refused.
     property string walletState:   "loading"
     property bool   revealMnemonic: false
     property bool   revealKey:      false
     property string exportedMnemonic: ""
     property string exportedKey:      ""
     property string secBusy:          ""      // non-empty = an op label in flight
+    // The password the user typed at unlock, kept for this session only (never persisted).
+    // medusa_core cannot identify its caller, so it gates every verb that exports a secret or
+    // moves funds on proof-of-user: the password re-presented as the trailing argument. Modules
+    // are separate processes, so the UI holds it and re-presents it - the user still types it
+    // exactly ONCE per session and there is deliberately NO per-transaction prompt.
+    property string sessionPw:        ""
+    property int    autoLockMs:       0       // core's idle auto-lock budget (getSecurityState)
+    property int    idleMs:           0       // ms since the last PRIVILEGED action (not polls)
+    property bool   lockWarned:       false   // one-shot "about to auto-lock" notice per session
+    property bool   cliPathIgnored:   false   // a stored CLI-path override was disowned on read
+    property string cliPathEff:       ""      // the binary the core will actually run
+    // The store on disk is NOT encrypted (getSecurityState.unencrypted / protected:false). This is
+    // not a lockout - the wallet is reachable and the way out is one ungated button on this very
+    // screen - but it is not harmless either: the core's gate (authorize()) refuses EVERY gated
+    // verb on a plaintext store, because there is no session password it could compare against and
+    // unlock() will not mint one for a store it cannot verify a password against.
+    // `protectionWarning` is the core's own wording for the risk.
+    property bool   storeUnprotected: false
+    property string protectionWarning: ""
+    // The consequence of the above, named once so no control has to re-derive it. While this is
+    // true every gated verb refuses with reason "unencrypted": sendTransfer, startSendTransfer,
+    // startSendToken, startShield, startDeshield, startPrivateTransfer,
+    // startPrivateTransferForeign, consolidateToken, approveAction, approveZone, exportMnemonic
+    // and exportKey. resetWallet and restoreWallet are NOT in that set (they are ungated while no
+    // session is live, which on a plaintext store is always), and every ungated verb - accounts,
+    // balances, tokens, faucet, receive keys, importKey, zones - keeps working. Controls that call
+    // a blocked verb are disabled and say why, instead of being offered and then refused. Setting
+    // a password (encryptPlaintextWallet, ungated) is what clears it.
+    readonly property bool signingBlocked: root.storeUnprotected
+    property int    plaintextSeen:    0       // consecutive polls reporting an unencrypted store
+    // A seal (create / migrate) just succeeded and granted NO session, so the very next screen is
+    // the lock screen. Without this it greets a user who created their wallet ten seconds ago
+    // with "Welcome back", which reads like something went wrong.
+    property bool   freshlySealed:    false
+    property var    displacedStores: []       // stores this module moved/copied aside (getWalletState)
+    property bool   storeInPlace:    false    // getWalletState.exists - is a storage.json there now?
+    property string restoreCandidate: ""      // displaced store the user opened the put-back flow for
+    property bool   restoreAsideArmed: false  // two-tap guard for step 1 of that flow
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── Displaced stores: naming what each file is, and how to put one back ────
+    // getWalletState lists every store the module moved aside (Erase, Restore) or copied aside
+    // (the migration). Printing the paths was already better than the silence before it, but a
+    // user whose wallet was displaced - by their own Erase, by a migration that rolled back, or
+    // by a co-resident caller invoking the ungated encryptPlaintextWallet/resetWallet - was shown
+    // where their money went and given nothing to do about it. These helpers back the put-back
+    // flow in Security & Backup.
+    function storeFileName(p) {
+        var s = String(p || ""); var i = s.lastIndexOf("/")
+        return i >= 0 ? s.slice(i + 1) : s
+    }
+    function storeDir(p) {
+        var s = String(p || ""); var i = s.lastIndexOf("/")
+        return i > 0 ? s.slice(0, i) : ""
+    }
+    // "plain" = the unencrypted copy encryptPlaintextWallet keeps before it seals; "bak" = the
+    // store resetWallet/restoreWallet renamed out of the way. The two need different things from
+    // the user afterwards, so they are never described with one sentence.
+    function displacedKind(p) {
+        var n = root.storeFileName(p)
+        if (n.indexOf("storage.json.plain-") === 0) return "plain"
+        if (n.indexOf("storage.json.bak-") === 0)   return "bak"
+        return "other"
+    }
+    function displacedWhat(p) {
+        var k = root.displacedKind(p)
+        if (k === "plain")
+            return "An UNENCRYPTED copy, kept just before a password was set on this wallet. It "
+                 + "needs no password - and anything running as you can read its keys, which is "
+                 + "why it should be put back only to rescue it, then given a password."
+        if (k === "bak")
+            return "The store that was in place when Erase or Restore ran. It opens with whatever "
+                 + "password sealed it; if you have that wallet's recovery phrase, restoring from "
+                 + "the phrase rebuilds the same accounts and needs no file at all."
+        return "A wallet store this module moved aside."
+    }
+    // The one step Medusa cannot take for the user. medusa_core can move a store aside (it does
+    // that itself, and never deletes), but it exposes no verb that puts one back, and a QML module
+    // has no filesystem of its own - so this is handed over as an exact command instead of as a
+    // button that would always fail. `cp -n` is chosen deliberately: it REFUSES rather than
+    // overwrite, so running it can never destroy the store that is in place.
+    function restoreCommandFor(p) {
+        var dir = root.storeDir(p)
+        if (dir.length === 0) return ""
+        return "cp -n '" + p + "' '" + dir + "/storage.json'"
+    }
+    function refreshDisplacedStores() {
+        if (typeof logos === "undefined" || !logos.callModule) return
+        var st = root.callModuleParse(logos.callModule("medusa_core", "getWalletState", []))
+        root.displacedStores = (st && Array.isArray(st.displacedStores)) ? st.displacedStores : []
+        root.storeInPlace    = !!(st && st.exists === true)
+    }
+    // Step 3 of the flow: the file may or may not be there now, so ask rather than assume, and
+    // hand the routing back to getWalletState the same way every other state change does.
+    function recheckAfterRestore() {
+        root.refreshDisplacedStores()
+        root.rerouteWalletState()
+        root.refreshSecurityState()
+        root.logActivity(root.storeInPlace
+            ? "A wallet store is in place. If it is encrypted, unlock it below; if it is not, set "
+              + "a password on it."
+            : "No wallet store is in place yet - run the copy command above, then check again.",
+            !root.storeInPlace)
+    }
     function displayId(id) {
         if (!id) return ""
         var s = id
@@ -436,6 +555,11 @@ Rectangle {
         if (root.walletState !== "ready") {
             var st = callModuleParse(logos.callModule("medusa_core", "getWalletState", []))
             if (!st) return
+            // Stores this module has moved or copied aside. Nothing used to report them, and
+            // "my wallet vanished and Reset buried it deeper" was the result - so they are shown,
+            // and Security & Backup offers a confirmed way to put one back.
+            root.displacedStores = Array.isArray(st.displacedStores) ? st.displacedStores : []
+            root.storeInPlace    = (st.exists === true)
             if (!st.exists) {
                 root.walletState = "new"; root.walletLocked = false
                 accountModel.clear(); refreshAccountBuckets(); return
@@ -444,11 +568,14 @@ Rectangle {
                 root.walletState = "locked"; root.walletLocked = true
                 accountModel.clear(); refreshAccountBuckets(); return
             }
-            if (!st.encrypted) {
-                // Wallet exists but isn't encrypted - require a password before use.
-                root.walletState = "plaintext"; root.walletLocked = false
-                accountModel.clear(); refreshAccountBuckets(); return
-            }
+            // An UNENCRYPTED store is a REACHABLE wallet, not a locked one, so it must not route to
+            // the lock screen: there is no password to ask for there (unlock() refuses a store it
+            // cannot verify a password against), and blocking here was the round-2 regression that
+            // left a user with funds and no working button. What it is not is a fully working
+            // wallet: the core's gate refuses every gated verb on it, so signing, dApp approvals
+            // and export stay DISABLED until the store is migrated. Both facts are surfaced rather
+            // than routed - storeUnprotected drives the persistent warning, the disabled controls,
+            // and the "set a password" migration in Security & Backup, which is the way out.
             root.walletState = "ready"; root.walletLocked = false
         }
 
@@ -675,9 +802,12 @@ Rectangle {
         if (root.sendTokenDef === "") executeSend(root.selectedFromId, to, amount)
         else {
             // token send is a background job (derive/create ATAs + token-send + wait)
-            var r = callModuleParse(logos.callModule("medusa_core", "startSendToken",
-                        [root.selectedFromId, to, root.sendTokenDef, amount]))
-            if (!r || r.error) { surfaceOpError("Token send", r && r.error ? r.error : "unknown"); return }
+            var r = root.callGated("startSendToken",
+                        [root.selectedFromId, to, root.sendTokenDef, amount])
+            if (!r || r.error) {
+                if (root.handleAuthRefusal("Token send", r)) return
+                surfaceOpError("Token send", r && r.error ? r.error : "unknown"); return
+            }
             if (!r.jobId) { logActivity("No jobId from token send", true); return }
             logActivity("Sending " + amount + " " + root.sendTokenName + "…", false)
             root.trackJob({ jobId: r.jobId, op: "tokensend", asset: "token",
@@ -696,10 +826,9 @@ Rectangle {
         // any case with a Private endpoint is a multi-minute proof - running it blocking timed
         // out / froze the UI ("Transfer failed: wallet command timed out"). Now it's a tracked
         // background job; the wrapper auto-syncs + uses the proof budget when --from is Private.
-        var r = callModuleParse(
-            logos.callModule("medusa_core", "startSendTransfer", [from, to, amount])
-        )
+        var r = root.callGated("startSendTransfer", [from, to, amount])
         if (!r || r.error) {
+            if (root.handleAuthRefusal("Transfer", r)) return
             surfaceOpError("Transfer", r && r.error ? r.error : "unknown")
             return
         }
@@ -863,9 +992,13 @@ Rectangle {
         // Approving a dApp action dispatches a sequencer op - same guard as in-wallet ops
         // (the request stays pending, so the user can approve once the zone is back).
         if (!root.guardZoneOp(root.opLabel(req.op || "send"))) return
-        var r = root.callModuleParse(logos.callModule("medusa_core",
-            "approveAction", [req.requestId]))
-        if (r && r.error)        { root.surfaceOpError("Action", r.error); return }
+        // Approval happens IN THE WALLET, never in the dApp, so the session password is right
+        // here - the SDK/Tip Jar contract is untouched and no dApp ever sees the password.
+        var r = root.callGated("approveAction", [req.requestId])
+        if (r && r.error) {
+            if (root.handleAuthRefusal("Action", r)) return
+            root.surfaceOpError("Action", r.error); return
+        }
         if (r && r.status === "rejected") {
             root.logActivity("Action rejected: " + (r.error || ""), true)
             root.pollConnRequests(); return
@@ -889,8 +1022,12 @@ Rectangle {
     // through the zoneSheet (mirrors the connect/action approval flow + reject verbs).
     function approveZoneRequest(requestId) {
         if (typeof logos === "undefined" || !logos.callModule) return
-        var r = callModuleParse(logos.callModule("medusa_core", "approveZone", [requestId]))
+        // GATED in the core exactly like approveAction: what it approves is repointing the wallet
+        // at someone else's sequencer. callGated() appends the session password; the zoneSheet is
+        // only visible while walletState is "ready", so it is always there.
+        var r = root.callGated("approveZone", [requestId])
         if (!r || r.error || r.status !== "approved") {
+            if (root.handleAuthRefusal("Sequencer switch", r)) { root.pollConnRequests(); return }
             root.logActivity("Sequencer switch failed: "
                              + ((r && (r.error || r.status)) || "no response"), true)
             root.pollConnRequests()
@@ -948,14 +1085,19 @@ Rectangle {
 
         var from = root.selectedFromId
         var method, args
+        // args stops BEFORE the session password - callGated() appends it (invariant 1). On
+        // shield/deshield that still forces definitionId to be passed always (empty for native),
+        // because it had a default and the password sits behind it.
         if (root.privMode === "shield") {
             if (root.privToId.length === 0) { root.logActivity("Pick a private destination account", true); return }
-            method = "startShield";   args = [root.privAsset, from, root.privToId, amt]
-            if (root.privAsset === "token") args.push(root.privTokenDef)   // token shield needs the def
+            method = "startShield"
+            args   = [root.privAsset, from, root.privToId, amt,
+                      root.privAsset === "token" ? root.privTokenDef : ""]   // token shield needs the def
         } else if (root.privMode === "deshield") {
             if (root.privToId.length === 0) { root.logActivity("Pick a public destination account", true); return }
-            method = "startDeshield"; args = [root.privAsset, from, root.privToId, amt]
-            if (root.privAsset === "token") args.push(root.privTokenDef)   // def routes to the recipient's ATA
+            method = "startDeshield"
+            args   = [root.privAsset, from, root.privToId, amt,
+                      root.privAsset === "token" ? root.privTokenDef : ""]   // def routes to the recipient's ATA
         } else { // transfer
             if (root.privToMode === "foreign") {
                 if (root.privToNpk.trim().length === 0 || root.privToVpk.trim().length === 0
@@ -967,17 +1109,19 @@ Rectangle {
                           root.privToIdent.trim(), amt]
             } else {
                 if (root.privToId.length === 0) { root.logActivity("Pick a private destination account", true); return }
-                method = "startPrivateTransfer"; args = [root.privAsset, from, root.privToId, amt]
+                method = "startPrivateTransfer"
+                args   = [root.privAsset, from, root.privToId, amt]
             }
         }
 
         root.privBusy = true
-        var r = callModuleParse(logos.callModule("medusa_core", method, args))
+        var r = root.callGated(method, args)
         root.privBusy = false
 
         if (!r || r.error) {
-            root.surfaceOpError(opLabel(root.privMode === "transfer" ? "private" : root.privMode),
-                                r && r.error ? r.error : "unknown")
+            var privLabel = opLabel(root.privMode === "transfer" ? "private" : root.privMode)
+            if (root.handleAuthRefusal(privLabel, r)) return
+            root.surfaceOpError(privLabel, r && r.error ? r.error : "unknown")
             return
         }
         if (!r.jobId) { root.logActivity("No jobId returned from module", true); return }
@@ -1114,28 +1258,394 @@ Rectangle {
         root.receiveKeys = r
     }
 
+    // ── Session password & the authorization gate ──────────────────────────────
+    //
+    // INVARIANT 1 - THE SESSION PASSWORD IS APPENDED IN EXACTLY ONE PLACE.
+    // medusa_core gates every verb that exports a secret, moves funds or repoints the wallet
+    // behind authorize(), and each of those verbs takes the session password as its TRAILING
+    // argument. So call sites do NOT write root.sessionPw into an argument list: they name the
+    // verb and pass everything BEFORE the password, and callGated() supplies it. That is what
+    // makes the round-2 regression structurally impossible instead of merely fixed: approveZone
+    // was gated in the core while its single call site kept passing one argument, so every
+    // dApp-initiated zone switch failed with "wallet password required for this operation". A
+    // call site cannot forget an argument it does not write. gatedVerbs mirrors the core's
+    // authorize() sites (WalletPlugin.cpp: consolidateToken, sendTransfer, startSendToken,
+    // startSendTransfer, startShield, startDeshield, startPrivateTransfer,
+    // startPrivateTransferForeign, approveAction, approveZone, exportMnemonic, exportKey, and
+    // conditionally resetWallet + restoreWallet); when the core gates one more verb, listing it
+    // here is the only change any call site needs.
+    readonly property var gatedVerbs: [
+        "sendTransfer", "startSendTransfer", "startSendToken",
+        "startShield", "startDeshield", "startPrivateTransfer", "startPrivateTransferForeign",
+        "consolidateToken", "approveAction", "approveZone",
+        "exportMnemonic", "exportKey",
+        // Conditional in the core: gated only while a session is live, ungated while locked so
+        // a forgotten password is still recoverable. Passing the (empty) session password is
+        // correct in both cases.
+        "resetWallet", "restoreWallet"
+    ]
+    // Call a gated verb. `args` is everything EXCEPT the password. Returns the parsed reply, or
+    // null when the module bridge is absent (every caller already treats null as a failure).
+    function callGated(verb, args) {
+        if (typeof logos === "undefined" || !logos.callModule) return null
+        if (root.gatedVerbs.indexOf(verb) < 0) {
+            // Refuse to hand the session password to a verb that is not on the gated list: an
+            // ungated verb has no password parameter, so this would be a silent arity mismatch.
+            root.logActivity("internal error: " + verb + " is not a gated verb", true)
+            return null
+        }
+        var a = (args || []).slice()
+        a.push(root.sessionPw)
+        return root.callModuleParse(logos.callModule("medusa_core", verb, a))
+    }
+    // Forget the cached password. Called on lock, on reset and on restore, and whenever the
+    // core tells us the session is gone - a stale secret must never outlive its session.
+    function forgetSession() {
+        root.sessionPw = ""
+        root.lockWarned = false
+        root.idleMs = 0
+    }
+    // Drop the UI back to the lock screen. walletState/walletLocked are re-derived from
+    // getWalletState() inside refreshAccounts(), which only re-routes while the state is NOT
+    // "ready" - so leaving "ready" here is exactly what lets that routing run again.
+    function toLockedScreen() {
+        root.forgetSession()
+        root.walletLocked = true
+        root.walletState  = "locked"
+        root.revealMnemonic = false; root.revealKey = false
+        root.exportedMnemonic = ""; root.exportedKey = ""
+        root.refreshAccounts()
+    }
+    // Lock now: forget the password in BOTH processes. clearSessionPassword is deliberately
+    // ungated in the core (needing a password to lock would be absurd), so this always works.
+    function lockWallet() {
+        if (typeof logos === "undefined" || !logos.callModule) return
+        logos.callModule("medusa_core", "clearSessionPassword", [])
+        root.toLockedScreen()
+        root.logActivity("Wallet locked", false)
+    }
+    // Ask the core what the store on disk is, rather than trusting a cached walletState. Used
+    // wherever the UI is about to pick a verb or a screen on the strength of "encrypted or not":
+    // guessing that is exactly how round 2 shipped an onboarding screen whose only button called
+    // a verb the core refuses.
+    function storeIsPlaintextNow() {
+        if (typeof logos === "undefined" || !logos.callModule) return false
+        var st = root.callModuleParse(logos.callModule("medusa_core", "getWalletState", []))
+        return !!(st && st.exists === true && st.encrypted === false)
+    }
+    // Drop every derived UI state and let refreshAccounts() re-derive it from getWalletState().
+    // refreshAccounts only re-routes while the state is NOT "ready", so "loading" is what hands
+    // the routing back to the core.
+    function rerouteWalletState() {
+        root.forgetSession()
+        root.walletLocked = false
+        root.resetArmed = false
+        root.revealMnemonic = false; root.revealKey = false
+        root.exportedMnemonic = ""; root.exportedKey = ""
+        root.walletState = "loading"
+        root.refreshAccounts()
+    }
+
+    // INVARIANT 2 - EVERY REFUSAL REASON THE CORE CAN EMIT HAS A USER-FACING OUTCOME.
+    // A refusal is a reply carrying BOTH `error` and `reason` (getSequencerStatus also has a
+    // `reason` field, but it is a status and never an error, so it can never land here). These
+    // are every reason string medusa_core emits, and what the user is left looking at:
+    //
+    //   locked               session cleared (idle / Lock)       → lock screen, "enter your password"
+    //   unauthorized         wrong password, or the cached one
+    //                        no longer matches                   → clear the core session, lock screen
+    //   rate-limited         unlock/reset/restore backoff        → error toast naming the wait
+    //   unencrypted          unlock(), or ANY gated verb, on an  → latch storeUnprotected (which
+    //                        unencrypted store: the gate has no    disables every control that would
+    //                        secret to compare there, so it        hit the same refusal) + re-derive
+    //                        refuses instead of passing            state (landing on a REACHABLE
+    //                                                              wallet, not a lock screen) + the
+    //                                                              warning naming the migration;
+    //                                                              never a password prompt, because
+    //                                                              there is nothing to unlock
+    //   no-wallet            unlock()/encryptPlaintextWallet with
+    //                        no store at all                     → re-route to "Create your wallet"
+    //   wallet-exists        createEncryptedWallet, store exists → re-route (lands on unlock)
+    //   wallet-not-encrypted createEncryptedWallet, store exists
+    //                        unencrypted                         → re-route + point at Security &
+    //                                                              Backup's "set a password"
+    //   already-encrypted    encryptPlaintextWallet on an
+    //                        encrypted store                     → re-route (lands on unlock)
+    //   not-created          the CLI reported success but wrote
+    //                        no store                            → loud build-problem error + re-route
+    //   not-encrypted        the CLI wrote an unencrypted store,
+    //                        or sealed one that will not open     → loud build-problem error + re-route;
+    //                                                              the core has already rolled back
+    //   not-supported        setCliPath (removed)                → error toast, no state change
+    //
+    // A reason this build does not know can only come from a NEWER core. It is deliberately NOT
+    // swallowed: it is warned about verbatim in the console and handed back to the caller, and
+    // every caller of a gated verb surfaces r.error to the user on a false return.
+    // Returns true when it produced the user-facing outcome, so the caller stops there.
+    function handleAuthRefusal(label, r) {
+        if (!r || !r.reason || !r.error) return false   // an ordinary error, not a refusal
+        var why = String(r.reason)
+
+        if (why === "locked") {
+            root.toLockedScreen()
+            root.logActivity(label + " needs an unlocked wallet - enter your password", true)
+            return true
+        }
+        if (why === "unauthorized") {
+            if (typeof logos !== "undefined" && logos.callModule)
+                logos.callModule("medusa_core", "clearSessionPassword", [])
+            root.toLockedScreen()
+            root.logActivity(label + " refused: this session's password no longer matches the "
+                             + "wallet - unlock again", true)
+            return true
+        }
+        if (why === "rate-limited") {
+            var wait = r.retryAfterMs
+                     ? " - try again in " + Math.ceil(r.retryAfterMs / 1000) + "s" : ""
+            root.logActivity(label + " refused: " + r.error + wait, true)
+            return true
+        }
+        if (why === "unencrypted") {
+            // The core reads the store's header to decide this, and a store is momentarily
+            // truncated every time the CLI rewrites it, so confirm before acting on it. If it
+            // really is unencrypted there is no password to ask for - the gate cannot pass on such
+            // a store and unlock() will not mint a session for it - so this is never a prompt.
+            // Latching storeUnprotected here is what disables the controls that would hit this
+            // same refusal again (signingBlocked), and it also closes the window in which the
+            // two-poll debounce below has not yet raised the warning. Then re-derive the state and
+            // let the warning carry the one route out.
+            if (!root.storeIsPlaintextNow()) {
+                root.logActivity(label + " failed: " + r.error, true)
+                return true
+            }
+            root.storeUnprotected = true
+            root.logActivity(label + " needs an encrypted wallet, and this store has no password "
+                             + "on it, so nothing can prove who is asking. Accounts, balances, the "
+                             + "faucet and receiving still work. Set a password in Security & "
+                             + "Backup - it keeps your accounts - then unlock, and this works.", true)
+            root.rerouteWalletState()
+            return true
+        }
+        if (why === "wallet-not-encrypted") {
+            root.storeUnprotected = true
+            root.logActivity("This wallet already exists and is not encrypted - open Security & "
+                             + "Backup and set a password on the wallet you have, which keeps its "
+                             + "accounts, instead of creating a new one", true)
+            root.rerouteWalletState()
+            return true
+        }
+        if (why === "wallet-exists" || why === "already-encrypted") {
+            root.logActivity("A wallet already exists here and is encrypted - unlock it, or erase "
+                             + "it and start over", true)
+            root.rerouteWalletState()
+            return true
+        }
+        if (why === "no-wallet") {
+            root.logActivity("There is no wallet here yet - create one first", true)
+            root.rerouteWalletState()
+            return true
+        }
+        if (why === "not-created" || why === "not-encrypted") {
+            // The CLI ran but did not produce a wallet this build can protect. The core refuses to
+            // claim protection it did not deliver (and rolls a half-migration back), so neither do
+            // we: name the build problem and re-derive, so whatever DID end up on disk is what the
+            // user is shown, with its escapes.
+            root.logActivity(label + " failed: " + r.error
+                             + " - reinstall the medusa_core module, or set MEDUSA_WALLET_CLI to "
+                             + "a working wallet binary before launching Basecamp", true)
+            root.rerouteWalletState()
+            return true
+        }
+        if (why === "not-supported") {
+            root.logActivity(label + ": " + r.error, true)
+            return true
+        }
+        // Unknown reason: a core newer than this UI. Say so in the log with the reason verbatim,
+        // then let the caller surface r.error (and classify it for the zone-offline modal).
+        console.warn("[wallet] unrecognized refusal reason from medusa_core:", why, "-", r.error)
+        return false
+    }
+    // The core auto-locks on idle and can be locked from elsewhere, so "unlocked" is not a state
+    // the UI may assume once reached: poll it. getSecurityState() runs no CLI and is NOT counted
+    // as activity by the core, so this neither costs anything nor holds the session open.
+    function refreshSecurityState() {
+        if (typeof logos === "undefined" || !logos.callModule) return
+        var s = callModuleParse(logos.callModule("medusa_core", "getSecurityState", []))
+        if (!s) return
+        root.autoLockMs = s.autoLockMs || 0
+        root.idleMs     = s.idleMs || 0
+        // Never disturb the post-create "write these words down" screen - refreshAccounts()
+        // guards it the same way, and locking there would wipe the phrase mid-transcription.
+        if (root.walletState === "backup") return
+        // `protected` is the core's verdict and is FALSE on an unencrypted store even when a
+        // password is held, because holding one there protects nothing. Raising the warning needs
+        // two consecutive polls (10s apart): a store is briefly truncated on every legitimate CLI
+        // write and reads as unencrypted for that instant, and a red banner flashing mid-send
+        // would be a lie. Clearing it is immediate - under-warning is the failure that matters.
+        //
+        // One case skips the debounce, because the debounce costs more than it saves there: the
+        // core says there is NO SESSION and the UI is already in "ready". The transient this
+        // debounce exists for is a CLI write, and a CLI write only happens while a session is
+        // live (establishSession refuses to hand one out for a plaintext store, so the two facts
+        // cannot both be true of the same healthy wallet). Waiting a second poll there means up
+        // to ~20s in which the UI offers a Send button whose verb is already certain to refuse.
+        if (s.unencrypted === true || s["protected"] === false) {   // bracketed: reserved word
+            root.plaintextSeen += 1
+            if (s.hasPassword === false && root.walletState === "ready")
+                root.plaintextSeen = Math.max(root.plaintextSeen, 2)
+            if (root.plaintextSeen >= 2 && !root.storeUnprotected) {
+                root.storeUnprotected = true
+                root.protectionWarning = s.warning || ""
+                root.logActivity("This wallet's storage is not encrypted: anything running as you "
+                                 + "can read its keys, and sending, shielding, dApp approvals and "
+                                 + "export are refused until it is. Set a password on it in "
+                                 + "Security & Backup - it keeps your accounts.", true)
+            }
+            // NOT a lock screen and NOT a dead end: there is no password to prompt for on such a
+            // store (unlock() refuses it), and the way out is the ungated migration button rather
+            // than a password field. The gated verbs DO refuse here, which is what signingBlocked
+            // turns into disabled controls. Returning here also keeps the hasPassword check below
+            // from mistaking "no session" - which is permanent on a plaintext store, not a lapse -
+            // for "auto-locked", which would bounce the user to a lock screen with nothing to type.
+            return
+        }
+        root.plaintextSeen = 0
+        if (root.storeUnprotected) { root.storeUnprotected = false; root.protectionWarning = "" }
+        if (s.hasPassword === false) {
+            // Sitting there looking unlocked while every gated call fails is the bug; follow it.
+            if (root.walletState === "ready" || root.sessionPw.length > 0) {
+                root.toLockedScreen()
+                root.logActivity("Wallet auto-locked after inactivity - unlock to continue", false)
+            }
+            return
+        }
+        // The core holds a session this UI cannot prove (medusa_ui reopened while medusa_core
+        // kept running). Every gated verb would refuse "unauthorized", so lock now and show a
+        // clean unlock screen instead of a first send that mysteriously fails.
+        if (root.walletState === "ready" && root.sessionPw.length === 0) {
+            logos.callModule("medusa_core", "clearSessionPassword", [])
+            root.toLockedScreen()
+            root.logActivity("Session needs re-authenticating - enter your password", false)
+            return
+        }
+        // One shot before the session lapses, so an auto-lock never lands unannounced. A
+        // running job holds the session open past the budget, so only warn while time is left.
+        var left = root.autoLockMs - root.idleMs
+        if (root.walletState === "ready" && !root.lockWarned && root.autoLockMs > 0
+                && left > 0 && left <= 90000) {
+            root.lockWarned = true
+            root.logActivity("Wallet locks itself in about a minute - you'll need your password again", false)
+        }
+    }
+    // getConfig() reports the binary the core will actually run (cliPathEff), whether a STORED
+    // cli-path override exists and was disowned on read (cliPathIgnored), and whether the path is
+    // settable at all (cliPathConfigurable, now always false: the setting was code execution plus
+    // password capture and the core no longer reads it). On an install poisoned before that
+    // removal the disowned value is the only visible trace it was ever there, so Settings says it.
+    function refreshCliConfig() {
+        if (typeof logos === "undefined" || !logos.callModule) return
+        var cfg = callModuleParse(logos.callModule("medusa_core", "getConfig", []))
+        root.cliPathIgnored = !!(cfg && cfg.cliPathIgnored)
+        root.cliPathEff     = (cfg && cfg.cliPathEff) ? cfg.cliPathEff : ""
+    }
+
     // ── Security & backup helpers ──────────────────────────────────────────────
     function doUnlock(pw) {
         if (typeof logos === "undefined" || !logos.callModule) return
         runBusy("Unlocking", function() {
             var r = callModuleParse(logos.callModule("medusa_core", "unlock", [pw]))
-            if (r && r.error) { root.logActivity("Unlock failed: " + r.error, true); return }
+            if (r && r.error) {
+                root.forgetSession()
+                // Only two reasons are ordinary outcomes of typing a password at an unlock
+                // prompt, and they must stay here because the shared router would send the user
+                // to the lock screen they are already standing on. EVERY other reason is a
+                // statement about the STORE ("unencrypted", "no-wallet", …), so it is routed
+                // rather than flattened into "Unlock failed" - that flattening is how a user ends
+                // up retyping a password at a wallet that has none.
+                var why = String(r.reason || "")
+                if (why !== "" && why !== "unauthorized" && why !== "rate-limited"
+                        && root.handleAuthRefusal("Unlock", r)) return
+                var wait = (r.reason === "rate-limited" && r.retryAfterMs)
+                         ? " - try again in " + Math.ceil(r.retryAfterMs / 1000) + "s" : ""
+                root.logActivity("Unlock failed: " + r.error + wait, true)
+                return
+            }
+            // Hold the verified password for the session. This is what keeps the core's gate
+            // from becoming a prompt on every send: the user typed it here, once.
+            root.sessionPw = pw
+            root.lockWarned = false
             root.walletLocked = false
+            root.freshlySealed = false
             root.logActivity("Wallet unlocked", false)
             root.refreshAccounts()
+            root.refreshSecurityState()
         })
     }
 
-    function doResetWallet() {
+    // `forRestore` only changes the WORDING: this is the same verb either way (resetWallet, which
+    // renames storage.json aside with a collision-safe name and never deletes it). Step 1 of the
+    // put-back flow needs exactly that displacement, and routing it through a second call site
+    // would be a second place to get a destructive verb wrong.
+    function doResetWallet(forRestore) {
         if (typeof logos === "undefined" || !logos.callModule) return
-        var r = callModuleParse(logos.callModule("medusa_core", "resetWallet", []))
-        if (!r || r.error) { root.logActivity("Reset failed: " + (r && r.error ? r.error : "unknown"), true); return }
+        var r = root.callGated("resetWallet", [])
+        if (!r || r.error) {
+            if (root.handleAuthRefusal(forRestore ? "Move aside" : "Reset", r)) return
+            root.logActivity((forRestore ? "Could not move the current wallet aside: "
+                                         : "Reset failed: ")
+                             + (r && r.error ? r.error : "unknown"), true); return
+        }
+        root.forgetSession()                  // the store is gone; its password goes with it
         root.walletLocked = false
         root.resetArmed = false
+        root.restoreAsideArmed = false
         root.walletState = "loading"          // force re-routing → "new" after the wipe
         root.exportedMnemonic = ""; root.exportedKey = ""
-        root.logActivity("Wallet erased - starting fresh", false)
+        root.logActivity((forRestore
+                            ? "Current wallet moved aside - the slot is free for the copy"
+                            : "Wallet erased - starting fresh")
+                         + (r.backup ? " (previous store kept at " + r.backup + ")" : ""), false)
         root.refreshAccounts()
+        root.refreshDisplacedStores()         // the store just moved aside belongs in the list
+    }
+
+    // INVARIANT 3 - THE UI NEVER GUESSES WHICH LIFECYCLE VERB APPLIES; IT ASKS THE CORE.
+    // "Set a password on this wallet" is ONE user intention with TWO core verbs behind it, and
+    // which one applies is a property of the store on disk, not of the screen the user is on:
+    //   no store yet          → createEncryptedWallet   (refuses if a store exists)
+    //   store exists, plain   → encryptPlaintextWallet  (refuses if there is no store, or it is
+    //                                                    already encrypted)
+    // Round 2 hard-wired the first one into a screen that only ever shows for the second, so the
+    // only button a plaintext user had called a verb the core refuses. Probing getWalletState()
+    // immediately before the call is what stops that from recurring, and each verb's refusal
+    // reasons are routed (handleAuthRefusal) so a race between the probe and the call still ends
+    // somewhere useful instead of in a dead end.
+    function doSecureWallet(pw) {
+        if (typeof logos === "undefined" || !logos.callModule) return
+        if (!pw || pw.length === 0) { root.logActivity("Choose a password first", true); return }
+        var st = callModuleParse(logos.callModule("medusa_core", "getWalletState", []))
+        if (st && st.exists === true && st.encrypted === false) root.doEncryptPlaintext(pw)
+        else root.doCreateEncrypted(pw)
+    }
+
+    // Adopt (or refuse to fake) a session after a verb sealed a store. Sealing a store is NOT
+    // evidence of who asked for it - a caller that chose the password can always open what it just
+    // wrote - so the core deliberately grants no session there and returns {locked:true}. The UI
+    // must never claim one it does not have, because "looks unlocked, every gated verb refuses" is
+    // the worst state this app can be in. So ask the core rather than assume either way, which
+    // also means this keeps working if that policy is ever relaxed.
+    function adoptSessionAfterSeal(pw) {
+        var s = callModuleParse(logos.callModule("medusa_core", "getSecurityState", []))
+        if (s && s.hasPassword === true) {
+            root.sessionPw = pw
+            root.lockWarned = false
+            root.walletLocked = false
+            return true
+        }
+        root.forgetSession()
+        root.walletLocked = true
+        root.walletState = "locked"
+        return false
     }
 
     function doCreateEncrypted(pw) {
@@ -1143,29 +1653,70 @@ Rectangle {
         if (!pw || pw.length === 0) { root.logActivity("Choose a password first", true); return }
         runBusy("Creating", function() {
             var r = callModuleParse(logos.callModule("medusa_core", "createEncryptedWallet", [pw]))
-            if (!r || r.error) { root.logActivity("Create failed: " + (r && r.error ? r.error : "unknown"), true); return }
-            root.walletLocked = false
-            root.logActivity("Encrypted wallet created", false)
+            if (!r || r.error) {
+                if (root.handleAuthRefusal("Create wallet", r)) return
+                root.logActivity("Create failed: " + (r && r.error ? r.error : "unknown"), true); return
+            }
+            var live = root.adoptSessionAfterSeal(pw)
+            root.freshlySealed = !live
+            root.logActivity("Encrypted wallet created"
+                             + (live ? "" : " - " + (r.note || "unlock with the password you just chose")), false)
             if (r.mnemonic) {
                 root.exportedMnemonic = r.mnemonic; root.revealMnemonic = true
                 root.walletState = "backup"          // show the phrase before entering the wallet
-            } else {
+            } else if (live) {
                 root.walletState = "ready"; root.refreshAccounts()
+            } else {
+                root.refreshAccounts()               // stays on the lock screen adoptSessionAfterSeal set
             }
         })
     }
 
+    // Encrypt an existing UNENCRYPTED store in place, keeping its accounts. This is the verb the
+    // "set a password" button needs; createEncryptedWallet refuses here (reason
+    // "wallet-not-encrypted") because re-sealing someone's existing wallet as if it were a new one
+    // is how an attacker locks its owner out. A wallet saved this way never held a recovery
+    // phrase, so there is no backup screen - the core copies the unencrypted store aside, names
+    // it, and puts it back untouched if the sealed store does not open.
+    function doEncryptPlaintext(pw) {
+        if (typeof logos === "undefined" || !logos.callModule) return
+        if (!pw || pw.length === 0) { root.logActivity("Choose a password first", true); return }
+        runBusy("Encrypting", function() {
+            var r = callModuleParse(logos.callModule("medusa_core", "encryptPlaintextWallet", [pw]))
+            if (!r || r.error) {
+                if (root.handleAuthRefusal("Set password", r)) return
+                root.logActivity("Set password failed: " + (r && r.error ? r.error : "unknown"), true); return
+            }
+            var live = root.adoptSessionAfterSeal(pw)
+            root.freshlySealed = !live
+            root.exportedMnemonic = ""; root.revealMnemonic = false
+            root.storeUnprotected = false; root.protectionWarning = ""; root.plaintextSeen = 0
+            root.logActivity("Wallet encrypted"
+                             + (r.backup ? " (unencrypted copy kept at " + r.backup + ")" : "")
+                             + (live ? "" : " - " + (r.note || "unlock with the password you just chose")), false)
+            if (live) root.walletState = "ready"
+            root.refreshAccounts()
+        })
+    }
+
     function finishBackup() {
-        root.walletState = "ready"
         root.revealMnemonic = false
+        // Never walk out of the backup screen into a wallet the core is not holding a session
+        // for: if the seal granted no session, adoptSessionAfterSeal already chose the lock
+        // screen, and "ready" here would be the "looks unlocked, nothing works" state.
+        if (root.sessionPw.length === 0) { root.walletState = "locked"; root.walletLocked = true }
+        else root.walletState = "ready"
         root.refreshAccounts()
     }
 
     function doExportMnemonic() {
         if (typeof logos === "undefined" || !logos.callModule) return
         runBusy("Exporting", function() {
-            var r = callModuleParse(logos.callModule("medusa_core", "exportMnemonic", []))
-            if (!r || r.error) { root.logActivity("Reveal phrase: " + (r && r.error ? r.error : "failed"), true); return }
+            var r = root.callGated("exportMnemonic", [])
+            if (!r || r.error) {
+                if (root.handleAuthRefusal("Reveal phrase", r)) return
+                root.logActivity("Reveal phrase: " + (r && r.error ? r.error : "failed"), true); return
+            }
             root.exportedMnemonic = r.mnemonic || ""
             root.revealMnemonic = true
         })
@@ -1176,8 +1727,11 @@ Rectangle {
         if (root.selectedFromId.length === 0) { root.logActivity("Select an account first", true); return }
         if (root.selectedFromType !== "public") { root.logActivity("Key export is for public accounts", true); return }
         runBusy("Exporting", function() {
-            var r = callModuleParse(logos.callModule("medusa_core", "exportKey", [root.selectedFromId]))
-            if (!r || r.error) { root.logActivity("Export key: " + (r && r.error ? r.error : "failed"), true); return }
+            var r = root.callGated("exportKey", [root.selectedFromId])
+            if (!r || r.error) {
+                if (root.handleAuthRefusal("Export key", r)) return
+                root.logActivity("Export key: " + (r && r.error ? r.error : "failed"), true); return
+            }
             root.exportedKey = r.privateKey || ""
             root.revealKey = true
         })
@@ -1187,10 +1741,23 @@ Rectangle {
         if (typeof logos === "undefined" || !logos.callModule) return
         if (!phrase || phrase.trim().split(/\s+/).length < 12) { root.logActivity("Enter a valid recovery phrase", true); return }
         runBusy("Restoring", function() {
-            var r = callModuleParse(logos.callModule("medusa_core", "restoreWallet", [phrase.trim(), pw, depth]))
-            if (!r || r.error) { root.logActivity("Restore failed: " + (r && r.error ? r.error : "unknown"), true); return }
-            root.walletLocked = false
-            root.logActivity("Wallet restored from recovery phrase", false)
+            // The TRAILING argument is the CURRENT session password, not the new one - callGated
+            // appends it. The core only demands it when a session is live, so restoring from the
+            // lock screen still works with an empty one.
+            var r = root.callGated("restoreWallet", [phrase.trim(), pw, depth])
+            if (!r || r.error) {
+                if (root.handleAuthRefusal("Restore", r)) return
+                root.logActivity("Restore failed: " + (r && r.error ? r.error : "unknown"), true); return
+            }
+            // The old store is gone, so the password that opened it must not linger. Whether the
+            // NEW one is a live session is the core's call: a restore run from the lock screen
+            // deliberately stays locked (the caller chose that password, so keeping it would be a
+            // way to mint a session), while a restore run from a proven session carries over.
+            root.forgetSession()
+            var live = root.adoptSessionAfterSeal(pw)
+            root.logActivity("Wallet restored from recovery phrase"
+                             + (r.backup ? " (previous store kept at " + r.backup + ")" : "")
+                             + (live ? "" : " - unlock with the password you just set"), false)
             root.refreshAccounts()
         })
     }
@@ -1230,6 +1797,7 @@ Rectangle {
             root.refreshStatus()
             root.refreshSeqStatus()
             root.refreshAccounts()
+            root.refreshSecurityState()   // the core auto-locks on idle - follow it back
             root.pollBusy = false
         }
     }
@@ -1282,8 +1850,7 @@ Rectangle {
 
     Component.onCompleted: {
         if (typeof logos === "undefined" || !logos.callModule) return
-        var cfg = callModuleParse(logos.callModule("medusa_core", "getConfig", []))
-        if (cfg && cfg.cliPathEff) cliPathField.text = cfg.cliPathEff
+        root.refreshCliConfig()
         var scfg = callModuleParse(logos.callModule("medusa_core", "getSequencerConfig", []))
         if (scfg) {
             root.seqPort = scfg.port || 3071
@@ -1293,9 +1860,20 @@ Rectangle {
         root.refreshSeqStatus()
         root.refreshZones()
         root.refreshAccounts()
+        root.refreshSecurityState()   // after refreshAccounts: it judges the routed walletState
         root.refreshWhitelist()
         root.checkForUpdate()
         if (!root.cliFound) root.screen = "settings"
+    }
+
+    // The disowned-CLI-path notice is only interesting on the Settings screen, and the list of
+    // displaced stores only on Security & Backup; re-read each there rather than paying for a
+    // getConfig / getWalletState on every status poll.
+    onScreenChanged: {
+        if (root.screen === "settings") root.refreshCliConfig()
+        if (root.screen === "security") root.refreshDisplacedStores()
+        else { root.restoreCandidate = ""; root.restoreAsideArmed = false }   // never leave a
+        // destructive two-tap armed on a screen the user walked away from
     }
 
     onSelectedFromIdChanged: {
@@ -1380,6 +1958,20 @@ Rectangle {
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.screen = (root.screen === "accounts" ? "main" : "accounts") }
             }
 
+            // Lock now - forget the session password in BOTH processes. The core also drops it
+            // by itself after an idle timeout; this is the manual door. Only shown while
+            // unlocked, so it never clashes with the key icon's locked 🔒 expression.
+            Rectangle {
+                visible: root.walletState === "ready"
+                width: 30; height: 30; radius: 15; color: "transparent"
+                border.color: lockBtnMa.containsMouse ? root.brandRedHover : root.brandRed
+                border.width: 1
+                Text { font.family: root.faceFont; anchors.centerIn: parent; text: "🔒"; font.pixelSize: 13
+                    color: lockBtnMa.containsMouse ? root.brandRedHover : root.brandRed }
+                MouseArea { id: lockBtnMa; anchors.fill: parent; hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor; onClicked: root.lockWallet() }
+            }
+
             // Security & backup (lock / key icon) - crimson idle/active, red while locked.
             Rectangle {
                 width: 30; height: 30; radius: 15; color: "transparent"
@@ -1413,6 +2005,51 @@ Rectangle {
                 border.color: root.screen === "settings" ? root.brandRedHover : root.brandRed; border.width: 1
                 Text { font.family: root.faceFont; anchors.centerIn: parent; text: "⚙"; font.pixelSize: 14; color: root.screen === "settings" ? root.brandRedHover : root.brandRed }
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.screen = (root.screen === "settings" ? "main" : "settings") }
+            }
+        }
+
+        // ── Unencrypted-storage banner ──────────────────────────────────────────
+        // The wallet is REACHABLE in this state and the way out is one ungated button, so this is
+        // a warning and not a lockout - but it is not "everything works" either: every gated verb
+        // refuses here, so the banner names the consequence next to the risk instead of leaving
+        // the user to discover it on a failed send. It is keyed on the core's own verdict and
+        // carries the core's own wording, so the UI can never claim a protection the core says
+        // does not exist, or the reverse.
+        Rectangle {
+            visible: root.storeUnprotected && root.walletState !== "loading"
+                     && root.walletState !== "backup" && !root.escapeScreenOpen
+            Layout.fillWidth: true
+            implicitHeight: unprotRow.implicitHeight + 16
+            radius: 10
+            color: root.errorTint
+            border.color: root.warningAmber; border.width: 1
+            RowLayout {
+                id: unprotRow
+                anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter; leftMargin: 12; rightMargin: 12 }
+                spacing: 10
+                Text { text: "⚠"; color: root.warningAmber; font.pixelSize: 14; Layout.alignment: Qt.AlignTop; Layout.topMargin: 1 }
+                ColumnLayout {
+                    Layout.fillWidth: true; spacing: 2
+                    Text { Layout.fillWidth: true; font.family: root.faceFont; font.pixelSize: 11; font.bold: true
+                        color: root.textPrimary; elide: Text.ElideRight; text: "This wallet is not encrypted" }
+                    Text { Layout.fillWidth: true; wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                        font.family: root.faceFont; font.pixelSize: 9; color: root.textSecondary
+                        maximumLineCount: 4; elide: Text.ElideRight
+                        text: (root.protectionWarning.length > 0 ? root.protectionWarning
+                                : "Every key in its storage can be read by any program running as you.")
+                            + " Sending, shielding, dApp approvals and key export are refused until "
+                            + "you set a password: it encrypts the store in place and keeps your "
+                            + "accounts." }
+                }
+                Rectangle {
+                    Layout.preferredWidth: 104; Layout.preferredHeight: 26; radius: 8
+                    color: unprotMa.containsMouse ? root.hoverWash : "transparent"
+                    border.color: root.warningAmber; border.width: 1
+                    Text { anchors.centerIn: parent; text: "Set a password"; color: root.textPrimary
+                        font.family: root.faceFont; font.pixelSize: 10 }
+                    MouseArea { id: unprotMa; anchors.fill: parent; hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor; onClicked: root.screen = "security" }
+                }
             }
         }
 
@@ -1457,9 +2094,13 @@ Rectangle {
         // ── Security & Backup panel ─────────────────────────────────────────────
         Rectangle {
             Layout.fillWidth: true
-            // Backup/export screen - only once the wallet is unlocked; create/unlock
-            // are handled by the dedicated onboarding screen.
-            visible: root.screen === "security" && root.walletState === "ready"
+            // Backup / export / recovery screen. Reachable in EVERY state its key icon is (which
+            // is every state): it is where a locked user restores from a recovery phrase or erases
+            // and starts over, and where an unencrypted wallet gets a password. Gating it on
+            // "ready" is what left those users looking at a screen full of nothing. The backup
+            // screen still owns the window - an unwritten recovery phrase is never covered.
+            visible: root.screen === "security" && root.walletState !== "loading"
+                     && root.walletState !== "backup"
             Layout.fillHeight: true
             color: root.panelColor
             border.color: root.walletLocked ? root.errorRed : root.borderColor; border.width: 1; radius: 12
@@ -1484,9 +2125,285 @@ Rectangle {
                     Item { Layout.fillWidth: true }
                 }
 
+                // ── Wallet storage this module moved or copied aside, and how to put it back ──
+                // Reset, Restore and the migration all displace the previous store instead of
+                // deleting it, and until the core reported them nothing on screen did. "My wallet
+                // vanished and Reset buried it deeper" was the result, so the paths are named in
+                // every state - most of all in "new", where the wallet looks gone.
+                //
+                // Naming them is not enough on its own. A user gets here without asking for it:
+                // their own Erase, a migration that rolled back, or a co-resident caller invoking
+                // the ungated encryptPlaintextWallet (which seals a legacy plaintext wallet under
+                // a password only that caller knows) or resetWallet. Such a user was shown the
+                // path to their money and given no control at all. So each entry now says WHAT it
+                // is and opens a confirmed put-back flow.
+                //
+                // The flow is split into a step Medusa can take and a step it cannot, and it is
+                // honest about which is which: medusa_core can move the store that is in place
+                // aside (resetWallet, never deletes, collision-safe name) but exposes no verb that
+                // puts a store back, and a QML module has no filesystem of its own - so the copy
+                // itself is handed over as an exact `cp -n` command. Both halves are safe by
+                // construction: nothing is deleted, and `-n` refuses rather than overwrites, so
+                // neither step can destroy the store that is currently in place.
+                ColumnLayout {
+                    visible: root.displacedStores.length > 0
+                    Layout.fillWidth: true; spacing: 4
+                    Text { font.family: root.faceFont;
+                        text: "Previous wallet storage kept on disk"
+                        color: root.textSecondary; font.pixelSize: 10; font.bold: true
+                        wrapMode: Text.WordWrap; Layout.fillWidth: true
+                    }
+                    Text { font.family: root.faceFont;
+                        text: "Nothing here is ever deleted. If the wallet in front of you is not "
+                            + "the one you expect, one of these is probably it."
+                        color: root.textDisabled; font.pixelSize: 9; wrapMode: Text.WordWrap; Layout.fillWidth: true
+                    }
+                    Repeater {
+                        model: root.displacedStores
+                        delegate: ColumnLayout {
+                            id: dsRow
+                            required property string modelData
+                            Layout.fillWidth: true; spacing: 3
+                            readonly property bool open: root.restoreCandidate === dsRow.modelData
+
+                            RowLayout {
+                                Layout.fillWidth: true; spacing: 6
+                                Text { font.family: root.faceFont;
+                                    text: dsRow.modelData; color: root.textDisabled; font.pixelSize: 9
+                                    elide: Text.ElideMiddle; Layout.fillWidth: true
+                                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
+                                        onClicked: { clipHelper.text = dsRow.modelData; clipHelper.selectAll()
+                                                     clipHelper.copy(); root.logActivity("Path copied", false) } }
+                                }
+                                Rectangle {
+                                    Layout.preferredWidth: 74; height: 22; radius: 10
+                                    color: "transparent"; border.color: root.accentOrange
+                                    Text { font.family: root.faceFont; anchors.centerIn: parent
+                                        text: dsRow.open ? "Close" : "Put back"
+                                        color: root.accentOrange; font.pixelSize: 9 }
+                                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
+                                        onClicked: {
+                                            root.restoreAsideArmed = false
+                                            root.restoreCandidate = dsRow.open ? "" : dsRow.modelData
+                                            if (root.restoreCandidate.length > 0) root.refreshDisplacedStores()
+                                        } }
+                                }
+                            }
+
+                            // ── The confirmed put-back flow for THIS file ──
+                            ColumnLayout {
+                                visible: dsRow.open
+                                Layout.fillWidth: true; Layout.leftMargin: 8; spacing: 4
+
+                                Text { font.family: root.faceFont;
+                                    text: root.displacedWhat(dsRow.modelData)
+                                    color: root.textSecondary; font.pixelSize: 9
+                                    wrapMode: Text.WordWrap; Layout.fillWidth: true
+                                }
+
+                                // Step 1 - free the slot, using the core's own non-destructive move.
+                                Text { font.family: root.faceFont;
+                                    text: root.storeInPlace
+                                        ? "1. A wallet is in place right now. Move it aside first: it is renamed, "
+                                          + "never deleted, and it appears in this list too, so this is reversible."
+                                        : "1. Done - no wallet is in place, so the slot is free."
+                                    color: root.storeInPlace ? root.textSecondary : root.textDisabled
+                                    font.pixelSize: 9; wrapMode: Text.WordWrap; Layout.fillWidth: true
+                                }
+                                Rectangle {
+                                    visible: root.storeInPlace
+                                    Layout.preferredWidth: 188; height: 22; radius: 10
+                                    color: "transparent"; border.color: root.errorRed
+                                    Text { font.family: root.faceFont; anchors.centerIn: parent
+                                        text: root.restoreAsideArmed ? "Tap again to move it aside"
+                                                                     : "Move the current wallet aside"
+                                        color: root.errorRed; font.pixelSize: 9 }
+                                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
+                                        onClicked: { if (root.restoreAsideArmed) root.doResetWallet(true)
+                                                     else root.restoreAsideArmed = true } }
+                                }
+
+                                // Step 2 - the copy. Handed over verbatim, not faked with a button.
+                                Text { font.family: root.faceFont;
+                                    text: "2. Copy the file back. Medusa moves stores aside but has no verb that "
+                                        + "puts one back, so this step is yours. `cp -n` refuses rather than "
+                                        + "overwrites, so it cannot destroy anything:"
+                                    color: root.textSecondary; font.pixelSize: 9
+                                    wrapMode: Text.WordWrap; Layout.fillWidth: true
+                                }
+                                Rectangle {
+                                    Layout.fillWidth: true
+                                    implicitHeight: dsCmd.implicitHeight + 10
+                                    color: root.inputBg; border.color: root.borderColor; radius: 8
+                                    Text { font.family: root.monoFont
+                                        id: dsCmd
+                                        anchors { left: parent.left; right: parent.right
+                                                  verticalCenter: parent.verticalCenter
+                                                  leftMargin: 6; rightMargin: 6 }
+                                        text: root.restoreCommandFor(dsRow.modelData)
+                                        color: root.textPrimary; font.pixelSize: 9
+                                        wrapMode: Text.WrapAnywhere
+                                    }
+                                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
+                                        onClicked: { clipHelper.text = root.restoreCommandFor(dsRow.modelData)
+                                                     clipHelper.selectAll(); clipHelper.copy()
+                                                     root.logActivity("Command copied - run it in a terminal", false) } }
+                                }
+
+                                // Step 3 - re-ask the core instead of assuming it worked.
+                                RowLayout {
+                                    Layout.fillWidth: true; spacing: 6
+                                    Text { font.family: root.faceFont;
+                                        text: "3. Then check again. This re-reads the wallet from disk and drops "
+                                            + "any session, so an encrypted store will ask for its password; an "
+                                            + "unencrypted one warns and offers to encrypt itself."
+                                        color: root.textSecondary; font.pixelSize: 9
+                                        wrapMode: Text.WordWrap; Layout.fillWidth: true
+                                    }
+                                    Rectangle {
+                                        Layout.preferredWidth: 84; height: 22; radius: 10
+                                        color: "transparent"; border.color: root.accentOrange
+                                        Text { font.family: root.faceFont; anchors.centerIn: parent
+                                            text: "Check again"; color: root.accentOrange; font.pixelSize: 9 }
+                                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
+                                            onClicked: root.recheckAfterRestore() }
+                                    }
+                                }
+
+                                // The in-app alternative that needs no file copy at all. Only an
+                                // UNENCRYPTED copy can be read this way, which is exactly the file
+                                // an ungated encryptPlaintextWallet leaves its victim with.
+                                Text { font.family: root.faceFont;
+                                    visible: root.displacedKind(dsRow.modelData) === "plain"
+                                    text: "Or, without copying anything: it is unencrypted, so open it in a text "
+                                        + "editor and paste each account's private key into \"Import a private "
+                                        + "key\", which appears in this panel once a wallet is in place."
+                                    color: root.textDisabled; font.pixelSize: 9
+                                    wrapMode: Text.WordWrap; Layout.fillWidth: true
+                                }
+                                Text { font.family: root.faceFont;
+                                    visible: root.displacedKind(dsRow.modelData) === "bak"
+                                    text: "Or, without copying anything: if you have that wallet's recovery phrase, "
+                                        + "\"Restore from recovery phrase\" rebuilds the same accounts from it."
+                                    color: root.textDisabled; font.pixelSize: 9
+                                    wrapMode: Text.WordWrap; Layout.fillWidth: true
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ── No wallet yet ──
+                ColumnLayout {
+                    visible: root.walletState === "new"
+                    Layout.fillWidth: true; spacing: 6
+                    Text { font.family: root.faceFont; text: "No wallet yet"; color: root.textPrimary; font.pixelSize: 12; font.bold: true }
+                    Text { font.family: root.faceFont;
+                        text: "Go back and choose a password to create one. If you already have a "
+                            + "recovery phrase, create a wallet first and then restore over it here."
+                        color: root.textSecondary; font.pixelSize: 10; wrapMode: Text.WordWrap; Layout.fillWidth: true
+                    }
+                    // Do not send someone who is halfway through putting an old store back off to
+                    // create a new one: creating destroys nothing, but it re-fills the slot they
+                    // just cleared and they would have to clear it again.
+                    Text { font.family: root.faceFont;
+                        visible: root.restoreCandidate.length > 0
+                        text: "You are in the middle of putting a previous store back (above): the "
+                            + "slot is free, so run the copy command and press Check again rather "
+                            + "than creating a new wallet here."
+                        color: root.warningAmber; font.pixelSize: 9; wrapMode: Text.WordWrap; Layout.fillWidth: true
+                    }
+                    Rectangle {
+                        Layout.preferredWidth: 124; height: 24; radius: 10; color: "transparent"; border.color: root.brandRed
+                        Text { font.family: root.faceFont; anchors.centerIn: parent; text: "Create a wallet"; color: root.brandRed; font.pixelSize: 10 }
+                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.screen = "main" }
+                    }
+                }
+
+                // ── The store has no password on it ──
+                // Keyed on the CORE's verdict (getSecurityState.protected === false), not on a UI
+                // state, so it shows wherever that is true - including a wallet the user can
+                // otherwise reach, which is exactly what an unencrypted store is. Round 2 blocked
+                // this user instead and left them with no working button, so the wallet stays
+                // reachable; but the gate refuses every gated verb here, so the controls behind
+                // those verbs are disabled further down and THIS block is the one that turns them
+                // back on. From here the user can set a password on the wallet they have (keeping
+                // its accounts), restore over it from a phrase, or erase it and start again.
+                ColumnLayout {
+                    visible: root.storeUnprotected
+                    Layout.fillWidth: true; spacing: 6
+                    Text { font.family: root.faceFont; text: "⚠ This wallet is not encrypted"; color: root.warningAmber; font.pixelSize: 12; font.bold: true }
+                    Text { font.family: root.faceFont;
+                        text: (root.protectionWarning.length > 0 ? root.protectionWarning
+                                : "Its storage has no password on it, so every key in it can be read "
+                                + "by any program running as you, and no password can change that.")
+                            + " Nothing can prove who is asking on a store like this, so sending, "
+                            + "shielding, dApp approvals and revealing a key or recovery phrase are "
+                            + "all refused until you set one. Setting one encrypts the store in "
+                            + "place, keeps its accounts, and you unlock with it afterwards."
+                        color: root.textSecondary; font.pixelSize: 10; wrapMode: Text.WordWrap; Layout.fillWidth: true
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true; spacing: 6
+                        Rectangle {
+                            Layout.fillWidth: true; height: 28; color: root.inputBg; border.color: root.borderColor; radius: 8
+                            TextInput { font.family: root.faceFont;
+                                id: secEncryptPw
+                                anchors { fill: parent; leftMargin: 6; rightMargin: 6 }
+                                verticalAlignment: TextInput.AlignVCenter; echoMode: TextInput.Password
+                                color: root.textPrimary; font.pixelSize: 11; clip: true
+                                onAccepted: root.doSecureWallet(text)
+                                Text { font.family: root.faceFont;
+                                    anchors.fill: parent; verticalAlignment: Text.AlignVCenter
+                                    text: parent.text.length === 0 ? "choose a password" : ""
+                                    color: root.textDisabled; font.pixelSize: 11
+                                }
+                            }
+                        }
+                        Rectangle {
+                            Layout.preferredWidth: 84; height: 28; radius: 10
+                            color: secEncMa.pressed ? root.brandRedPressed
+                                 : secEncMa.containsMouse ? root.brandRedHover : root.brandRed
+                            border.color: root.brandRed
+                            Behavior on color { ColorAnimation { duration: root.motionQuick } }
+                            Text { font.family: root.faceFont; anchors.centerIn: parent
+                                text: root.secBusy === "Encrypting" ? "…" : "Set password"
+                                color: root.textPrimary; font.pixelSize: 11 }
+                            MouseArea { id: secEncMa; anchors.fill: parent; hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor; onClicked: root.doSecureWallet(secEncryptPw.text) }
+                        }
+                    }
+                    Text { font.family: root.faceFont;
+                        text: "The unencrypted store is copied aside first and put back untouched if "
+                            + "the encrypted one will not open, so this is reversible. A wallet saved "
+                            + "this way never held a recovery phrase, so none is shown - back it up "
+                            + "by exporting each account's key. You unlock with this password after."
+                        color: root.textDisabled; font.pixelSize: 9; wrapMode: Text.WordWrap; Layout.fillWidth: true
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true; spacing: 6
+                        Text { font.family: root.faceFont;
+                            text: "Not your wallet, or you would rather start clean?"
+                            color: root.textDisabled; font.pixelSize: 9; wrapMode: Text.WordWrap; Layout.fillWidth: true
+                        }
+                        Rectangle {
+                            Layout.preferredWidth: 124; height: 22; radius: 10; color: "transparent"; border.color: root.errorRed
+                            Text { font.family: root.faceFont;
+                                anchors.centerIn: parent
+                                text: root.resetArmed ? "Tap again to erase" : "Erase & start over"
+                                color: root.errorRed; font.pixelSize: 9
+                            }
+                            MouseArea {
+                                anchors.fill: parent; cursorShape: Qt.PointingHandCursor
+                                onClicked: { if (root.resetArmed) root.doResetWallet(); else root.resetArmed = true }
+                            }
+                        }
+                    }
+                }
+
                 // ── Locked: unlock ──
                 ColumnLayout {
-                    visible: root.walletLocked
+                    visible: root.walletState === "locked"
                     Layout.fillWidth: true; spacing: 6
                     Text { font.family: root.faceFont; text: "🔒 Wallet is locked"; color: root.errorRed; font.pixelSize: 12; font.bold: true }
                     Text { font.family: root.faceFont;
@@ -1516,11 +2433,63 @@ Rectangle {
                         }
                     }
 
-                    // Escape hatch - forgotten password / not your wallet → start over.
+                    Rectangle { Layout.fillWidth: true; height: 1; color: root.borderColor }
+
+                    // FORGOT THE PASSWORD, STILL HAVE THE PHRASE. This is the canonical wallet
+                    // recovery and it belongs on the locked screen, which is where that user is.
+                    // The core allows a restore while locked on purpose (the phrase IS the
+                    // credential there, and it moves the outgoing store aside rather than deleting
+                    // it); without this the only route was Erase → create a throwaway wallet →
+                    // restore over it, which asks a frightened user to erase first.
+                    Text { font.family: root.faceFont; text: "Restore from your recovery phrase"
+                        color: root.textSecondary; font.pixelSize: 10 }
+                    Text { font.family: root.faceFont;
+                        text: "Replaces the wallet on this machine with the one your phrase derives. "
+                            + "The current storage is kept aside, never deleted."
+                        color: root.textDisabled; font.pixelSize: 9; wrapMode: Text.WordWrap; Layout.fillWidth: true
+                    }
+                    Rectangle {
+                        Layout.fillWidth: true; height: 46; color: root.inputBg
+                        border.color: lockedPhrase.activeFocus ? root.accentOrange : root.borderColor; radius: 8
+                        TextEdit {
+                            id: lockedPhrase
+                            anchors { fill: parent; margins: 6 }
+                            color: root.textPrimary; font.pixelSize: 10
+                            wrapMode: TextEdit.WordWrap; clip: true; selectByMouse: true
+                        }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true; spacing: 6
+                        Rectangle {
+                            Layout.fillWidth: true; height: 26; color: root.inputBg
+                            border.color: lockedRestorePw.activeFocus ? root.accentOrange : root.borderColor; radius: 8
+                            TextInput { font.family: root.faceFont;
+                                id: lockedRestorePw
+                                anchors { fill: parent; leftMargin: 6; rightMargin: 6 }
+                                verticalAlignment: TextInput.AlignVCenter; echoMode: TextInput.Password
+                                color: root.textPrimary; font.pixelSize: 10; clip: true
+                                Text { font.family: root.faceFont;
+                                    anchors.fill: parent; verticalAlignment: Text.AlignVCenter
+                                    text: parent.text.length === 0 ? "new password" : ""
+                                    color: root.textDisabled; font.pixelSize: 10
+                                }
+                            }
+                        }
+                        Rectangle {
+                            Layout.preferredWidth: 74; height: 26; radius: 10; color: "transparent"; border.color: root.accentOrange
+                            Text { font.family: root.faceFont; anchors.centerIn: parent
+                                text: root.secBusy === "Restoring" ? "…" : "Restore"
+                                color: root.accentOrange; font.pixelSize: 10 }
+                            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
+                                onClicked: root.doRestore(lockedPhrase.text, lockedRestorePw.text, 5) }
+                        }
+                    }
+
+                    // Escape hatch - forgotten password, no phrase either → start over.
                     RowLayout {
                         Layout.fillWidth: true; spacing: 6
                         Text { font.family: root.faceFont;
-                            text: "Forgot the password, or it isn't your wallet?"
+                            text: "No phrase either, or it isn't your wallet?"
                             color: root.textDisabled; font.pixelSize: 9; wrapMode: Text.WordWrap; Layout.fillWidth: true
                         }
                         Rectangle {
@@ -1539,8 +2508,11 @@ Rectangle {
                 }
 
                 // ── Unlocked: backup + import/export ──
+                // Keyed on the wallet state, not on !walletLocked: walletLocked is a second
+                // variable saying the same thing, and the two drifting apart is how a section
+                // shows in a state none of its buttons work in.
                 ColumnLayout {
-                    visible: !root.walletLocked
+                    visible: root.walletState === "ready"
                     Layout.fillWidth: true; spacing: 8
 
                     Text { font.family: root.faceFont; text: "SECURITY & BACKUP"; color: root.brandRed; font.pixelSize: 9; font.bold: true; font.letterSpacing: 1.2 }
@@ -1549,35 +2521,71 @@ Rectangle {
                         color: root.textDisabled; font.pixelSize: 9; wrapMode: Text.WordWrap; Layout.fillWidth: true
                     }
 
-                    // Create encrypted wallet (set a password) - for a fresh wallet
+                    // Session state. The password typed at unlock is held in memory for this
+                    // session and re-checked by every sensitive operation; it is dropped on idle
+                    // and by the Lock button. No operation ever asks for it a second time.
+                    //
+                    // On a PLAINTEXT store there is no session and there cannot be one: unlock()
+                    // refuses a store it cannot verify a password against, so nothing ever reaches
+                    // establishSession. Claiming "Unlocked, locks itself in 15 min" there described
+                    // a protection the store does not have, next to a banner correctly saying it is
+                    // not encrypted, and offered a Lock button with no session to forget. Both are
+                    // replaced by the truth and by the route that changes it.
                     RowLayout {
                         Layout.fillWidth: true; spacing: 6
-                        Rectangle {
-                            Layout.fillWidth: true; height: 26; color: root.inputBg; border.color: newPwField.activeFocus ? root.accentOrange : root.borderColor; radius: 8
-                            TextInput { font.family: root.faceFont;
-                                id: newPwField
-                                anchors { fill: parent; leftMargin: 6; rightMargin: 6 }
-                                verticalAlignment: TextInput.AlignVCenter; echoMode: TextInput.Password
-                                color: root.textPrimary; font.pixelSize: 10; clip: true
-                                Text { font.family: root.faceFont;
-                                    anchors.fill: parent; verticalAlignment: Text.AlignVCenter
-                                    text: parent.text.length === 0 ? "set a password (new encrypted wallet)" : ""
-                                    color: root.textDisabled; font.pixelSize: 10
-                                }
-                            }
+                        Text { font.family: root.faceFont; Layout.fillWidth: true
+                            color: root.textDisabled; font.pixelSize: 9; wrapMode: Text.WordWrap
+                            text: root.signingBlocked
+                                ? "Not unlocked, and it cannot be: this store has no password on it, "
+                                  + "so there is no session to hold, to time out, or to lock. Set a "
+                                  + "password above and it becomes a normal encrypted wallet."
+                                : root.autoLockMs > 0
+                                ? "Unlocked. Locks itself after " + Math.round(root.autoLockMs / 60000)
+                                  + " min without a wallet operation (about "
+                                  + Math.max(0, Math.round((root.autoLockMs - root.idleMs) / 60000))
+                                  + " min left)."
+                                : "Unlocked. The session password is held in memory only, never stored."
                         }
                         Rectangle {
-                            Layout.preferredWidth: 70; height: 26; radius: 10
-                            color: secCreateMa.pressed ? root.brandRedPressed
-                                 : secCreateMa.containsMouse ? root.brandRedHover : root.brandRed
-                            border.color: root.brandRed
-                            Behavior on color { ColorAnimation { duration: root.motionQuick } }
-                            Text { font.family: root.faceFont; anchors.centerIn: parent; text: root.secBusy === "Creating" ? "…" : "Create"; color: root.textPrimary; font.pixelSize: 10 }
-                            MouseArea { id: secCreateMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.doCreateEncrypted(newPwField.text) }
+                            visible: !root.signingBlocked
+                            Layout.preferredWidth: 84; height: 22; radius: 10
+                            color: "transparent"
+                            border.color: secLockMa.containsMouse ? root.brandRedHover : root.brandRed
+                            Text { font.family: root.faceFont; anchors.centerIn: parent
+                                text: "Lock now"; color: root.brandRed; font.pixelSize: 9 }
+                            MouseArea { id: secLockMa; anchors.fill: parent; hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor; onClicked: root.lockWallet() }
                         }
                     }
 
-                    Rectangle { Layout.fillWidth: true; height: 1; color: root.borderColor }
+                    // The "create a new encrypted wallet" row used to live here. It is gone on
+                    // purpose: this section shows for walletState === "ready", which means a store
+                    // exists (encrypted and open, or legacy plaintext), and createEncryptedWallet
+                    // refuses in both cases ("wallet-exists" / "wallet-not-encrypted"). Creating is
+                    // the onboarding screen's job; the "new" section above points at it. Replacing
+                    // an existing wallet is Restore (below) or Erase & start over; giving a
+                    // plaintext store a password is the block above, not this one.
+
+                    // ── Export: the two controls the gate refuses on a plaintext store ──
+                    // exportMnemonic and exportKey both call authorize(), which on a store with no
+                    // crypto envelope has no secret to compare and refuses with reason
+                    // "unencrypted". Offering them anyway meant a user pressed "Reveal recovery
+                    // phrase" and got a refusal on the same screen that had just told them they
+                    // were "Unlocked". They are disabled instead, with the reason and the route on
+                    // the button's own row, and they come back the moment the store is migrated.
+                    Text { font.family: root.faceFont;
+                        visible: root.signingBlocked
+                        text: "Revealing the recovery phrase or a private key needs a wallet that can "
+                            + "prove who is asking, so both are disabled while this store has no "
+                            + "password on it. Set one above and they work again. (A wallet migrated "
+                            + "this way never held a recovery phrase, so only the key export applies.)"
+                        color: root.warningAmber; font.pixelSize: 9
+                        wrapMode: Text.WordWrap; Layout.fillWidth: true
+                    }
+                    ColumnLayout {
+                        Layout.fillWidth: true; spacing: 8
+                        enabled: !root.signingBlocked
+                        opacity: enabled ? 1.0 : 0.4
 
                     // Reveal recovery phrase
                     RowLayout {
@@ -1638,6 +2646,7 @@ Rectangle {
                             onClicked: { clipHelper.text = root.exportedKey; clipHelper.selectAll(); clipHelper.copy(); root.revealKey = true; root.logActivity("Private key copied", false) }
                         }
                     }
+                    }   // end of the gate-dependent export block
 
                     Rectangle { Layout.fillWidth: true; height: 1; color: root.borderColor }
 
@@ -1748,42 +2757,63 @@ Rectangle {
                     Item { Layout.fillWidth: true }
                 }
 
-                Text { font.family: root.faceFont; text: "Wallet CLI path"; color: root.textSecondary; font.pixelSize: 10 }
+                Text { font.family: root.faceFont; text: "Wallet CLI"; color: root.textSecondary; font.pixelSize: 10 }
+                // READ-ONLY on purpose. A stored CLI path was code execution plus password
+                // capture that outlived both a reboot and the module that planted it, so the core
+                // no longer reads the setting and setCliPath always refuses ("not-supported").
+                // An editable field with a Save button that can only fail is a lie the user pays
+                // for, so this shows what will actually run and how to change it instead.
                 Rectangle {
                     Layout.fillWidth: true; height: 26; color: root.inputBg
                     border.color: root.borderColor; radius: 8
-                    TextInput { font.family: root.faceFont;
+                    Text { font.family: root.faceFont;
                         id: cliPathField
                         anchors { fill: parent; leftMargin: 6; rightMargin: 6 }
-                        verticalAlignment: TextInput.AlignVCenter
-                        color: root.textPrimary; font.pixelSize: 11; clip: true
-                        Text { font.family: root.faceFont;
-                            anchors.fill: parent; verticalAlignment: Text.AlignVCenter
-                            text: parent.text.length === 0 ? "~/.local/bin/wallet" : ""
-                            color: root.textDisabled; font.pixelSize: 11;                        }
+                        verticalAlignment: Text.AlignVCenter
+                        text: root.cliPathEff.length > 0 ? root.cliPathEff
+                            : (root.cliPath.length > 0 ? root.cliPath : "wallet")
+                        color: root.textPrimary; font.pixelSize: 11; elide: Text.ElideMiddle; clip: true
+                    }
+                    MouseArea {
+                        anchors.fill: parent; cursorShape: Qt.PointingHandCursor
+                        onClicked: { clipHelper.text = cliPathField.text; clipHelper.selectAll()
+                                     clipHelper.copy(); root.logActivity("Wallet CLI path copied", false) }
                     }
                 }
                 Text { font.family: root.faceFont
-                    text: "The network connection is configured per-zone - switch or add zones from the network selector at the top."
-                    color: root.textDisabled; font.pixelSize: 9; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-
-                RowLayout {
+                    visible: !root.cliFound
+                    text: "This binary is missing, so no wallet operation can run. Reinstall the "
+                        + "medusa_core module, or set MEDUSA_WALLET_CLI to a wallet binary in the "
+                        + "environment that launches Basecamp, then reopen Medusa."
+                    color: root.errorRed; font.pixelSize: 9; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                // A stored override from an older build is IGNORED rather than deleted, so say so:
+                // on an install poisoned before the override was removed this is the only visible
+                // trace of what was planted.
+                Rectangle {
+                    visible: root.cliPathIgnored
                     Layout.fillWidth: true
-                    Item { Layout.fillWidth: true }
-                    Rectangle {
-                        width: 56; height: 24; radius: 10; color: "transparent"; border.color: root.accentOrange
-                        Text { font.family: root.faceFont; anchors.centerIn: parent; text: "Save"; color: root.accentOrange; font.pixelSize: 11 }
-                        MouseArea {
-                            anchors.fill: parent; cursorShape: Qt.PointingHandCursor
-                            onClicked: {
-                                logos.callModule("medusa_core", "setCliPath", [cliPathField.text])
-                                root.screen = "main"
-                                root.refreshStatus()
-                                root.refreshSeqStatus()
-                            }
-                        }
+                    implicitHeight: cliIgnoredTxt.implicitHeight + 14
+                    radius: 8; color: root.errorTint; border.color: root.errorRed; border.width: 1
+                    Text {
+                        id: cliIgnoredTxt
+                        anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter
+                                  leftMargin: 8; rightMargin: 8 }
+                        font.family: root.faceFont; font.pixelSize: 9; wrapMode: Text.WordWrap
+                        color: root.errorRed
+                        text: "A wallet CLI path saved by an older build is being ignored: medusa "
+                            + "runs the binary bundled with the module and never a path stored on "
+                            + "disk, because anything running as you could rewrite it. Use "
+                            + "MEDUSA_WALLET_CLI to point at a different build."
                     }
                 }
+                Text { font.family: root.faceFont
+                    text: "The wallet CLI is not configurable from here - medusa runs the binary "
+                        + "bundled with the module. Set MEDUSA_WALLET_CLI before launching to use "
+                        + "a different build."
+                    color: root.textDisabled; font.pixelSize: 9; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                Text { font.family: root.faceFont
+                    text: "The network connection is configured per-zone - switch or add zones from the network selector at the top."
+                    color: root.textDisabled; font.pixelSize: 9; wrapMode: Text.WordWrap; Layout.fillWidth: true }
             }
         }
 
@@ -2135,6 +3165,7 @@ Rectangle {
         // ── Onboarding / lock screen - shown until a wallet is unlocked ─────────
         Rectangle {
             visible: root.walletState !== "ready" && root.walletState !== "loading"
+                     && !root.escapeScreenOpen
             Layout.fillWidth: true
             Layout.fillHeight: true
             gradient: Gradient {
@@ -2198,7 +3229,7 @@ Rectangle {
                 // ── State-specific prompt ──
                 Text { font.family: root.faceFont;
                     Layout.alignment: Qt.AlignHCenter; Layout.topMargin: 4
-                    text: root.walletState === "locked"    ? "Welcome back"
+                    text: root.walletState === "locked"    ? (root.freshlySealed ? "Wallet ready" : "Welcome back")
                         : root.walletState === "plaintext" ? "Secure your wallet"
                         : root.walletState === "backup"    ? "Back up your recovery phrase"
                         : "Create your wallet"
@@ -2207,7 +3238,10 @@ Rectangle {
                 Text { font.family: root.faceFont;
                     Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap
                     color: root.textSecondary; font.pixelSize: 11
-                    text: root.walletState === "locked"    ? "Enter your password to unlock."
+                    text: root.walletState === "locked"    ? (root.freshlySealed
+                            ? "Your wallet is encrypted. Unlock it with the password you just chose - "
+                              + "the wallet holds no session until that password has opened the store."
+                            : "Enter your password to unlock.")
                         : root.walletState === "plaintext" ? "Set a password to encrypt this wallet."
                         : root.walletState === "backup"    ? "Write these words down and keep them safe - they're the only way to recover your wallet."
                         : "Choose a password. Your wallet is encrypted with it; you'll see your recovery phrase next."
@@ -2282,8 +3316,12 @@ Rectangle {
                         }
                     }
                 }
+                // Confirm field. Its condition is the COMPLEMENT of the unlock case, not a list of
+                // states that need it: onbBtn.can requires the two fields to match for every state
+                // except "locked", so enumerating states here is how a state ends up with a button
+                // that can never enable because the field it compares against is hidden.
                 Rectangle {
-                    visible: root.walletState === "new" || root.walletState === "plaintext"
+                    visible: root.walletState !== "locked" && root.walletState !== "backup"
                     Layout.fillWidth: true; height: 30; color: root.inputBg
                     border.color: onbPw2.activeFocus ? root.accentOrange : root.borderColor; radius: 10
                     TextInput { font.family: root.faceFont;
@@ -2299,7 +3337,7 @@ Rectangle {
                     }
                 }
                 Text { font.family: root.faceFont;
-                    visible: (root.walletState === "new" || root.walletState === "plaintext")
+                    visible: root.walletState !== "locked" && root.walletState !== "backup"
                              && onbPw2.text.length > 0 && onbPw.text !== onbPw2.text
                     text: "passwords don't match"; color: root.errorRed; font.pixelSize: 10
                     Layout.alignment: Qt.AlignHCenter
@@ -2332,26 +3370,46 @@ Rectangle {
                         anchors.fill: parent; hoverEnabled: true; enabled: onbBtn.can && root.secBusy.length === 0
                         cursorShape: onbBtn.can ? Qt.PointingHandCursor : Qt.ArrowCursor
                         onClicked: {
+                            // doSecureWallet asks the core which of createEncryptedWallet /
+                            // encryptPlaintextWallet applies, so this one button is right for both
+                            // "no wallet yet" and "a wallet with no password on it".
                             if (root.walletState === "locked") root.doUnlock(onbPw.text)
-                            else root.doCreateEncrypted(onbPw.text)
+                            else root.doSecureWallet(onbPw.text)
                         }
                     }
                 }
 
-                // locked: escape hatch
+                // ESCAPE HATCH. Deliberately NOT enumerated per state: it shows for every state
+                // this screen can be in except the two where it would be wrong ("new" - there is
+                // nothing to erase; "backup" - nothing may compete with an unwritten recovery
+                // phrase). Round 2's version listed "locked" only, so any other degraded state
+                // arrived with no way out, which is how a user ends up stranded. A state this
+                // build has never heard of still gets a reset here.
                 Rectangle {
-                    visible: root.walletState === "locked"
-                    Layout.alignment: Qt.AlignHCenter; Layout.preferredWidth: 170; height: 22; radius: 10
+                    visible: root.walletState !== "new" && root.walletState !== "backup"
+                    Layout.alignment: Qt.AlignHCenter; Layout.preferredWidth: 190; height: 22; radius: 10
                     color: "transparent"; border.color: root.borderColor
                     Text { font.family: root.faceFont;
                         anchors.centerIn: parent
-                        text: root.resetArmed ? "Tap again to erase wallet" : "Forgot password? Reset"
+                        text: root.resetArmed ? "Tap again to erase wallet"
+                            : root.walletState === "locked" ? "Forgot password? Reset"
+                            : "Not your wallet? Erase & start over"
                         color: root.errorRed; font.pixelSize: 9
                     }
                     MouseArea {
                         anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                         onClicked: { if (root.resetArmed) root.doResetWallet(); else root.resetArmed = true }
                     }
+                }
+                // The other two escapes are behind unlabelled icons in the top bar, which is not
+                // discoverable, so name them: Security & Backup restores from a recovery phrase,
+                // Settings names the wallet binary that has to exist for any of this to work.
+                Text { font.family: root.faceFont;
+                    visible: root.walletState !== "backup"
+                    Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap
+                    text: "Have a recovery phrase, or nothing working at all? The key and cog icons "
+                        + "at the top open Security & Backup and Settings from here."
+                    color: root.textDisabled; font.pixelSize: 9
                 }
             }
         }
@@ -2696,10 +3754,20 @@ Rectangle {
                         }
                     }
 
+                    // Signing is a gated verb, so it cannot succeed while the store is plaintext.
+                    // Say so where the button is, not after it fails.
+                    Text { font.family: root.faceFont; visible: root.signingBlocked
+                        text: "Sending needs a wallet that can prove who is asking. This store has no "
+                            + "password on it, so the send would be refused. Set a password in "
+                            + "Security & Backup (it keeps your accounts), then unlock."
+                        color: root.warningAmber; font.pixelSize: 10
+                        wrapMode: Text.WordWrap; Layout.fillWidth: true }
+
                     Rectangle {
                         id: confirmBtn
                         Layout.fillWidth: true; height: 36; radius: 10
-                        property bool canSend: root.selectedFromId.length > 0
+                        property bool canSend: !root.signingBlocked
+                                               && root.selectedFromId.length > 0
                                                && toField.text.trim().length > 0
                                                && amountField.text.trim().length > 0
                         color: !canSend ? "transparent"
@@ -3108,6 +4176,15 @@ Rectangle {
                             }
                         }
 
+                        // Shield / deshield / private transfer are all gated verbs, so none of
+                        // them can succeed while the store is plaintext. Same rule as Send.
+                        Text { font.family: root.faceFont; visible: root.signingBlocked
+                            text: "Shielding, de-shielding and private transfers need a wallet that can "
+                                + "prove who is asking. This store has no password on it, so they would "
+                                + "be refused. Set a password in Security & Backup, then unlock."
+                            color: root.warningAmber; font.pixelSize: 10
+                            wrapMode: Text.WordWrap; Layout.fillWidth: true }
+
                         // Confirm
                         Rectangle {
                             id: privConfirmBtn
@@ -3116,6 +4193,7 @@ Rectangle {
                             readonly property bool needsAck:
                                 root.privMode === "deshield" || (root.privMode === "transfer" && root.privToMode === "foreign")
                             property bool canConfirm:
+                                !root.signingBlocked &&
                                 root.privFromValid && !root.privBusy && root.privAmount.trim().length > 0 &&
                                 ( (root.privMode === "transfer" && root.privToMode === "foreign")
                                     ? (root.privToNpk.trim().length > 0 && root.privToVpk.trim().length > 0 && root.privToIdent.trim().length > 0)
@@ -3339,9 +4417,14 @@ Rectangle {
     } // ColumnLayout
 
     // ── Toast (notices / errors). Errors persist with Copy + Dismiss. ──────────
+    // z is ABOVE the modal sheets (300/320) on purpose: this is where every refusal reason the
+    // core can emit is surfaced, and a sheet that stays open across a refusal (a dApp action or
+    // zone request the core declined) used to paint over the only explanation the user got.
+    // "Handled" and "seen" are not the same thing, and a routed reason nobody can read is a
+    // silent failure with extra steps.
     Rectangle {
         id: toastCard
-        z: 200
+        z: 340
         property bool copied: false
         visible: root.notice.length > 0
         anchors { bottom: parent.bottom; bottomMargin: 16; horizontalCenter: parent.horizontalCenter }
@@ -3888,6 +4971,19 @@ Rectangle {
                     font.pixelSize: 10; wrapMode: Text.WrapAtWordBoundaryOrAnywhere
                 }
 
+                // approveAction is a gated verb: on a plaintext store it is refused, so approving
+                // could only ever fail and leave the dApp waiting. Reject stays live (it is
+                // ungated and it is the honest answer here), and the reason is on the sheet.
+                Text {
+                    visible: root.signingBlocked
+                    Layout.fillWidth: true
+                    text: "This wallet's storage has no password on it, so it cannot prove who is "
+                        + "approving and the core will refuse this. Reject it, set a password in "
+                        + "Security & Backup, unlock, and ask the app again."
+                    color: root.warningAmber; font.family: root.faceFont
+                    font.pixelSize: 10; wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                }
+
                 RowLayout {
                     Layout.fillWidth: true; Layout.topMargin: 2; spacing: 10
                     Rectangle {
@@ -3903,14 +4999,20 @@ Rectangle {
                     Rectangle {
                         id: actionApproveBtn
                         Layout.fillWidth: true; height: 38; radius: 10
-                        color: actionApproveMa.pressed ? root.brandRedPressed
+                        enabled: !root.signingBlocked
+                        opacity: enabled ? 1.0 : 0.4
+                        color: !enabled ? "transparent"
+                             : actionApproveMa.pressed ? root.brandRedPressed
                              : actionApproveMa.containsMouse ? root.brandRedHover : root.brandRed
+                        border.color: enabled ? root.brandRed : root.borderColor
                         Behavior on color { ColorAnimation { duration: root.motionQuick } }
                         Text { anchors.centerIn: parent; text: "Approve"
-                               color: root.textPrimary; font.family: root.faceFont; font.pixelSize: 13; font.bold: true }
+                               color: actionApproveBtn.enabled ? root.textPrimary : root.textDisabled
+                               font.family: root.faceFont; font.pixelSize: 13; font.bold: true }
                         MouseArea {
                             id: actionApproveMa
-                            anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                            anchors.fill: parent; hoverEnabled: true
+                            cursorShape: actionApproveBtn.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
                             onClicked: if (actionSheet.req) root.approveActionRequest(actionSheet.req)
                         }
                     }
@@ -4029,6 +5131,19 @@ Rectangle {
                     }
                 }
 
+                // approveZone is gated for the same reason approveAction is (it repoints the wallet
+                // at someone else's sequencer), so it is refused on a plaintext store. Same
+                // treatment: Reject stays live, Approve is disabled and says why.
+                Text {
+                    visible: root.signingBlocked
+                    Layout.fillWidth: true
+                    text: "This wallet's storage has no password on it, so it cannot prove who is "
+                        + "approving a zone switch and the core will refuse this. Reject it, set a "
+                        + "password in Security & Backup, unlock, and ask the app again."
+                    color: root.warningAmber; font.family: root.faceFont
+                    font.pixelSize: 10; wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                }
+
                 RowLayout {
                     Layout.fillWidth: true; Layout.topMargin: 2; spacing: 10
                     Rectangle {
@@ -4044,14 +5159,20 @@ Rectangle {
                     Rectangle {
                         id: zoneApproveBtn
                         Layout.fillWidth: true; height: 38; radius: 10
-                        color: zoneApproveMa.pressed ? root.brandRedPressed
+                        enabled: !root.signingBlocked
+                        opacity: enabled ? 1.0 : 0.4
+                        color: !enabled ? "transparent"
+                             : zoneApproveMa.pressed ? root.brandRedPressed
                              : zoneApproveMa.containsMouse ? root.brandRedHover : root.brandRed
+                        border.color: enabled ? root.brandRed : root.borderColor
                         Behavior on color { ColorAnimation { duration: root.motionQuick } }
                         Text { anchors.centerIn: parent; text: "Approve"
-                               color: root.textPrimary; font.family: root.faceFont; font.pixelSize: 13; font.bold: true }
+                               color: zoneApproveBtn.enabled ? root.textPrimary : root.textDisabled
+                               font.family: root.faceFont; font.pixelSize: 13; font.bold: true }
                         MouseArea {
                             id: zoneApproveMa
-                            anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                            anchors.fill: parent; hoverEnabled: true
+                            cursorShape: zoneApproveBtn.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
                             onClicked: if (zoneSheet.req) root.approveZoneRequest(zoneSheet.req.requestId)
                         }
                     }
