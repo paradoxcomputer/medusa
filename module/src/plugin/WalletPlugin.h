@@ -26,7 +26,7 @@ public:
     // Must track modules/medusa_core/manifest.json. It was left at 0.2.0 through two ABI-breaking
     // rounds (every gated verb grew a trailing password), so a host or a UI that consulted it was
     // told the old surface was still there.
-    QString version() const override { return QStringLiteral("0.4.0"); }
+    QString version() const override { return QStringLiteral("0.3.0"); }
 
     // ── THE THREE INVARIANTS THIS CLASS ENFORCES ──────────────────────────────────
     // Rounds 1 and 2 each fixed the reviewer's example and each shipped the same capability
@@ -163,6 +163,36 @@ public:
     Q_INVOKABLE QString startFaucet(const QString& accountId);
     // Faucet (synchronous, legacy/unused - superseded by startFaucet).
     Q_INVOKABLE QString claimFaucet(const QString& accountId);
+
+    // ── The ON-CHAIN token faucet (the deployed `medusa_faucet` LEZ program) ─────
+    //
+    // WHY BOTH FAUCETS EXIST, AND WHY startFaucet ABOVE IS STILL THE DEFAULT. The two
+    // dispense different things and are not interchangeable today:
+    //   • startFaucet   = `pinata claim`: native LEZ from the zone's built-in pinata program,
+    //                     PLUS whitelist tokens dropped CLIENT-SIDE by the wrapper's separate
+    //                     treasury wallet (a plain `token send` from a supply account).
+    //   • startTokenFaucet = the on-chain program: whitelist tokens only, from per-definition
+    //                     treasury PDAs the program itself owns, with an on-chain 6h cooldown.
+    // The program is deployed on both operator zones (its id is the constant below), but on
+    // neither zone do the token definitions or the funded treasuries it dispenses from exist
+    // yet. An unfunded on-chain faucet gives the user nothing, so it does NOT replace the
+    // client-side path - it sits beside it, and reports precisely which precondition is
+    // missing instead of failing opaquely.
+    //
+    // Read-only, ungated (it moves nothing and reveals nothing the UI does not already show):
+    // {programId, available, reason, message, client, clientFound, bin, binFound, verified,
+    //  definitions[], tickers{}, recipients[], funded}. `reason` is a machine code the UI
+    //  switches on: "" (available) | "client-missing" | "bin-missing" | "program-mismatch" |
+    //  "no-definitions" | "no-holding".
+    Q_INVOKABLE QString faucetStatus();
+    // Claim from the on-chain faucet. GATED (authorize()): it signs and broadcasts a
+    // transaction with the wallet's keys, so it takes the session password as its TRAILING
+    // argument exactly like every other verb that spends. Asynchronous: returns {jobId,state},
+    // poll getJob(jobId). `accountId` is the account the claim is ATTRIBUTED to in local
+    // history; the on-chain recipients are the wallet's per-definition holdings, never the
+    // account itself (one account can hold exactly one token definition, so spending the
+    // user's main account as a recipient would bind it to one token forever).
+    Q_INVOKABLE QString startTokenFaucet(const QString& accountId, const QString& password);
 
     // Transfer
     // Every verb below is GATED (authorize()): the trailing `password` is the session password
@@ -440,6 +470,26 @@ private:
     // faucet or be spent from. init is NOT idempotent, so we check chain state first. {ok}.
     QString ensureInitialized(const QString& accountId);
 
+    // ── On-chain faucet preflight ────────────────────────────────────────────────
+    // ONE function answers "can the on-chain faucet do anything here", so faucetStatus()
+    // (what the UI renders) and startTokenFaucet() (what actually runs) can never disagree
+    // about availability - the shape of bug that ships a button which always fails.
+    struct FaucetPreflight {
+        bool        ok = false;
+        QString     reason;        // machine code, "" when ok
+        QString     message;       // the sentence the user reads
+        QString     client;        // resolved medusa-faucet-client path ("" = not found)
+        QString     bin;           // resolved guest .bin path ("" = not found)
+        bool        verified = false;   // the .bin's ImageID == kFaucetProgramId
+        QStringList definitions;   // whitelist token definition ids on the active zone
+        QStringList recipients;    // this wallet's holding per definition, same order
+        QStringList tickers;       // display names, same order as definitions
+    };
+    FaucetPreflight faucetPreflight();
+    // Resolve the deployed program's guest .bin (MEDUSA_FAUCET_BIN, then the module bundle,
+    // then a dev install). "" when no readable file is there.
+    static QString faucetGuestBin();
+
     // ── Local sequencer lifecycle (plugin-owned standalone process) ───────────
     QProcess*      m_seqProc = nullptr;       // the bundled standalone sequencer (local mode)
     QProcess*      m_fwdProc = nullptr;       // diaphani-forward (Tor tunnel) - Tor zones
@@ -577,9 +627,12 @@ private:
     // private destination (double-booking a fresh account would waste the second proof).
     QString privateDestInFlight(const QString& toP) const;
     // Build args + spawn a privacy "send" as a background job; returns {jobId,state}.
+    // `binOverride` names a DIFFERENT child to run under the same job machinery (the on-chain
+    // faucet's medusa-faucet-client); empty = the wallet CLI, which is every other caller.
     QString startPrivacyJob(const QString& op, const QString& asset,
                             const QStringList& sendArgs,
-                            const QString& from, const QString& to, const QString& amount);
+                            const QString& from, const QString& to, const QString& amount,
+                            const QString& binOverride = QString());
     void    onJobFinished(const QString& jobId, int exitCode);
 
     QHash<QString, Job*> m_jobs;

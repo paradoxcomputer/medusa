@@ -16,6 +16,7 @@
 #include <QCryptographicHash>
 
 #include <algorithm>
+#include <utility>   // std::as_const
 #include <cstring>
 #include <cerrno>
 #include <dlfcn.h>   // dladdr: locate the module's own install dir (bundled binaries)
@@ -64,6 +65,24 @@ static QString logosTestnetUrl()
                                          QStringLiteral("medusa-logos-testnet.url"));
     return u.isEmpty() ? QString::fromLatin1(kDefaultLogosTestnetUrl) : u;
 }
+// The deployed `medusa_faucet` LEZ program (wallet/faucet/guest), as ONE constant for every
+// zone. That is not an assumption about our zones, it is what a LEZ program id IS: `Program::new`
+// derives it with `compute_image_id` over the guest ELF alone (lee/state_machine/src/program.rs),
+// with no channel, deployer or endpoint mixed in. The same 437 884-byte binary therefore deploys
+// under this id everywhere, which was confirmed empirically when it was deployed to BOTH operator
+// zones on 2026-07-31 and each sequencer accepted it under exactly this id:
+//   Paradox   https://seq-testnet.paradox.computer/  block 975
+//   Logos     https://testnet.lez.logos.co/          block 44810
+// A per-zone table here would be a table with one distinct value in it, and would invite the
+// belief that a redeploy could change one entry without changing the program.
+//
+// It is also the wallet's trust anchor for the local copy of the guest: `medusa-faucet-client`
+// recomputes the ImageID from whatever .bin it is handed, so a planted .bin would silently point
+// the claim at a DIFFERENT program. faucetPreflight() runs `info --bin` (offline: no wallet, no
+// network) and refuses unless the answer is exactly this string.
+static constexpr const char* kFaucetProgramId =
+    "523320bdfff97cdbec1f01fdb5de9c37b4555abb7585cd123d77e9d09756e571";
+
 // Bundled-Tor SOCKS port (distinct from a system Tor on 9050, so the two never clash).
 static constexpr int kTorSocksPort = 9250;
 // Bundled-Tor control port (for the onion-connection-stage monitor).
@@ -299,7 +318,7 @@ QString moduleBinDir()
 // bit, leaves the binaries untouched, survives a reboot and survives uninstalling the module that
 // planted it. It does NOT defend against an attacker who overwrites the bundled binaries
 // themselves. Nothing this module can do would: it runs at the same uid as its attacker, so
-// <module>/bin/wallet is as writable as ~/.local/bin/wallet. What is different about the two is
+// <module>/bin/medusa-wallet is as writable as ~/.local/bin/medusa-wallet. What differs is
 // that overwriting the bundle destroys a shipped file (a reinstall undoes it, an integrity check
 // sees it) whereas step 3 lets an attacker ADD a file that was never there - which is why step 3
 // is confined to installs that have no bundle to speak of.
@@ -550,6 +569,16 @@ QString WalletPlugin::cliPath() const
 {
     // MEDUSA_WALLET_CLI (launcher-owned) -> the module's bundle -> (unpackaged installs only)
     // ~/.local/bin -> PATH. See resolveBin() for the full rule and for what it does not defend.
+    //
+    // The wrapper is "medusa-wallet": namespaced like every other binary we ship (medusa-tor,
+    // medusa-tor-monitor, diaphani-forward). A bare "wallet" in a shared ~/.local/bin is both a
+    // collision risk and the most plantable name there is, which is exactly the surface
+    // resolveBin() distrusts on packaged installs.
+    const QString named = resolveBin(QStringLiteral("medusa-wallet"), "MEDUSA_WALLET_CLI");
+    if (!named.isEmpty())
+        return named;
+    // Legacy fallback, one release only: installs made before the rename staged the wrapper as
+    // "wallet". Without this an upgrade would fail "wallet CLI not found" on every operation.
     return resolveBin(QStringLiteral("wallet"), "MEDUSA_WALLET_CLI");
 }
 
@@ -823,7 +852,7 @@ QString WalletPlugin::runWalletCommandInput(const QStringList& args,
 }
 
 // Turn raw merged CLI output + exit code into the module's JSON contract.
-// The wallet wrapper script (~/.local/bin/wallet) already emits JSON for some
+// The wallet wrapper script (~/.local/bin/medusa-wallet) already emits JSON for some
 // commands and free text for others, so this mirrors that: valid JSON passes
 // through untouched; text becomes {"ok":true,"output":…} on success or
 // {"error":…} on failure.
@@ -2280,6 +2309,213 @@ QString WalletPlugin::startFaucet(const QString& accountId)
                            toArg, QString(), QStringLiteral("150"));
 }
 
+// ── The on-chain faucet (the deployed `medusa_faucet` program) ────────────────────────────────
+
+// Where the guest .bin lives. It is DATA, not an executable, so this deliberately does not go
+// through resolveBin(): nothing here is ever launched. It is still read with the same
+// suspicion - faucetPreflight() proves its ImageID against kFaucetProgramId before any claim
+// uses it, so a planted file is caught rather than trusted because of where it sat.
+QString WalletPlugin::faucetGuestBin()
+{
+    const QString env = qEnvironmentVariable("MEDUSA_FAUCET_BIN").trimmed();
+    if (!env.isEmpty())
+        return QFileInfo::exists(env) ? QFileInfo(env).absoluteFilePath() : QString();
+    QStringList candidates;
+    const QString bdir = moduleBinDir();
+    if (!bdir.isEmpty())
+        candidates << bdir + QStringLiteral("/medusa_faucet.bin");
+    candidates << QDir::homePath() + QStringLiteral("/.local/share/medusa/medusa_faucet.bin")
+               << QDir::homePath() + QStringLiteral("/.local/bin/medusa_faucet.bin");
+    for (const QString& c : std::as_const(candidates))
+        if (QFileInfo::exists(c))
+            return c;
+    return QString();
+}
+
+// Everything that has to be true before an on-chain claim can possibly succeed, decided ONCE.
+// Ordered install-first, then zone, then wallet: a broken install is answered without touching
+// the network, and each failure names the single next thing to fix.
+//
+// What this deliberately does NOT re-check: whether each treasury is initialized, and whether the
+// cooldown has elapsed. medusa-faucet-client already fails fast on both with messages meant for a
+// human ("treasury for definition <id> is not initialized - run init-treasury first",
+// "cooldown not elapsed: N minutes remaining before the next claim"), and those checks need the
+// treasury PDA, whose derivation lives in medusa_faucet_shared. Re-deriving a PDA in C++ is
+// exactly the drift the shared crate exists to prevent, so the claim path surfaces the client's
+// answer instead of computing a second opinion that could disagree with the chain.
+WalletPlugin::FaucetPreflight WalletPlugin::faucetPreflight()
+{
+    FaucetPreflight pf;
+
+    // 1. The client binary. Absent on every install that does not ship it, which today is all
+    //    of them - so this is the message most users would see, and it must not read as a bug.
+    const QString client = resolveBin(QStringLiteral("medusa-faucet-client"),
+                                      "MEDUSA_FAUCET_CLIENT");
+    if (client.isEmpty() || !QFileInfo(client).isExecutable()) {
+        pf.reason  = QStringLiteral("client-missing");
+        pf.message = QStringLiteral("the on-chain faucet helper (medusa-faucet-client) is not "
+                                    "installed with this wallet, so it can only use the standard "
+                                    "faucet");
+        return pf;
+    }
+    pf.client = client;
+
+    // 2. The guest binary, which is what the program id is computed from.
+    pf.bin = faucetGuestBin();
+    if (pf.bin.isEmpty()) {
+        pf.reason  = QStringLiteral("bin-missing");
+        pf.message = QStringLiteral("the faucet program binary (medusa_faucet.bin) is not "
+                                    "installed with this wallet, so the on-chain faucet cannot "
+                                    "be addressed - use the standard faucet");
+        return pf;
+    }
+
+    // 3. THE CONSTANT, doing work. `info` is offline by construction (no unlock, no sequencer),
+    //    so this costs one short-lived process and no network. A .bin whose ImageID is not
+    //    kFaucetProgramId is a DIFFERENT program, whatever its filename says, and pointing a
+    //    signed claim at it is the failure mode worth refusing.
+    {
+        QProcess probe;
+        probe.setProcessChannelMode(QProcess::SeparateChannels);
+        if (!startChild(probe, client, { QStringLiteral("info"), QStringLiteral("--bin"), pf.bin })) {
+            pf.reason  = QStringLiteral("client-missing");
+            pf.message = QStringLiteral("the on-chain faucet helper could not be launched");
+            return pf;
+        }
+        probe.closeWriteChannel();
+        if (!probe.waitForFinished(15000)) {
+            probe.kill();
+            probe.waitForFinished(2000);
+        }
+        const QJsonObject o = QJsonDocument::fromJson(probe.readAllStandardOutput()).object();
+        const QString got = o.value(QStringLiteral("programId")).toString().trimmed().toLower();
+        pf.verified = (got == QString::fromLatin1(kFaucetProgramId));
+        if (!pf.verified) {
+            pf.reason  = QStringLiteral("program-mismatch");
+            pf.message = QStringLiteral("the local faucet program binary is not the deployed "
+                                        "faucet (its id is ")
+                       + (got.isEmpty() ? QStringLiteral("unreadable") : got.left(16) + QStringLiteral("…"))
+                       + QStringLiteral(", expected ")
+                       + QString::fromLatin1(kFaucetProgramId).left(16)
+                       + QStringLiteral("…) - refusing to claim from it");
+            return pf;
+        }
+    }
+
+    // 4. The zone's tokens. The faucet dispenses WHITELIST TOKENS from per-definition treasuries,
+    //    so a zone with no definitions has nothing for it to dispense, however well it is
+    //    deployed. This is the true state of both operator zones as of 2026-07-31.
+    QHash<QString, QString> names;
+    {
+        const QJsonDocument wl = QJsonDocument::fromJson(getWhitelist().toUtf8());
+        const QJsonArray arr = wl.array();
+        for (const QJsonValue& v : arr) {
+            const QJsonObject t = v.toObject();
+            const QString def = t.value(QStringLiteral("def")).toString().trimmed();
+            if (def.isEmpty())
+                continue;
+            pf.definitions << def;
+            names.insert(def, t.value(QStringLiteral("name")).toString());
+        }
+    }
+    if (pf.definitions.isEmpty()) {
+        pf.reason  = QStringLiteral("no-definitions");
+        pf.message = QStringLiteral("this zone has no faucet tokens yet: the faucet program is "
+                                    "deployed, but no token definitions or funded treasuries "
+                                    "exist on it, so there is nothing to claim");
+        return pf;
+    }
+
+    // 5. A recipient holding per definition. The claim signs each recipient, so every one must be
+    //    an account this wallet owns, and they must be distinct: one account holds exactly one
+    //    token definition. The wrapper's registry already designates one per definition (its
+    //    "vaults"), which is why the user's own account is never used here.
+    QHash<QString, QString> vaults;
+    {
+        const QJsonObject reg =
+            QJsonDocument::fromJson(getTokenRegistry().toUtf8()).object();
+        const QJsonObject v = reg.value(QStringLiteral("vaults")).toObject();
+        for (auto it = v.constBegin(); it != v.constEnd(); ++it)
+            vaults.insert(it.key(), it.value().toString());
+    }
+    for (const QString& def : std::as_const(pf.definitions)) {
+        const QString vault = vaults.value(def).trimmed();
+        if (vault.isEmpty()) {
+            pf.reason  = QStringLiteral("no-holding");
+            pf.message = QStringLiteral("this wallet has no holding account for ")
+                       + (names.value(def).isEmpty() ? def.left(8) : names.value(def))
+                       + QStringLiteral(" yet - use the standard faucet once (it creates one), "
+                                        "then the on-chain faucet can deliver into it");
+            return pf;
+        }
+        pf.recipients << vault;
+        pf.tickers    << names.value(def);
+    }
+
+    pf.ok = true;
+    return pf;
+}
+
+QString WalletPlugin::faucetStatus()
+{
+    const FaucetPreflight pf = faucetPreflight();
+
+    QJsonObject o;
+    o[QStringLiteral("programId")]   = QString::fromLatin1(kFaucetProgramId);
+    o[QStringLiteral("available")]   = pf.ok;
+    o[QStringLiteral("reason")]      = pf.reason;
+    o[QStringLiteral("message")]     = pf.message;
+    o[QStringLiteral("client")]      = pf.client;
+    o[QStringLiteral("clientFound")] = !pf.client.isEmpty();
+    o[QStringLiteral("bin")]         = pf.bin;
+    o[QStringLiteral("binFound")]    = !pf.bin.isEmpty();
+    o[QStringLiteral("verified")]    = pf.verified;
+    o[QStringLiteral("definitions")] = QJsonArray::fromStringList(pf.definitions);
+    o[QStringLiteral("recipients")]  = QJsonArray::fromStringList(pf.recipients);
+    QJsonObject tick;
+    for (int i = 0; i < pf.definitions.size() && i < pf.tickers.size(); ++i)
+        tick[pf.definitions.at(i)] = pf.tickers.at(i);
+    o[QStringLiteral("tickers")] = tick;
+    // Honest, not decorative. Treasury balances live behind a PDA whose derivation is owned by
+    // medusa_faucet_shared, and this module does not re-derive it (see faucetPreflight), so the
+    // wallet cannot assert "funded" from here. What it CAN do is never present an empty treasury
+    // as an unexplained failure: onJobFinished translates the sequencer's silent rejection of a
+    // preflighted claim into the funding message.
+    o[QStringLiteral("funded")] = QStringLiteral("unknown");
+    return QJsonDocument(o).toJson(QJsonDocument::Compact);
+}
+
+QString WalletPlugin::startTokenFaucet(const QString& accountId, const QString& password)
+{
+    // The gate comes FIRST, before any probe, any CLI call and any resolution: a caller that
+    // cannot prove who it is learns nothing about this wallet's install or its holdings, and the
+    // refusal it gets is identical to every other spend verb's.
+    if (!authorize(password))
+        return authRefusal();
+
+    if (accountId.trimmed().isEmpty())
+        return errorJson(QStringLiteral("accountId is required"));
+
+    const FaucetPreflight pf = faucetPreflight();
+    if (!pf.ok)
+        return errorJson(pf.message, pf.reason);
+
+    QString id = accountId.trimmed();
+    const QString attribute =
+        (id.startsWith(QStringLiteral("Public/")) || id.startsWith(QStringLiteral("Private/")))
+            ? id : QStringLiteral("Public/") + id;
+
+    // No amount: the program dispenses a pseudorandom 10-500 PER DEFINITION, decided on-chain
+    // from the block clock, and the client's reply does not carry the figures either. Reporting a
+    // made-up number in the history would be worse than reporting none.
+    return startPrivacyJob(QStringLiteral("tokenfaucet"), QStringLiteral("token"),
+                           { QStringLiteral("claim"),
+                             QStringLiteral("--bin"),         pf.bin,
+                             QStringLiteral("--account"),     pf.recipients.join(QLatin1Char(',')),
+                             QStringLiteral("--definitions"), pf.definitions.join(QLatin1Char(',')) },
+                           attribute, QString(), QString(), pf.client);
+}
+
 // ── Transaction history (local store) ─────────────────────────────────────────
 
 static QString txHistoryKey(const QString& accountId)
@@ -2572,7 +2808,8 @@ int WalletPlugin::proveTimeoutMs()
 QString WalletPlugin::startPrivacyJob(const QString& op, const QString& asset,
                                       const QStringList& sendArgs,
                                       const QString& from, const QString& to,
-                                      const QString& amount)
+                                      const QString& amount,
+                                      const QString& binOverride)
 {
     // Bound the registry - drop the oldest terminal jobs once we hit the cap.
     if (m_jobs.size() >= kMaxJobs) {
@@ -2589,7 +2826,10 @@ QString WalletPlugin::startPrivacyJob(const QString& op, const QString& asset,
         }
     }
 
-    const QString bin   = cliPath();
+    // Every existing caller runs the wallet CLI; the on-chain faucet runs its own client under
+    // the same job machinery (registry, phases, kill budget, history) rather than growing a
+    // second, subtly different copy of it.
+    const QString bin   = binOverride.isEmpty() ? cliPath() : binOverride;
     const QString jobId = QStringLiteral("job-%1").arg(++m_jobSeq);
 
     Job* j   = new Job;
@@ -2617,8 +2857,9 @@ QString WalletPlugin::startPrivacyJob(const QString& op, const QString& asset,
                      this, [this, jobId](int code, QProcess::ExitStatus) {
         onJobFinished(jobId, code);
     });
+    const bool ownBin = !binOverride.isEmpty();
     QObject::connect(proc, &QProcess::errorOccurred, this,
-                     [this, jobId, bin](QProcess::ProcessError e) {
+                     [this, jobId, bin, ownBin](QProcess::ProcessError e) {
         if (e != QProcess::FailedToStart) return;   // other errors arrive via finished()
         Job* job = m_jobs.value(jobId, nullptr);
         if (!job || job->state != QStringLiteral("running")) return;
@@ -2626,10 +2867,14 @@ QString WalletPlugin::startPrivacyJob(const QString& op, const QString& asset,
         // NOT "configure the path in settings": there is no such setting any more (see
         // cliPath()). This is the async twin of the message in runWalletCommandInput, and it
         // serves shield, deshield, private transfer, token send, plain send and the faucet - so
-        // it was the message most users would actually have seen.
-        job->result = errorJson(QStringLiteral("wallet CLI not found: ") + bin
-                                + QStringLiteral(" - reinstall the medusa_core module, or set "
-                                                 "MEDUSA_WALLET_CLI before launching"));
+        // it was the message most users would actually have seen. A job running its OWN binary
+        // must not blame the wallet CLI: naming the wrong missing file is how a five-minute fix
+        // becomes an hour.
+        job->result = ownBin
+            ? errorJson(QStringLiteral("on-chain faucet helper could not be launched: ") + bin)
+            : errorJson(QStringLiteral("wallet CLI not found: ") + bin
+                        + QStringLiteral(" - reinstall the medusa_core module, or set "
+                                         "MEDUSA_WALLET_CLI before launching"));
         if (job->proc) { job->proc->deleteLater(); job->proc = nullptr; }
     });
 
@@ -2667,6 +2912,14 @@ QString WalletPlugin::startPrivacyJob(const QString& op, const QString& asset,
         const bool realProofs = (netId() != QStringLiteral("devnet"));
         QProcessEnvironment penv = childEnv();   // sanitised $PATH, then the proof mode on top
         penv.insert(QStringLiteral("RISC0_DEV_MODE"), realProofs ? QStringLiteral("0") : QStringLiteral("1"));
+        // The wallet WRAPPER defaults LEE_WALLET_HOME_DIR for itself, so it and the module always
+        // agree on one home even when nothing exported it. A non-wrapper child does not: the
+        // faucet client would fall back to lee's own default and operate on a DIFFERENT wallet -
+        // wrong keys, wrong sequencer, and a claim that looks like it silently did nothing.
+        // walletHome() returns the inherited value whenever there is one, so this pins the same
+        // home the module itself reads and changes nothing for anyone who already set it.
+        if (ownBin)
+            penv.insert(QStringLiteral("LEE_WALLET_HOME_DIR"), walletHome());
         proc->setProcessEnvironment(penv);
     }
 
@@ -2711,6 +2964,27 @@ void WalletPlugin::onJobFinished(const QString& jobId, int exitCode)
     QJsonObject no = QJsonDocument::fromJson(normalized.toUtf8()).object();
     const bool success = !j->killedByTimeout && (effectiveCode == 0)
                        && !no.contains(QStringLiteral("error"));
+
+    // THE UNFUNDED TREASURY, NAMED. A tokenfaucet claim only reaches the chain after
+    // faucetPreflight() passed and after medusa-faucet-client's own fail-fast checks (treasury
+    // initialized, cooldown elapsed) passed, and the client reports both of those in plain
+    // words. What is left when the sequencer then drops the tx is overwhelmingly a treasury with
+    // no supply in it: the program is deployed and initialized but nobody has funded it. The raw
+    // message for that is "transaction … was not included within N blocks", which tells the user
+    // nothing they can act on, so it is replaced here rather than shown.
+    if (!success && j->op == QStringLiteral("tokenfaucet")) {
+        const QString raw = no.value(QStringLiteral("error")).toString();
+        if (raw.contains(QStringLiteral("was not included"))
+            || raw.contains(QStringLiteral("rejected it silently"))) {
+            no[QStringLiteral("error")] =
+                QStringLiteral("the faucet treasuries on this zone have no token supply yet - the "
+                               "faucet program is deployed but nobody has funded it, so there is "
+                               "nothing to dispense. Use the standard faucet meanwhile.");
+            no[QStringLiteral("reason")]    = QStringLiteral("not-funded");
+            no[QStringLiteral("rawError")]  = raw;
+            normalized = QJsonDocument(no).toJson(QJsonDocument::Compact);
+        }
+    }
 
     j->result = normalized;
     j->state  = success ? QStringLiteral("done") : QStringLiteral("error");
@@ -2760,11 +3034,20 @@ QString WalletPlugin::getJob(const QString& jobId)
     if (j->state != QStringLiteral("running")) {
         QJsonObject r = QJsonDocument::fromJson(j->result.toUtf8()).object();
         o[QStringLiteral("result")] = r;
-        if (j->state == QStringLiteral("done"))
+        if (j->state == QStringLiteral("done")) {
             o[QStringLiteral("txId")] = extractTxHash(j->result);
-        else
+        } else {
             o[QStringLiteral("error")] = r.value(QStringLiteral("error")).toString(
                 QStringLiteral("privacy transfer failed"));
+            // A machine-readable code beside the sentence, using the module's existing `reason`
+            // convention, so the UI can act on a failure class instead of matching on prose.
+            // Only present when the failure has one (today: the faucet's "not-funded"), and the
+            // raw message travels with it so an operator can still see what the chain said.
+            if (r.contains(QStringLiteral("reason")))
+                o[QStringLiteral("reason")] = r.value(QStringLiteral("reason"));
+            if (r.contains(QStringLiteral("rawError")))
+                o[QStringLiteral("rawError")] = r.value(QStringLiteral("rawError"));
+        }
     }
     return QJsonDocument(o).toJson(QJsonDocument::Compact);
 }

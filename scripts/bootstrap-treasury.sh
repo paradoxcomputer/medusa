@@ -7,7 +7,7 @@
 # which the wrapper reads for the whitelist + the per-claim distribution.
 set -euo pipefail
 
-WALLET="${WALLET:-$HOME/.local/bin/wallet}"        # the JSON wrapper
+WALLET="${WALLET:-$HOME/.local/bin/medusa-wallet}"        # the JSON wrapper
 export LEE_WALLET_HOME_DIR="${MEDUSA_TREASURY_HOME:-$HOME/.local/share/medusa-treasury}"
 export NSSA_WALLET_HOME_DIR="$LEE_WALLET_HOME_DIR"   # rc4 binary compat
 export LOGOS_SEQUENCER="${LOGOS_SEQUENCER:-http://127.0.0.1:3071/}"

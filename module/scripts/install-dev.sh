@@ -103,16 +103,20 @@ install_into() {
 for BASE in "${ROOTS[@]}"; do install_into "$BASE"; done
 
 # Stage the bundled binaries the plugin auto-launches (local + diaphani modes).
-# Installed to ~/.local/bin (where seqPath() looks), next to wallet/wallet-lez.
+# Installed to ~/.local/bin (where seqPath() looks), next to medusa-wallet/wallet-lez.
 #   sequencer_service     - standalone build (devnet/testnet, L1-free)
 #   sequencer_service_l1  - NON-standalone build (diaphani: talks to the real Bedrock L1)
 #   diaphani-forward      - Tor tunnel to the node's .onion (diaphani mode)
 if [[ $QML_ONLY -eq 0 ]]; then
-    # Wallet CLI: the plugin invokes ~/.local/bin/wallet (the JSON-normalizing wrapper), which
-    # in turn calls ~/.local/bin/wallet-lez (the built wallet). Stage BOTH or every wallet op
-    # fails "wallet CLI not found".
-    install -m755 "$REPO/scripts/wallet-wrapper" "$HOME/.local/bin/wallet" \
-        && echo "  staged wallet wrapper → ~/.local/bin/wallet"
+    # Wallet CLI: the plugin invokes ~/.local/bin/medusa-wallet (the JSON-normalizing wrapper),
+    # which in turn calls ~/.local/bin/wallet-lez (the built engine). Stage BOTH or every wallet
+    # op fails "wallet CLI not found". Only the wrapper is public-facing, so only it is
+    # namespaced; wallet-lez stays as-is.
+    install -m755 "$REPO/scripts/wallet-wrapper" "$HOME/.local/bin/medusa-wallet" \
+        && echo "  staged wallet wrapper → ~/.local/bin/medusa-wallet"
+    # Retire the pre-rename name so a stale copy cannot be picked up by the legacy fallback in
+    # cliPath(). Harmless if it was never there.
+    rm -f "$HOME/.local/bin/wallet"
     WALLET_SRC="${WALLET_SRC:-$REPO/../wallet/.lez-build/target/release/wallet}"
     if [[ -x "$WALLET_SRC" ]]; then
         install -m755 "$WALLET_SRC" "$HOME/.local/bin/wallet-lez"
