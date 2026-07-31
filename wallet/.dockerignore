@@ -1,0 +1,9 @@
+# Keep the cargo-risczero docker build context (wallet/) lean: the guest build only
+# needs the .lez-build SOURCE tree (path-deps) + faucet/, never build outputs or git.
+.lez-build/target
+.lez-build/.git
+.diaphani-build
+faucet/client/target
+faucet/shared/target
+faucet/guest/target
+target

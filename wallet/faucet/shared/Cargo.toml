@@ -1,0 +1,24 @@
+[package]
+name = "medusa_faucet_shared"
+version = "0.1.0"
+edition = "2024"
+
+# The instruction enum and PDA/amount derivations shared by the medusa_faucet risc0
+# guest (wallet/faucet/guest) and the host client (wallet/faucet/client), so the wire
+# encodings can never drift between the two.
+
+[dependencies]
+# The enum itself only needs serde (no_std-friendly). The derivation helpers need the
+# in-tree lee_core types + the risc0 SHA impl and are gated behind the default
+# "helpers" feature, which both the guest and the client enable.
+serde = { version = "1.0.60", default-features = false, features = ["derive"] }
+lee_core = { path = "../../.lez-build/lee/state_machine/core", optional = true }
+# Pin exactly the upstream-pinned zkVM version so guest and host resolve ONE copy.
+risc0-zkvm = { version = "=3.0.5", default-features = false, features = ["std"], optional = true }
+
+[features]
+default = ["helpers"]
+helpers = ["dep:lee_core", "dep:risc0-zkvm"]
+
+# Standalone crate: never attach to an enclosing workspace.
+[workspace]

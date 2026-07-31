@@ -1,0 +1,32 @@
+[package]
+name = "medusa-faucet-client"
+version = "0.1.0"
+edition = "2024"
+
+# Host-side operator client for the medusa_faucet LEZ program: deploy the guest .bin,
+# initialize per-token treasuries, and claim. Builds against the PATCHED v0.2.0 tree in
+# wallet/.lez-build (the patched wallet crate matters: upstream v0.2.0 links pyo3 /
+# the build host's libpython; patch 0002 builds it out).
+
+[[bin]]
+name = "medusa-faucet-client"
+path = "src/main.rs"
+
+[dependencies]
+wallet = { path = "../../.lez-build/lez/wallet" }
+lee = { path = "../../.lez-build/lee/state_machine" }
+lee_core = { path = "../../.lez-build/lee/state_machine/core" }
+common = { path = "../../.lez-build/lez/common" }
+sequencer_service_rpc = { path = "../../.lez-build/lez/sequencer/service/rpc", features = ["client"] }
+clock_core = { path = "../../.lez-build/lez/programs/clock/core" }
+medusa_faucet_shared = { path = "../shared" }
+
+anyhow = "1.0.98"
+bytemuck = "1.24.0"
+clap = { version = "4.5.42", features = ["derive"] }
+hex = "0.4.3"
+serde_json = "1.0.81"
+tokio = { version = "1.50", features = ["macros", "rt-multi-thread"] }
+
+# Standalone crate: never attach to an enclosing workspace.
+[workspace]

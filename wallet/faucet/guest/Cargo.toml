@@ -1,0 +1,28 @@
+[package]
+name = "medusa_faucet"
+version = "0.1.0"
+edition = "2024"
+
+# The medusa_faucet LEZ program (risc0 guest). Built for riscv32im-risc0-zkvm-elf via
+#   cargo risczero build --manifest-path wallet/faucet/guest/Cargo.toml
+# (see wallet/faucet/README.md). Path-deps resolve against the PATCHED v0.2.0 tree in
+# wallet/.lez-build (medusa-build = tag v0.2.0 + wallet/patches-v020/*), the same tree
+# the deployed wallet and sequencer are built from, so the in-guest types match the
+# zone's ImageID-relevant encodings exactly.
+
+[[bin]]
+name = "medusa_faucet"
+path = "src/main.rs"
+
+[dependencies]
+lee_core = { path = "../../.lez-build/lee/state_machine/core" }
+token_core = { path = "../../.lez-build/lez/programs/token/core" }
+clock_core = { path = "../../.lez-build/lez/programs/clock/core" }
+medusa_faucet_shared = { path = "../shared" }
+# Pin exactly the upstream-pinned zkVM version: guarantees a SINGLE risc0-zkvm copy in
+# the guest (lee_core's caret "3.0.5" unifies onto this exact pin).
+risc0-zkvm = { version = "=3.0.5", default-features = false, features = ["std"] }
+
+# NOTE: this crate is a member of the wallet/Cargo.toml workspace (see the comment
+# there): the workspace root doubles as the cargo-risczero docker build context, which
+# must contain the .lez-build path-deps.

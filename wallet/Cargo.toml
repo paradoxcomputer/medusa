@@ -1,0 +1,18 @@
+# Workspace root for the medusa_faucet GUEST crate only.
+#
+# This exists so that `cargo risczero build` derives its docker build context from
+# wallet/ (the workspace root): the guest's path-deps into wallet/.lez-build must live
+# INSIDE the context or the in-docker `cargo fetch` cannot see them. wallet/.dockerignore
+# keeps the copied context lean (no .lez-build/target, no .git).
+#
+# The host-side crates stay out on purpose: wallet/faucet/client and wallet/faucet/shared
+# are standalone (own [workspace] tables), so host wallet deps never leak into the guest
+# lockfile (wallet/Cargo.lock) that the reproducible guest build resolves with.
+
+[workspace]
+resolver = "3"
+members = ["faucet/guest"]
+# Path-deps living under wallet/ must NOT be auto-captured as members of THIS
+# workspace: .lez-build crates inherit license/lints from .lez-build's own workspace
+# root, and shared/client are deliberately standalone.
+exclude = [".lez-build", "faucet/shared", "faucet/client"]
