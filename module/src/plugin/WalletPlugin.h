@@ -251,6 +251,22 @@ private:
     QProcess*      m_healthProbe = nullptr;
     bool           m_lastSeqOk = false;       // cached: did the last async checkHealth succeed?
     void           probeSeqHealthAsync(const QString& url);  // fire-and-forget, updates m_lastSeqOk
+    // ── Local-sequencer failure record (drives getSequencerStatus's reason field) ──
+    // A user op against a dead local sequencer must be able to say WHY it is dead
+    // (binary missing / spawn failed / crashed) instead of an eternal "Connecting…".
+    QString        m_seqLaunchError;          // last spawn failure ("" = launched fine / not tried)
+    bool           m_seqExited = false;       // the spawned sequencer exited on its own
+    int            m_seqExitCode = 0;         // its exit code (-1 = killed by a signal)
+    bool           m_seqStopping = false;     // deliberate stopSequencer() in flight - not a crash
+    qint64         m_seqLaunchedMs = 0;       // epoch ms of the last successful spawn (grace period)
+    qint64         m_bornMs = 0;              // plugin construction time (grace before first launch)
+    // ── Zone/build compatibility ("unknown" | "ok" | "mismatch") ──
+    // Probed asynchronously via `wallet check-health` once the zone answers health checks;
+    // reset on every zone (re)apply. A stale bundled sequencer under a newer wallet ANSWERS
+    // health checks, so without this the UI reads an unusable zone as connected.
+    QProcess*      m_compatProbe = nullptr;
+    QString        m_zoneCompat;
+    void           probeZoneCompatAsync();
     // Async balances: `account list -l` over Tor is slow + would freeze/crash the UI, so the
     // account list is served LOCALLY (no -l, instant) with balances merged from this cache,
     // refreshed by a background fetch.

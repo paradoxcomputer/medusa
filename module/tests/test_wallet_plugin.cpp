@@ -48,6 +48,14 @@ private:
     }
 
 private slots:
+    void initTestCase()
+    {
+        // Isolate every test from the developer's real wallet home (~/.local/share/
+        // medusa-wallet-home): the sequencer-status tests read wallet_config.json and
+        // write a sequencer log under walletHome(), and must never touch real state.
+        qputenv("LEE_WALLET_HOME_DIR", (m_tmp.path() + QStringLiteral("/home")).toUtf8());
+    }
+
     void init()
     {
         QSettings s;
@@ -763,6 +771,90 @@ private slots:
         WalletPlugin p;
         QCOMPARE(parseObj(p.actionStatus(QStringLiteral("req-nope")))[QStringLiteral("error")].toString(),
                  QString("unknown request"));
+    }
+
+    // ── Sequencer status: the offline/failure surface the UI's modal + banner read ──
+    void testSequencerStatusDevnetBinaryMissing()
+    {
+        QSettings s;
+        s.setValue(QStringLiteral("medusa-wallet/network"), QStringLiteral("devnet"));
+        s.setValue(QStringLiteral("medusa-wallet/seqPath"),
+                   m_tmp.path() + QStringLiteral("/no_such_sequencer"));
+        s.sync();
+
+        WalletPlugin p;
+        auto r = parseObj(p.getSequencerStatus());
+        QCOMPARE(r[QStringLiteral("mode")].toString(), QString("local-standalone"));
+        QCOMPARE(r[QStringLiteral("binaryAvailable")].toBool(), false);
+        QCOMPARE(r[QStringLiteral("running")].toBool(), false);
+        QCOMPARE(r[QStringLiteral("healthy")].toBool(), false);
+        // No binary can never come up - reported immediately, no launch grace applies.
+        QCOMPARE(r[QStringLiteral("reason")].toString(), QString("binary-missing"));
+        QCOMPARE(r[QStringLiteral("compat")].toString(), QString("unknown"));
+        QVERIFY(r.contains(QStringLiteral("endpoint")));
+        QVERIFY(r.contains(QStringLiteral("lastLaunchError")));
+    }
+
+    void testSequencerStatusLaunchFailedReason()
+    {
+        // An existing but non-executable "binary": the spawn fails, and the status must
+        // carry the reason + a human launch error (not just an eternal "unreachable").
+        QString bad = m_tmp.path() + QStringLiteral("/seq_not_executable");
+        { QFile f(bad); f.open(QIODevice::WriteOnly); f.write("not a program\n"); }
+        QFile::setPermissions(bad, QFile::ReadOwner | QFile::WriteOwner);   // no exec bit
+
+        QSettings s;
+        s.setValue(QStringLiteral("medusa-wallet/seqPath"), bad);
+        s.sync();
+
+        WalletPlugin p;
+        parseObj(p.setActiveZone(QStringLiteral("devnet")));   // applySequencer → spawn attempt
+        auto r = parseObj(p.getSequencerStatus());
+        QCOMPARE(r[QStringLiteral("mode")].toString(), QString("local-standalone"));
+        QCOMPARE(r[QStringLiteral("binaryAvailable")].toBool(), true);
+        QCOMPARE(r[QStringLiteral("running")].toBool(), false);
+        QCOMPARE(r[QStringLiteral("reason")].toString(), QString("launch-failed"));
+        QVERIFY(!r[QStringLiteral("lastLaunchError")].toString().isEmpty());
+    }
+
+    void testSequencerStatusExitedReason()
+    {
+        // A "sequencer" that starts fine and exits immediately (crash / bad config / port
+        // clash): the status must report reason "exited" with the exit code and the log
+        // path in the module's data dir - even inside the launch grace window.
+        QString dying = m_tmp.path() + QStringLiteral("/seq_dies.sh");
+        { QFile f(dying); f.open(QIODevice::WriteOnly | QIODevice::Text);
+          f.write("#!/bin/sh\necho boom\nexit 3\n"); }
+        QFile::setPermissions(dying, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+
+        QSettings s;
+        s.setValue(QStringLiteral("medusa-wallet/seqPath"), dying);
+        s.sync();
+
+        WalletPlugin p;
+        parseObj(p.setActiveZone(QStringLiteral("devnet")));
+        QTRY_COMPARE_WITH_TIMEOUT(
+            parseObj(p.getSequencerStatus())[QStringLiteral("reason")].toString(),
+            QString("exited"), 5000);
+        auto r = parseObj(p.getSequencerStatus());
+        QCOMPARE(r[QStringLiteral("exitCode")].toInt(), 3);
+        QVERIFY(r[QStringLiteral("lastLaunchError")].toString().isEmpty());
+        QVERIFY(r[QStringLiteral("logPath")].toString().endsWith(QStringLiteral("sequencer.log")));
+    }
+
+    void testSequencerStatusRemoteFields()
+    {
+        // Fresh settings → the default zone is the built-in remote clearnet zone. The
+        // status must expose the endpoint/healthy/compat trio there too (the offline
+        // modal names the endpoint), but none of the local-sequencer reason fields.
+        WalletPlugin p;
+        auto r = parseObj(p.getSequencerStatus());
+        QCOMPARE(r[QStringLiteral("mode")].toString(), QString("remote"));
+        QVERIFY(r.contains(QStringLiteral("endpoint")));
+        QVERIFY(r.contains(QStringLiteral("healthy")));
+        QCOMPARE(r[QStringLiteral("compat")].toString(), QString("unknown"));
+        QVERIFY(!r.contains(QStringLiteral("reason")));
+        QVERIFY(!r.contains(QStringLiteral("running")));
     }
 };
 

@@ -136,6 +136,28 @@ Rectangle {
     property string torStage:            ""           // current Tor bootstrap stage text
     property string torOnionStage:       ""           // onion-connection stage (post-bootstrap, real)
     property int    torOnionPct:         0            // onion-connection coarse % (from control port)
+    // ── Zone-offline / local-sequencer failure surface ─────────────────────────
+    property bool   seqHealthy:          false       // last health-probe verdict for the active zone
+    property string seqReason:           ""          // local-zone problem: "" | binary-missing | launch-failed | exited | unhealthy | mismatch
+    property string seqLaunchError:      ""          // human text for a failed sequencer spawn
+    property string seqLogPath:          ""          // the local sequencer's log file (if one exists)
+    property int    seqExitCode:         0           // exit code of a crashed local sequencer
+    property string seqEndpoint:         ""          // the address the wallet actually dials
+    property string zoneCompat:          "unknown"   // wallet-vs-zone build: unknown | ok | mismatch
+    readonly property bool seqOnline:    seqStatus === "running"
+    // The one problem string the banner + offline modal render ("" = none). A build
+    // mismatch wins: the zone ANSWERS, so plain "offline" wording would mislead.
+    // tor-missing is folded in for the Tor-tunnelled local zone (diaphani).
+    readonly property string seqProblem: {
+        if (zoneCompat === "mismatch") return "mismatch"
+        if (seqMode === "local-standalone") return seqReason
+        if (seqMode === "local-l1-tor" && torBinaryMissing) return "tor-missing"
+        return ""
+    }
+    property bool   zoneOfflineOpen:     false       // the blocking zone-offline modal
+    property string zoneOfflineOp:       ""          // label of the blocked/failed operation
+    property bool   zoneOfflineMismatch: false       // route the modal to the mismatch wording
+    property bool   zoneRetryBusy:       false       // a Retry health re-check is in flight
     property string cliPath:             ""
     property var    accounts:            []
     property bool   pollBusy:            false
@@ -277,6 +299,8 @@ Rectangle {
             var r = callModuleParse(logos.callModule("medusa_core", "setActiveZone", [id]))
             if (r && r.error) { root.logActivity("Zone switch failed: " + r.error, true); return }
             root.network = id
+            root.zoneCompat = "unknown"       // the build-compat verdict is per-zone
+            root.zoneOfflineOpen = false      // a stale offline modal refers to the old zone
             root.selectedFromId = ""; root.selectedTokens = []    // re-select on the new zone
             root.refreshSeqStatus(); root.refreshZones()
             netReloadTimer.restart()
@@ -506,6 +530,16 @@ Rectangle {
         root.seqBinaryPath = (s && s.binaryPath) ? s.binaryPath : ""
         // Tor/onion zone with no usable Tor binary (neither bundled medusa-tor nor a system tor).
         root.torBinaryMissing = !!(s && s.needsTor === true && s.torAvailable === false)
+        // Failure surface for the offline modal + local-sequencer banner.
+        root.seqHealthy     = !!(s && s.healthy === true)
+        root.seqReason      = (s && s.reason) ? s.reason : ""
+        root.seqLaunchError = (s && s.lastLaunchError) ? s.lastLaunchError : ""
+        root.seqLogPath     = (s && s.logPath) ? s.logPath : ""
+        root.seqExitCode    = (s && s.exitCode !== undefined) ? s.exitCode : 0
+        root.seqEndpoint    = (s && s.endpoint) ? s.endpoint : ""
+        // Only accept a real verdict: "unknown" must not erase a mismatch learned from an
+        // op error (the plugin re-probes lazily). Zone switches reset this explicitly.
+        if (s && (s.compat === "ok" || s.compat === "mismatch")) root.zoneCompat = s.compat
         // While connecting over Tor, surface bootstrap progress for the connect bar.
         if (root.activeZoneIsTor() && root.seqStatus !== "running") {
             var t = callModuleParse(logos.callModule("medusa_core", "getTorProgress", []))
@@ -522,6 +556,91 @@ Rectangle {
                 return root.zones[i].kind === "local-l1-tor"
                     || (root.zones[i].kind === "remote" && root.zones[i].tor)
         return false
+    }
+
+    // ── Zone-offline guard: user-triggered sequencer ops must NEVER fail silently ──
+    // (real incident: a send while the zone was down produced no feedback at all).
+    // Returns true when the op may proceed; otherwise raises the blocking modal.
+    // NB: passive refreshes (unlock, background listAccounts - incl. the deliberate
+    // Tor-noise suppression above) are NOT ops and stay un-guarded.
+    function guardZoneOp(opName) {
+        if (root.seqProblem === "mismatch") { root.openZoneOffline(opName, true); return false }
+        if (root.seqStatus === "running") return true
+        root.openZoneOffline(opName, false)
+        return false
+    }
+    function openZoneOffline(opName, mismatch) {
+        root.zoneOfflineOp = opName || ""
+        root.zoneOfflineMismatch = (mismatch === true)
+        root.zoneOfflineOpen = true
+    }
+    // Transport/connection-class error classifier. The wrapper's zone gate ("program ids
+    // differ") routes to the mismatch wording instead - a reachable-but-incompatible zone
+    // must not read as "check your network".
+    function classifyOpError(msg) {
+        var s = String(msg || "").toLowerCase()
+        if (s.indexOf("program ids differ") >= 0 || s.indexOf("different from remote") >= 0)
+            return "mismatch"
+        var pats = ["connection refused", "connection reset", "timed out", "timeout",
+                    "dns error", "error sending request", "transport", "failed to connect",
+                    "connection closed", "network is unreachable"]
+        for (var i = 0; i < pats.length; i++)
+            if (s.indexOf(pats[i]) >= 0) return "offline"
+        return ""
+    }
+    // Surface an operation failure: always the persistent error toast (copyable), PLUS
+    // the blocking zone modal when the failure is connection-class or the mismatch gate.
+    function surfaceOpError(label, msg) {
+        var m = (msg && String(msg).length > 0) ? String(msg) : "unknown"
+        root.logActivity(label + " failed: " + m, true)
+        var cls = root.classifyOpError(m)
+        if (cls === "mismatch") { root.zoneCompat = "mismatch"; root.openZoneOffline(label, true) }
+        else if (cls === "offline") root.openZoneOffline(label, false)
+    }
+    // Retry from the offline modal: re-check health, close on success. Health for
+    // remote/Tor zones is an async cached probe, so poll a few rounds (covering the
+    // probe's 8s budget) instead of reading one stale answer.
+    function retryZoneHealth() {
+        root.zoneRetryBusy = true
+        zoneRetryTimer.tries = 0
+        root.refreshSeqStatus()
+        zoneRetryTimer.start()
+    }
+    // The endpoint to NAME in offline messages: the zone's configured endpoint (URL or
+    // onion) when known, else the effective address the wallet dials (local sequencer).
+    function zoneEndpointDesc() {
+        for (var i = 0; i < root.zones.length; i++)
+            if (root.zones[i].id === root.network && root.zones[i].endpoint)
+                return root.zones[i].endpoint
+        return root.seqEndpoint
+    }
+    function seqProblemTitle() {
+        return root.seqProblem === "mismatch" ? "Zone build mismatch" : "Local sequencer not running"
+    }
+    // Reason-specific advice for the banner + offline modal. Every branch says what to DO
+    // (reinstall the module / restart Basecamp / switch zone).
+    function seqProblemBody() {
+        if (root.seqProblem === "mismatch")
+            return "This zone's sequencer runs a different LEZ build than this wallet (program "
+                 + "ids differ). Reinstall/update the Medusa module so both match, or switch zone."
+        if (root.seqProblem === "binary-missing")
+            return "The bundled sequencer binary was not found"
+                 + (root.seqBinaryPath ? " (looked for " + root.seqBinaryPath + ")" : "")
+                 + ". Reinstall the Medusa module, or switch zone."
+        if (root.seqProblem === "launch-failed")
+            return "The local sequencer failed to launch"
+                 + (root.seqLaunchError ? ": " + root.seqLaunchError : "")
+                 + ". Reinstall the module, restart Basecamp, or switch zone."
+        if (root.seqProblem === "exited")
+            return "The local sequencer process exited (code " + root.seqExitCode + ")"
+                 + (root.seqLogPath ? " - log: " + root.seqLogPath : "")
+                 + ". Restart Basecamp to relaunch it, or switch zone."
+        if (root.seqProblem === "tor-missing")
+            return "This zone tunnels over Tor, but no Tor binary was found. Reinstall the "
+                 + "Medusa module (it bundles Tor) or install a system tor, then restart Basecamp."
+        return "The local sequencer is not answering health checks"
+             + (root.seqLogPath ? " - log: " + root.seqLogPath : "")
+             + ". Restart Basecamp to relaunch it, or switch zone."
     }
 
     function refreshTxHistory() {
@@ -545,6 +664,8 @@ Rectangle {
     }
 
     function doSend(to, amount) {
+        // Sequencer op: never let it fail silently against a dead/incompatible zone.
+        if (!root.guardZoneOp(root.sendTokenDef === "" ? "Transfer" : "Token send")) return
         var bal = root.sendBalance()
         var sym = root.sendTokenDef === "" ? "LEZ" : root.sendTokenName
         var raw = String(amount).trim()
@@ -559,7 +680,7 @@ Rectangle {
             // token send is a background job (derive/create ATAs + token-send + wait)
             var r = callModuleParse(logos.callModule("medusa_core", "startSendToken",
                         [root.selectedFromId, to, root.sendTokenDef, amount]))
-            if (!r || r.error) { logActivity("Token send failed: " + (r && r.error ? r.error : "unknown"), true); return }
+            if (!r || r.error) { surfaceOpError("Token send", r && r.error ? r.error : "unknown"); return }
             if (!r.jobId) { logActivity("No jobId from token send", true); return }
             logActivity("Sending " + amount + " " + root.sendTokenName + "…", false)
             root.trackJob({ jobId: r.jobId, op: "tokensend", asset: "token",
@@ -582,7 +703,7 @@ Rectangle {
             logos.callModule("medusa_core", "startSendTransfer", [from, to, amount])
         )
         if (!r || r.error) {
-            logActivity("Transfer failed: " + (r && r.error ? r.error : "unknown"), true)
+            surfaceOpError("Transfer", r && r.error ? r.error : "unknown")
             return
         }
         if (!r.jobId) { logActivity("No jobId returned from transfer", true); return }
@@ -651,11 +772,12 @@ Rectangle {
 
     function doClaimFaucet() {
         if (typeof logos === "undefined" || !logos.callModule) return
+        if (!root.guardZoneOp("Faucet claim")) return   // sequencer op - never silent offline
         var acctId = root.selectedFromId
         if (!acctId && accountModel.count > 0) acctId = accountModel.get(0).id
         if (!acctId) { root.logActivity("No accounts - create one first", true); return }
         var r = callModuleParse(logos.callModule("medusa_core", "startFaucet", [acctId]))
-        if (!r || r.error) { root.logActivity("Faucet failed: " + (r && r.error ? r.error : "unknown"), true); return }
+        if (!r || r.error) { root.surfaceOpError("Faucet claim", r && r.error ? r.error : "unknown"); return }
         if (!r.jobId) { root.logActivity("No jobId returned from faucet", true); return }
         root.logActivity("Claiming faucet → " + root.displayId(acctId).substring(0, 16) + "…", false)
         root.trackJob({ jobId: r.jobId, op: "faucet", asset: "native",
@@ -741,9 +863,12 @@ Rectangle {
 
     function approveActionRequest(req) {
         if (typeof logos === "undefined" || !logos.callModule) return
+        // Approving a dApp action dispatches a sequencer op - same guard as in-wallet ops
+        // (the request stays pending, so the user can approve once the zone is back).
+        if (!root.guardZoneOp(root.opLabel(req.op || "send"))) return
         var r = root.callModuleParse(logos.callModule("medusa_core",
             "approveAction", [req.requestId]))
-        if (r && r.error)        { root.logActivity("Action failed: " + r.error, true); return }
+        if (r && r.error)        { root.surfaceOpError("Action", r.error); return }
         if (r && r.status === "rejected") {
             root.logActivity("Action rejected: " + (r.error || ""), true)
             root.pollConnRequests(); return
@@ -777,6 +902,8 @@ Rectangle {
         // The wallet is now on the requested zone - mirror switchZone(): re-select + refresh
         // so the network label, accounts and balances don't linger on the old zone.
         root.network = r.zoneId
+        root.zoneCompat = "unknown"       // the build-compat verdict is per-zone
+        root.zoneOfflineOpen = false
         root.selectedFromId = ""; root.selectedTokens = []
         refreshSeqStatus(); refreshZones()
         netReloadTimer.restart()
@@ -817,6 +944,8 @@ Rectangle {
 
     function startPrivacyOp() {
         if (typeof logos === "undefined" || !logos.callModule) return
+        // Sequencer op (shield / deshield / private transfer) - never silent offline.
+        if (!root.guardZoneOp(opLabel(root.privMode === "transfer" ? "private" : root.privMode))) return
         var amt = root.privAmount.trim()
         if (!root.privFromValid || amt.length === 0) return
 
@@ -850,8 +979,8 @@ Rectangle {
         root.privBusy = false
 
         if (!r || r.error) {
-            root.logActivity(opLabel(root.privMode === "transfer" ? "private" : root.privMode)
-                             + " failed: " + (r && r.error ? r.error : "unknown"), true)
+            root.surfaceOpError(opLabel(root.privMode === "transfer" ? "private" : root.privMode),
+                                r && r.error ? r.error : "unknown")
             return
         }
         if (!r.jobId) { root.logActivity("No jobId returned from module", true); return }
@@ -902,7 +1031,10 @@ Rectangle {
             root.logActivity(opLabel(j.op) + " done"
                              + (j.txId ? " - " + j.txId.substring(0, 14) + "…" : ""), false)
         } else {
-            root.logActivity(opLabel(j.op) + " failed: " + (j.error || "unknown"), true)
+            // Connection-class / zone-mismatch failures ALSO raise the blocking zone modal
+            // (it stacks above the job-done sheet - higher z), so an async op that died
+            // because the zone is down is never presented as a mystery failure.
+            root.surfaceOpError(opLabel(j.op), j.error || "unknown")
         }
         // Surface a one-shot completion sheet. Several jobs can finish in one poll, so
         // entries are queued and shown one after another (see jobDoneSheet).
@@ -1133,6 +1265,24 @@ Rectangle {
         onTriggered: root.pollConnRequests()
     }
 
+    // Polls health while the offline modal's Retry is in flight; closes it on success.
+    // Bounded (8 rounds ≈ 12s: covers the async probe's 8s budget) so "Checking…" can't
+    // spin forever against a zone that stays down.
+    Timer {
+        id: zoneRetryTimer
+        interval: 1500; repeat: true
+        property int tries: 0
+        onTriggered: {
+            root.refreshSeqStatus()
+            if (root.seqStatus === "running" && root.seqProblem === "") {
+                stop(); root.zoneRetryBusy = false; root.zoneOfflineOpen = false
+                root.logActivity("Zone connection restored", false)
+            } else if (++tries >= 8) {
+                stop(); root.zoneRetryBusy = false
+            }
+        }
+    }
+
     Component.onCompleted: {
         if (typeof logos === "undefined" || !logos.callModule) return
         var cfg = callModuleParse(logos.callModule("medusa_core", "getConfig", []))
@@ -1266,6 +1416,44 @@ Rectangle {
                 border.color: root.screen === "settings" ? root.brandRedHover : root.brandRed; border.width: 1
                 Text { font.family: root.faceFont; anchors.centerIn: parent; text: "⚙"; font.pixelSize: 14; color: root.screen === "settings" ? root.brandRedHover : root.brandRed }
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.screen = (root.screen === "settings" ? "main" : "settings") }
+            }
+        }
+
+        // ── Local-sequencer problem banner (right under the zone pill) ───────────
+        // Persistent surface for a LOCAL zone whose plugin-managed sequencer is dead or
+        // incompatible: crashed / failed to launch / failing health checks / build
+        // mismatch. binary-missing and tor-missing keep the existing bottom prereq
+        // disclaimer (same facts, richer install advice) - no double banner for those.
+        Rectangle {
+            visible: root.walletState === "ready" && root.seqProblem !== ""
+                     && root.seqProblem !== "binary-missing" && root.seqProblem !== "tor-missing"
+            Layout.fillWidth: true
+            implicitHeight: seqProbRow.implicitHeight + 16
+            radius: 10
+            color: root.errorTint
+            border.color: root.errorRed; border.width: 1
+            RowLayout {
+                id: seqProbRow
+                anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter; leftMargin: 12; rightMargin: 12 }
+                spacing: 10
+                Text { text: "⚠"; color: root.errorRed; font.pixelSize: 14; Layout.alignment: Qt.AlignTop; Layout.topMargin: 1 }
+                ColumnLayout {
+                    Layout.fillWidth: true; spacing: 2
+                    Text { Layout.fillWidth: true; font.family: root.faceFont; font.pixelSize: 11; font.bold: true
+                        color: root.textPrimary; elide: Text.ElideRight; text: root.seqProblemTitle() }
+                    Text { Layout.fillWidth: true; wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                        font.family: root.faceFont; font.pixelSize: 9; color: root.textSecondary
+                        maximumLineCount: 3; elide: Text.ElideRight; text: root.seqProblemBody() }
+                }
+                Rectangle {
+                    Layout.preferredWidth: 92; Layout.preferredHeight: 26; radius: 8
+                    color: seqProbZoneMa.containsMouse ? root.hoverWash : "transparent"
+                    border.color: root.borderStrong; border.width: 1
+                    Text { anchors.centerIn: parent; text: "Switch zone"; color: root.textPrimary
+                        font.family: root.faceFont; font.pixelSize: 10 }
+                    MouseArea { id: seqProbZoneMa; anchors.fill: parent; hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor; onClicked: root.screen = "network" }
+                }
             }
         }
 
@@ -1805,7 +1993,11 @@ Rectangle {
                                         var rr = root.callModuleParse(logos.callModule("medusa_core", "removeZone", [modelData.id]))
                                         if (rr && rr.error) { root.logActivity("Remove zone: " + rr.error, true); return }
                                         root.refreshZones()
-                                        if (wasActive) { root.selectedFromId = ""; root.selectedTokens = []; root.refreshSeqStatus(); netReloadTimer.restart() }
+                                        if (wasActive) {
+                                            root.zoneCompat = "unknown"       // the build-compat verdict is per-zone
+                                            root.zoneOfflineOpen = false      // a stale offline modal refers to the old zone
+                                            root.selectedFromId = ""; root.selectedTokens = []; root.refreshSeqStatus(); netReloadTimer.restart()
+                                        }
                                     } } }
                         }
                     }
@@ -1864,7 +2056,11 @@ Rectangle {
                                 zNameF.text = ""; zEndF.text = ""; root.addZoneOpen = false; root.editingZoneId = ""
                                 root.refreshZones()
                                 if (r && r.id) root.switchZone(r.id)                                  // new zone → switch
-                                else if (editedId && root.network === editedId) { root.refreshSeqStatus(); netReloadTimer.restart() }
+                                else if (editedId && root.network === editedId) {
+                                    root.zoneCompat = "unknown"       // the build-compat verdict is per-zone
+                                    root.zoneOfflineOpen = false      // a stale offline modal refers to the old endpoint
+                                    root.refreshSeqStatus(); netReloadTimer.restart()
+                                }
                             } }
                     }
                 }
@@ -4003,6 +4199,150 @@ Rectangle {
 
         // FIFO queue of finished-job summaries (head shown first).
         ListModel { id: jobDoneModel }
+    }
+
+    // ── Zone-offline modal (blocking) ──────────────────────────────────────────
+    // Raised whenever a user-triggered sequencer op is attempted while the zone is
+    // unreachable, or an op fails with a connection-class error - an op must NEVER
+    // fail silently, not even on Tor zones where passive-refresh noise is deliberately
+    // suppressed. Mirrors connectSheet/jobDoneSheet; higher z so it stacks above the
+    // job-done sheet when an async job died because the zone is down.
+    Rectangle {
+        id: zoneOfflineSheet
+        z: 320
+        anchors.fill: parent
+        visible: root.zoneOfflineOpen
+        color: "transparent"   // tint is a child below, so the backdrop blur reads through
+        // Glassmorphism: blur the screen content behind the sheet (appBody is a sibling - no recursion).
+        MultiEffect { anchors.fill: parent; source: appBody; blurEnabled: true; blur: 0.85; autoPaddingEnabled: false }
+        // Dark scrim tint ABOVE the blur - lightened so the frosted backdrop stays visible.
+        Rectangle { anchors.fill: parent; color: Qt.rgba(0, 0, 0, 0.40) }
+        MouseArea { anchors.fill: parent; hoverEnabled: true; preventStealing: true
+            onClicked: {} onPressed: {} onWheel: {} }   // block input behind the modal
+
+        // What to do, per zone kind + failure state. seqProblemBody() carries the
+        // reason-specific local-sequencer advice (incl. binary-missing / tor-missing).
+        function hintText() {
+            if (root.zoneOfflineMismatch) return root.seqProblemBody()
+            if (root.seqMode === "local-standalone") {
+                if (root.seqProblem !== "") return root.seqProblemBody()
+                return "The local sequencer is still starting - give it a few seconds, then retry."
+            }
+            if (root.seqMode === "local-l1-tor") {
+                if (root.seqProblem !== "") return root.seqProblemBody()
+                return "The Tor tunnel to this zone isn't up yet. Wait for the connect bar to "
+                     + "finish, check your network, or switch zone."
+            }
+            return "Check your network connection - or the zone may be down. Retry, or switch zone."
+        }
+
+        Rectangle {
+            anchors.centerIn: parent
+            width: Math.min(root.width - 40, 380)
+            height: Math.min(root.height - 40, zoneOffCol.implicitHeight + 32)
+            radius: root.rSheet
+            color: root.surface2; border.color: root.borderStrong; border.width: 1
+            // Deeper elevation for the floating modal (autoPadding stops the shadow clipping).
+            layer.enabled: true
+            layer.effect: MultiEffect {
+                shadowEnabled: true; autoPaddingEnabled: true
+                shadowColor: "#000000"; shadowVerticalOffset: 8; shadowBlur: 0.6; shadowOpacity: 0.35
+            }
+            // sheet entrance - scale + fade
+            opacity: zoneOfflineSheet.visible ? 1 : 0
+            scale: zoneOfflineSheet.visible ? 1 : 0.92
+            Behavior on opacity { NumberAnimation { duration: root.motionStandard; easing.type: Easing.OutCubic } }
+            Behavior on scale   { NumberAnimation { duration: root.motionStandard; easing.type: Easing.OutCubic } }
+            // hairline silver inner rim
+            Rectangle { anchors.fill: parent; radius: parent.radius; color: "transparent"
+                border.color: root.accentTint10; border.width: 1 }
+
+            ColumnLayout {
+                id: zoneOffCol
+                anchors { left: parent.left; right: parent.right; top: parent.top; margins: 16 }
+                spacing: 12
+
+                RowLayout {
+                    Layout.fillWidth: true; spacing: 10
+                    Rectangle {
+                        Layout.preferredWidth: 38; Layout.preferredHeight: 38; radius: 19
+                        color: "transparent"; border.width: 1; border.color: root.errorRed
+                        Text { anchors.centerIn: parent
+                            text: root.zoneOfflineMismatch ? "≠" : "⚡"
+                            color: root.errorRed; font.pixelSize: 17; font.bold: true }
+                    }
+                    ColumnLayout {
+                        Layout.fillWidth: true; spacing: 1
+                        Text { Layout.fillWidth: true
+                            text: root.zoneOfflineMismatch ? "Zone build mismatch" : "Zone connection offline"
+                            color: root.textPrimary; font.family: root.faceFont
+                            font.pixelSize: 15; font.bold: true; elide: Text.ElideRight }
+                        Text { Layout.fillWidth: true
+                            visible: root.zoneOfflineOp.length > 0
+                            text: root.zoneOfflineOp + (root.zoneOfflineMismatch
+                                  ? " can't run against this zone" : " needs a zone connection")
+                            color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 11
+                            elide: Text.ElideRight }
+                    }
+                }
+
+                // The zone in question: display name, endpoint, and what to do about it.
+                Rectangle {
+                    Layout.fillWidth: true; radius: 10
+                    color: root.inputBg; border.color: root.borderColor
+                    implicitHeight: zoneOffZoneCol.implicitHeight + 20
+                    ColumnLayout {
+                        id: zoneOffZoneCol
+                        anchors { left: parent.left; right: parent.right; top: parent.top; margins: 10 }
+                        spacing: 4
+                        RowLayout {
+                            Layout.fillWidth: true; spacing: 6
+                            Rectangle { Layout.preferredWidth: 8; Layout.preferredHeight: 8; radius: 4
+                                Layout.alignment: Qt.AlignVCenter
+                                color: root.seqStatus === "running"  ? root.greenBright
+                                     : root.seqStatus === "starting" ? root.connectGray : root.errorRed }
+                            Text { Layout.fillWidth: true; text: root.zoneName(root.network)
+                                color: root.textPrimary; font.family: root.faceFont; font.pixelSize: 12
+                                font.bold: true; elide: Text.ElideRight }
+                        }
+                        Text { Layout.fillWidth: true; visible: text.length > 0
+                            text: root.zoneEndpointDesc()
+                            color: root.textDisabled; font.family: root.monoFont; font.pixelSize: 9
+                            elide: Text.ElideMiddle }
+                        Text { Layout.fillWidth: true
+                            wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                            font.family: root.faceFont; font.pixelSize: 10; color: root.textSecondary
+                            text: zoneOfflineSheet.hintText() }
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true; spacing: 8
+                    Rectangle {   // Retry - re-checks health, closes on success
+                        Layout.fillWidth: true; Layout.preferredHeight: 38; radius: 10
+                        color: root.zoneRetryBusy ? root.brandRedPressed
+                             : zoneOffRetryMa.pressed ? root.brandRedPressed
+                             : zoneOffRetryMa.containsMouse ? root.brandRedHover : root.brandRed
+                        Behavior on color { ColorAnimation { duration: root.motionQuick } }
+                        Text { anchors.centerIn: parent
+                            text: root.zoneRetryBusy ? "Checking…" : "Retry"
+                            color: root.textPrimary; font.family: root.faceFont; font.pixelSize: 13; font.bold: true }
+                        MouseArea { id: zoneOffRetryMa; anchors.fill: parent; hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            enabled: !root.zoneRetryBusy
+                            onClicked: root.retryZoneHealth() }
+                    }
+                    Rectangle {   // Close - the error toast (if any) stays for copying
+                        Layout.preferredWidth: 96; Layout.preferredHeight: 38; radius: 10
+                        color: "transparent"; border.color: root.borderStrong; border.width: 1
+                        Text { anchors.centerIn: parent; text: "Close"
+                            color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 12 }
+                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
+                            onClicked: { zoneRetryTimer.stop(); root.zoneRetryBusy = false; root.zoneOfflineOpen = false } }
+                    }
+                }
+            }
+        }
     }
 
     // ── Auto-select first account on initial load only ────────────────────────

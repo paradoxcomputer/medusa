@@ -59,6 +59,9 @@ static QString logosTestnetUrl()
 static constexpr int kTorSocksPort = 9250;
 // Bundled-Tor control port (for the onion-connection-stage monitor).
 static constexpr int kTorControlPort = 9251;
+// A just-spawned standalone sequencer needs a few seconds before checkHealth answers; only
+// after this window does a silent non-answer count as a reportable "unhealthy" failure.
+static constexpr qint64 kSeqLaunchGraceMs = 15000;
 static constexpr const char* kSeqModeKey = "medusa-wallet/seqMode";   // "local" | "hosted"
 static constexpr const char* kSeqUrlKey  = "medusa-wallet/seqUrl";    // hosted sequencer URL
 static constexpr const char* kSeqPortKey = "medusa-wallet/seqPort";   // local port (default 3071)
@@ -302,6 +305,8 @@ QString WalletPlugin::normalizeCliOutput(const QString& rawOut, int exitCode)
 WalletPlugin::WalletPlugin(QObject* parent)
     : QObject(parent)
 {
+    m_bornMs = QDateTime::currentMSecsSinceEpoch();
+    m_zoneCompat = QStringLiteral("unknown");
     migrateLegacyNaming();
 }
 
@@ -728,8 +733,17 @@ void WalletPlugin::ensureSequencer()
     const QString cfg = seqHome() + QStringLiteral("/sequencer_config.json");
     writeSeqConfig(cfg);
 
+    // Fresh spawn attempt: the failure record describes THIS attempt, not a previous one.
+    m_seqLaunchError.clear();
+    m_seqExited = false;
+    m_seqExitCode = 0;
+
     m_seqProc = new QProcess(this);
-    m_seqProc->setProcessChannelMode(QProcess::SeparateChannels);
+    // Keep the child's merged output in a per-zone log file so a crash or a bad config is
+    // diagnosable (and the UI can point the user at it) instead of dying with the process.
+    m_seqProc->setProcessChannelMode(QProcess::MergedChannels);
+    m_seqProc->setStandardOutputFile(seqHome() + QStringLiteral("/sequencer.log"),
+                                     QIODevice::Truncate);
     QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
     // Dev-mode (fake/fast proofs, no verification) ONLY for the local "devnet" sandbox; every real
     // zone (diaphani + user-added remote) must verify real proofs. Matches the wallet's prove mode.
@@ -740,21 +754,40 @@ void WalletPlugin::ensureSequencer()
         appendLog(QStringLiteral("sequencer process error: ")
                   + (m_seqProc ? m_seqProc->errorString() : QString()), QStringLiteral("error"));
     });
+    // Record an unexpected exit (crash, bad config, port clash) so the status surface can say
+    // "the sequencer died" - without this the zone just sat in a silent, eternal "Connecting…".
+    QObject::connect(m_seqProc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                     this, [this](int code, QProcess::ExitStatus st) {
+        if (m_seqStopping) return;   // deliberate stop/kill, not a crash
+        m_seqExited = true;
+        m_seqExitCode = (st == QProcess::CrashExit) ? -1 : code;
+        appendLog(QStringLiteral("sequencer exited unexpectedly (code %1)").arg(m_seqExitCode),
+                  QStringLiteral("error"));
+    });
 
     const QString bin = seqPath();
     appendLog(QStringLiteral("spawning sequencer: %1 --port %2").arg(bin).arg(port));
     m_seqProc->start(bin, { QStringLiteral("--port"), QString::number(port), cfg });
     if (!m_seqProc->waitForStarted(3000)) {
-        appendLog(QStringLiteral("sequencer failed to start (binary missing?): ") + bin,
+        // Distinguish "no binary on disk" from "binary present but won't exec" - the UI
+        // gives different advice for each (reinstall the module vs check the log/perms).
+        m_seqLaunchError = QFileInfo::exists(bin)
+            ? QStringLiteral("failed to launch ") + bin
+              + QStringLiteral(" (") + m_seqProc->errorString() + QStringLiteral(")")
+            : QStringLiteral("sequencer binary not found: ") + bin;
+        appendLog(QStringLiteral("sequencer failed to start: ") + m_seqLaunchError,
                   QStringLiteral("error"));
         m_seqProc->deleteLater();
         m_seqProc = nullptr;
+        return;
     }
+    m_seqLaunchedMs = QDateTime::currentMSecsSinceEpoch();   // starts the health grace window
 }
 
 void WalletPlugin::stopSequencer()
 {
     if (m_seqProc) {
+        m_seqStopping = true;   // a deliberate stop must not register as a crash
         if (m_seqProc->state() != QProcess::NotRunning) {
             m_seqProc->terminate();                       // graceful (== Ctrl-C)
             if (!m_seqProc->waitForFinished(3000))
@@ -763,7 +796,11 @@ void WalletPlugin::stopSequencer()
         }
         m_seqProc->deleteLater();
         m_seqProc = nullptr;
+        m_seqStopping = false;
     }
+    // The stopped process (and any crash it recorded) is history for the next zone.
+    m_seqExited = false;
+    m_seqExitCode = 0;
     stopForward();   // tear down the Tor tunnel too (no-op if not running)
 }
 
@@ -833,6 +870,7 @@ QString WalletPlugin::applySequencer()
     // Repoint: kill the old local sequencer/tunnel, then bring up whatever this zone needs.
     stopSequencer();
     m_lastSeqOk = false;   // drop the previous zone's cached health → next poll shows "Connecting" until reconfirmed
+    m_zoneCompat = QStringLiteral("unknown");   // the build-compat verdict is per-zone - re-probe
     ensureSequencer();
     appendLog(QStringLiteral("zone: %1 (%2) -> %3").arg(id, kind, addr));
     return addr;
@@ -1095,6 +1133,56 @@ void WalletPlugin::probeSeqHealthAsync(const QString& url)
         url });
 }
 
+// Async zone/build compatibility probe: `wallet check-health` exits 0 when the wallet's
+// builtin program ImageIDs match the zone's (getProgramIds), and panics with
+// "... is different from remote" on a mismatch. A stale bundled sequencer under a newer
+// wallet still ANSWERS checkHealth, so without this probe a fundamentally unusable zone
+// reads as connected. Transport / locked-storage failures stay "unknown" - never a false
+// "mismatch". One probe at a time; the verdict is cached until the next zone (re)apply.
+void WalletPlugin::probeZoneCompatAsync()
+{
+    if (m_compatProbe && m_compatProbe->state() != QProcess::NotRunning)
+        return;   // one probe at a time
+    if (m_compatProbe) { m_compatProbe->deleteLater(); m_compatProbe = nullptr; }
+    // Never run the CLI before a wallet store exists - some verbs auto-create storage.
+    if (!QFile::exists(walletHome() + QStringLiteral("/storage.json")))
+        return;
+    // A locked wallet can't answer the CLI's password prompt: the verdict would stay
+    // "unknown" and the 10s status poll would respawn a check-health (network round-trip
+    // + Argon2id) forever behind the lock screen. Probe once the wallet is unlocked.
+    if (m_password.isEmpty())
+        return;
+    QProcess* p = new QProcess(this);
+    m_compatProbe = p;
+    p->setProcessChannelMode(QProcess::MergedChannels);   // the mismatch panic lands on stderr
+    QObject::connect(p, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
+        [this, p](int code, QProcess::ExitStatus) {
+            const QString out = QString::fromUtf8(p->readAllStandardOutput());
+            if (code == 0) {
+                m_zoneCompat = QStringLiteral("ok");
+            } else if (out.contains(QStringLiteral("different from remote"))
+                       || out.contains(QStringLiteral("program ids differ"))) {
+                m_zoneCompat = QStringLiteral("mismatch");
+                appendLog(QStringLiteral("zone/build mismatch: wallet program ids differ from this zone"),
+                          QStringLiteral("error"));
+            }   // anything else: keep "unknown" (transport, locked wallet, missing CLI)
+            p->deleteLater();
+            if (m_compatProbe == p) m_compatProbe = nullptr;
+        });
+    p->start(cliPath(), { QStringLiteral("check-health") });
+    if (!p->waitForStarted(3000)) {
+        p->deleteLater();
+        if (m_compatProbe == p) m_compatProbe = nullptr;
+        return;
+    }
+    p->write((m_password + QStringLiteral("\n")).toUtf8());
+    p->closeWriteChannel();
+    // Safety kill: a wedged CLI must not block every future probe (one-at-a-time guard).
+    QTimer::singleShot(90000, p, [p]() {
+        if (p->state() != QProcess::NotRunning) p->kill();
+    });
+}
+
 QString WalletPlugin::getSequencerStatus()
 {
     const QString id   = netId();
@@ -1111,12 +1199,14 @@ QString WalletPlugin::getSequencerStatus()
     const bool torZone = (kind == QStringLiteral("local-l1-tor"))
                       || (kind == QStringLiteral("remote") && zoneObj(id).value(QStringLiteral("tor")).toBool());
 
+    bool healthy = false;
     if (torZone) {
         // Thin client over Tor: a 1s probe would always time out, so probe ASYNC (cached)
         // and report green/gray/red from the cached result + the tunnel state.
         probeSeqHealthAsync(eff);
         const bool fwdUp = m_fwdProc && m_fwdProc->state() != QProcess::NotRunning;
-        state = m_lastSeqOk ? QStringLiteral("running")
+        healthy = m_lastSeqOk;
+        state = healthy ? QStringLiteral("running")
               : (fwdUp ? QStringLiteral("starting") : QStringLiteral("unreachable"));
     } else if (kind == QStringLiteral("remote")) {
         // Remote clearnet: probe ASYNC + cached. A sync 1s probe always times out on a real
@@ -1125,25 +1215,63 @@ QString WalletPlugin::getSequencerStatus()
         // while the first probe is in flight, then green/red from the cached result.
         probeSeqHealthAsync(eff);
         const bool probing = m_healthProbe && m_healthProbe->state() != QProcess::NotRunning;
-        state = m_lastSeqOk ? QStringLiteral("running")
+        healthy = m_lastSeqOk;
+        state = healthy ? QStringLiteral("running")
               : (probing ? QStringLiteral("starting") : QStringLiteral("unreachable"));
     } else {
         // Local zone (devnet): a process we own + its checkHealth on 127.0.0.1:port.
         const bool procUp = m_seqProc && m_seqProc->state() != QProcess::NotRunning;
-        state = seqHealthy(port) ? QStringLiteral("running")
+        healthy = seqHealthy(port);
+        state = healthy ? QStringLiteral("running")
               : (procUp ? QStringLiteral("starting") : QStringLiteral("unreachable"));
     }
+    // Once the zone answers, confirm the wallet build actually matches it (async, cached).
+    if (healthy && m_zoneCompat == QStringLiteral("unknown"))
+        probeZoneCompatAsync();
+
     QJsonObject o;
     o[QStringLiteral("state")] = state;
     o[QStringLiteral("mode")]  = kind;
     o[QStringLiteral("port")]  = port;
+    // What the wallet actually dials + the health/compat verdicts, for every zone kind:
+    // the UI names the endpoint in its offline modal and must never guess it.
+    o[QStringLiteral("endpoint")] = eff;
+    o[QStringLiteral("healthy")]  = healthy;
+    o[QStringLiteral("compat")]   = m_zoneCompat;   // "unknown" | "ok" | "mismatch"
     // For a local zone (devnet), whether the sequencer binary is actually on disk - if not,
     // it can never spawn, so the UI shows a "you need a local sequencer" disclaimer instead
     // of an endless "Connecting…". (Remote/Tor zones don't run a local sequencer.)
     if (kind == QStringLiteral("local-standalone")) {
         const QFileInfo si(seqPath());
-        o[QStringLiteral("binaryAvailable")] = si.exists() && si.isFile();
+        const bool binMissing = !(si.exists() && si.isFile());
+        o[QStringLiteral("binaryAvailable")] = !binMissing;
         o[QStringLiteral("binaryPath")]      = seqPath();
+        const bool procUp = m_seqProc && m_seqProc->state() != QProcess::NotRunning;
+        o[QStringLiteral("running")]         = procUp;
+        o[QStringLiteral("lastLaunchError")] = m_seqLaunchError;
+        if (m_seqExited)
+            o[QStringLiteral("exitCode")] = m_seqExitCode;
+        const QString logp = seqHome() + QStringLiteral("/sequencer.log");
+        if (QFile::exists(logp))
+            o[QStringLiteral("logPath")] = logp;
+        // One machine-readable reason for the UI's banner / offline modal. Empty while the
+        // just-spawned sequencer is inside its launch grace window (it needs a few seconds
+        // to open its port) or when nothing is wrong. Precedence: a build mismatch beats
+        // everything (the zone ANSWERS, so "offline" wording would mislead); then the
+        // states that can never self-heal (no binary / spawn failed / crashed).
+        QString reason;
+        const qint64 sinceMs = QDateTime::currentMSecsSinceEpoch()
+                             - qMax(m_seqLaunchedMs, m_bornMs);
+        if (m_zoneCompat == QStringLiteral("mismatch")) {
+            reason = QStringLiteral("mismatch");
+        } else if (!healthy) {
+            if (binMissing)                       reason = QStringLiteral("binary-missing");
+            else if (!m_seqLaunchError.isEmpty()) reason = QStringLiteral("launch-failed");
+            else if (m_seqExited)                 reason = QStringLiteral("exited");
+            else if (sinceMs < kSeqLaunchGraceMs) reason.clear();        // still starting
+            else                                  reason = QStringLiteral("unhealthy");
+        }
+        o[QStringLiteral("reason")] = reason;
     }
     // Tor/onion zone: whether a usable Tor binary (bundled medusa-tor OR a system tor) exists -
     // else the wallet can't reach the zone, so the UI shows a "no Tor found" disclaimer.
@@ -1665,6 +1793,17 @@ WalletPlugin::~WalletPlugin()
 {
     stopSequencer();   // don't orphan the child sequencer when the module unloads
     stopTor();         // and don't orphan the bundled Tor
+    if (QProcess* probe = m_compatProbe) {   // nor an in-flight `wallet check-health` compat probe
+        m_compatProbe = nullptr;   // detach first: waitForFinished() below runs the finished
+                                   // handler synchronously, and that handler nulls the member
+        if (probe->state() != QProcess::NotRunning) {
+            probe->terminate();
+            if (!probe->waitForFinished(3000))
+                probe->kill();
+            probe->waitForFinished(2000);
+        }
+        probe->deleteLater();
+    }
     qDeleteAll(m_jobs);
     m_jobs.clear();
     qDeleteAll(m_sessions);
