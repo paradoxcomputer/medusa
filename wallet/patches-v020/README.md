@@ -44,10 +44,17 @@ set it to "v020" in the SAME commit that flips build.sh's defaults.
   `wallet check-health` probe, which compares local program ImageIDs against the sequencer's.
   Previously a mismatched zone made them return empty arrays and zero balances silently.
 
-## STILL REQUIRED BEFORE RELEASING 0.3.0
+## Sequencer upgrade: DONE 2026-07-31
 
-The Paradox sequencer must be upgraded to v0.2.0 AT THE SAME TIME. Program ImageIDs are a hash
-of the program binary, identical across installations of a given tag but different between
-tags, and the wallet proves against the ids it was compiled with. A 0.3.0 wallet therefore
-cannot transact against the current rc5 zone at all - the probe above will refuse, by design.
-Do not publish 0.3.0 to the catalog until seq-testnet.paradox.computer runs v0.2.0.
+seq-testnet.paradox.computer runs v0.2.0 as of 2026-07-31 00:12 UTC (binary from this
+patch series' .lez-build, v0.2.0 + the two wallet-only patches; sequencer code is pure
+upstream). Same channel 8888…88, same bedrock signing key, fresh rocksdb (the rc5 chain
+ended at block 42036; the old db is kept on the box as data/rocksdb.old-rc5-8888, the
+rc5 binary as sequencer_service_l1.bak-rc5). getProgramIds matches testnet.lez.logos.co
+exactly and `wallet check-health` passes, so publishing 0.3.0 to the catalog is unblocked.
+
+Historical context (why the upgrade had to be simultaneous with 0.3.0): Program ImageIDs
+are a hash of the program binary, identical across installations of a given tag but
+different between tags, and the wallet proves against the ids it was compiled with. A
+0.3.0 wallet therefore could not transact against the rc5 zone at all - the probe above
+refuses, by design.
