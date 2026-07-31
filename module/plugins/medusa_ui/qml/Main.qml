@@ -125,7 +125,7 @@ Rectangle {
     property string editingZoneId:       ""          // non-empty → the form edits this zone
     property string renamingAcctId:      ""          // non-empty → that account row is being renamed
     property bool   cliFound:            false
-    property string seqMode:             "local"     // local | hosted
+    property string seqMode:             "local"     // local-standalone | local-l1-tor | remote ("local" until the first poll)
     property string seqUrl:              ""          // hosted URL
     property int    seqPort:             3071
     property string seqStatus:           "unknown"   // running | starting | unreachable
@@ -137,14 +137,12 @@ Rectangle {
     property string torOnionStage:       ""           // onion-connection stage (post-bootstrap, real)
     property int    torOnionPct:         0            // onion-connection coarse % (from control port)
     // ── Zone-offline / local-sequencer failure surface ─────────────────────────
-    property bool   seqHealthy:          false       // last health-probe verdict for the active zone
     property string seqReason:           ""          // local-zone problem: "" | binary-missing | launch-failed | exited | unhealthy | mismatch
     property string seqLaunchError:      ""          // human text for a failed sequencer spawn
     property string seqLogPath:          ""          // the local sequencer's log file (if one exists)
     property int    seqExitCode:         0           // exit code of a crashed local sequencer
     property string seqEndpoint:         ""          // the address the wallet actually dials
     property string zoneCompat:          "unknown"   // wallet-vs-zone build: unknown | ok | mismatch
-    readonly property bool seqOnline:    seqStatus === "running"
     // The one problem string the banner + offline modal render ("" = none). A build
     // mismatch wins: the zone ANSWERS, so plain "offline" wording would mislead.
     // tor-missing is folded in for the Tor-tunnelled local zone (diaphani).
@@ -531,7 +529,6 @@ Rectangle {
         // Tor/onion zone with no usable Tor binary (neither bundled medusa-tor nor a system tor).
         root.torBinaryMissing = !!(s && s.needsTor === true && s.torAvailable === false)
         // Failure surface for the offline modal + local-sequencer banner.
-        root.seqHealthy     = !!(s && s.healthy === true)
         root.seqReason      = (s && s.reason) ? s.reason : ""
         root.seqLaunchError = (s && s.lastLaunchError) ? s.lastLaunchError : ""
         root.seqLogPath     = (s && s.logPath) ? s.logPath : ""
