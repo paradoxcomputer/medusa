@@ -1,0 +1,123 @@
+From 98d4eebf416565f08fba82713326bf1a0537a843 Mon Sep 17 00:00:00 2001
+From: medusa build <build@medusa.local>
+Date: Fri, 31 Jul 2026 06:18:56 +0000
+Subject: [PATCH 3/3] fix(wallet): take the imported signing key on stdin, not
+ argv
+
+`account import public --private-key <hex>` puts a raw 32-byte signing key on the
+process command line, and /proc/<pid>/cmdline is world-readable (mode 0444, and a
+stock Linux box mounts /proc with no hidepid), so any local uid can read the key for
+as long as the import runs. Medusa's wallet wrapper re-execs its argv verbatim, so in
+practice the key sat on TWO command lines at once.
+
+Every other secret this CLI handles already avoids argv: read_password_from_stdin()
+and read_mnemonic_from_stdin() in cli/mod.rs, and helperfunctions.rs states the intent
+outright ("so the phrase never appears in argv, shell history, or `ps`"). `import
+public` was simply never given the same treatment: private_key was a required clap
+argument with no env fallback and no stdin alternative.
+
+Make it optional and read the key from stdin when the flag is absent, following the
+convention that is already there rather than inventing a new one: main() consumes
+stdin line 1 as the password before dispatching any subcommand, so the key is line 2.
+That mirrors restore-keys, which reads a recovery-phrase line and then a password line.
+
+--private-key is kept working, so existing scripts and an older GUI still run against a
+patched engine, but it is documented as the unsafe form. The value is held in a
+zeroize::Zeroizing<String> and the parse error deliberately does not echo it, because
+callers log stderr.
+---
+ integration_tests/tests/account.rs |  2 +-
+ lez/wallet/src/cli/account.rs      | 19 ++++++++++++++++---
+ lez/wallet/src/cli/mod.rs          | 17 +++++++++++++++++
+ 3 files changed, 34 insertions(+), 4 deletions(-)
+
+diff --git a/integration_tests/tests/account.rs b/integration_tests/tests/account.rs
+index 0de8a9e2..948e7deb 100644
+--- a/integration_tests/tests/account.rs
++++ b/integration_tests/tests/account.rs
+@@ -131,7 +131,7 @@ async fn import_public_account() -> Result<()> {
+     let account_id = lee::AccountId::from(&lee::PublicKey::new_from_private_key(&private_key));
+ 
+     let command = Command::Account(AccountSubcommand::Import(ImportSubcommand::Public {
+-        private_key,
++        private_key: Some(private_key),
+     }));
+     let sub_ret = wallet::cli::execute_subcommand(ctx.wallet_mut(), command).await?;
+     let SubcommandReturnValue::Empty = sub_ret else {
+diff --git a/lez/wallet/src/cli/account.rs b/lez/wallet/src/cli/account.rs
+index be4887de..53591175 100644
+--- a/lez/wallet/src/cli/account.rs
++++ b/lez/wallet/src/cli/account.rs
+@@ -9,7 +9,9 @@ use token_core::{TokenDefinition, TokenHolding};
+ use crate::{
+     WalletCore,
+     account::{AccountIdWithPrivacy, HumanReadableAccount, Label},
+-    cli::{CliAccountMention, SubcommandReturnValue, WalletSubcommand},
++    cli::{
++        CliAccountMention, SubcommandReturnValue, WalletSubcommand, read_private_key_from_stdin,
++    },
+ };
+ 
+ /// Represents generic chain CLI subcommand.
+@@ -562,10 +564,14 @@ impl WalletSubcommand for AccountSubcommand {
+ #[derive(Subcommand, Debug, Clone)]
+ pub enum ImportSubcommand {
+     /// Import a public account signing key.
++    ///
++    /// With `--private-key` omitted the key is read from stdin, on the line after the
++    /// password, so it never appears in argv, shell history, or `ps` output.
+     Public {
+-        /// Private key in hex format.
++        /// Private key in hex format. Omit it to read the key from stdin instead, which is
++        /// the only safe form: `/proc/<pid>/cmdline` is world-readable.
+         #[arg(long)]
+-        private_key: lee::PrivateKey,
++        private_key: Option<lee::PrivateKey>,
+     },
+     /// Import a private account keychain and account state.
+     Private {
+@@ -591,6 +597,13 @@ impl WalletSubcommand for ImportSubcommand {
+     ) -> Result<SubcommandReturnValue> {
+         match self {
+             Self::Public { private_key } => {
++                // `--private-key` is kept only so existing callers keep working; when it is
++                // absent the key arrives on stdin, after the password line.
++                let private_key = match private_key {
++                    Some(private_key) => private_key,
++                    None => read_private_key_from_stdin()?,
++                };
++
+                 let account_id =
+                     lee::AccountId::from(&lee::PublicKey::new_from_private_key(&private_key));
+ 
+diff --git a/lez/wallet/src/cli/mod.rs b/lez/wallet/src/cli/mod.rs
+index ea98a750..c752524c 100644
+--- a/lez/wallet/src/cli/mod.rs
++++ b/lez/wallet/src/cli/mod.rs
+@@ -373,6 +373,23 @@ pub fn read_mnemonic_from_stdin() -> Result<Mnemonic> {
+     Mnemonic::from_str(phrase.trim()).context("Invalid mnemonic phrase")
+ }
+ 
++/// Read a hex-encoded signing key for `account import public`.
++///
++/// A command line is world-readable through `/proc/<pid>/cmdline`, so an imported key must
++/// never travel in argv. Stdin line 1 is already the password (read by `main` before any
++/// subcommand runs), so the key is line 2 - the same two-line convention `restore-keys`
++/// uses for the recovery phrase.
++pub fn read_private_key_from_stdin() -> Result<lee::PrivateKey> {
++    let mut hex_key = zeroize::Zeroizing::new(String::new());
++
++    eprint!("Input private key: ");
++    std::io::stderr().flush()?;
++    std::io::stdin().read_line(&mut hex_key)?;
++
++    // The error deliberately omits the offending value: callers log stderr.
++    lee::PrivateKey::from_str(hex_key.trim()).context("Invalid private key")
++}
++
+ pub async fn execute_keys_restoration(wallet_core: &mut WalletCore, depth: u32) -> Result<()> {
+     wallet_core
+         .storage
+-- 
+2.34.1
+

@@ -12,6 +12,8 @@ wrapper adapts it and smooths over a couple of on-chain lifecycle quirks:
                           credits without claiming, so the chain rejects an
                           unregistered (default-owned) recipient; we run
                           `auth-transfer init` for it when needed, then claim.
+  • `account import`   → the private key is read from stdin (line 2, after the password
+                          line), never from argv: /proc/<pid>/cmdline is world-readable.
   • everything else    → JSON passed through; otherwise success text is wrapped as
                           {"ok": true, "output": …} and failures as {"error": …}.
 
@@ -73,7 +75,35 @@ PROOF_TMO = int(os.environ.get("MEDUSA_PROOF_TIMEOUT_S", "3600"))
 args = sys.argv[1:]
 # The module pipes the session password (+ newline) on stdin; read it once so it can
 # be fed to every wallet-lez invocation (some wrapper commands run more than one).
+# `account import public` appends a second line, the private key to import.
 pw = "" if sys.stdin.isatty() else sys.stdin.read()
+
+# A secret must never reach a command line. /proc/<pid>/cmdline is mode 0444 and a stock
+# box mounts /proc with no hidepid, so `--private-key <hex>` hands the key to every local
+# uid for as long as the import runs - and this wrapper used to re-exec its argv verbatim,
+# putting it on TWO command lines at once. The patched wallet-lez (patches-v020/0003) takes
+# the key on stdin line 2 instead, which is what the module now sends. A caller still
+# passing --private-key keeps working, but the value is lifted onto stdin here so it never
+# reaches the engine's argv. This script's own argv was fixed by whoever exec'd it and
+# cannot be rewritten from Python, so that legacy form still leaks on this one process:
+# it is kept for backward compatibility only, and callers should stop using it.
+if args[:3] == ["account", "import", "public"]:
+    _key = ""
+    _clean = []
+    _drop_next = False
+    for _i, _a in enumerate(args):
+        if _drop_next:
+            _drop_next = False
+        elif _a == "--private-key":
+            _key = args[_i + 1] if _i + 1 < len(args) else ""
+            _drop_next = True
+        elif _a.startswith("--private-key="):
+            _key = _a.split("=", 1)[1]
+        else:
+            _clean.append(_a)
+    if _key:
+        args = _clean
+        pw = (pw if pw.endswith("\n") else pw + "\n") + _key + "\n"
 
 # Cap proof parallelism (RISC0/Rayon) EARLY - before any verb block can exec a prover.
 # (token-shield/token-deshield emit()+exit inside their blocks and would skip a cap set
@@ -361,7 +391,8 @@ def emit(proc):
     except (json.JSONDecodeError, ValueError):
         if proc.returncode != 0:
             msg = (proc.stderr or "").strip() or out or f"wallet command failed (exit {proc.returncode})"
-            msg = msg.replace("Input password: ", "").replace("Input recovery phrase: ", "").strip()
+            msg = msg.replace("Input password: ", "").replace("Input recovery phrase: ", "")
+            msg = msg.replace("Input private key: ", "").strip()
             print(json.dumps({"error": msg}))
         else:
             print(json.dumps({"ok": True, "output": out}))
