@@ -13,9 +13,18 @@
 #include <QProcessEnvironment>
 #include <QUrl>
 #include <QRandomGenerator>
+#include <QCryptographicHash>
 
 #include <algorithm>
+#include <cstring>
+#include <cerrno>
 #include <dlfcn.h>   // dladdr: locate the module's own install dir (bundled binaries)
+#include <unistd.h>       // access(), geteuid(), close()
+#include <fcntl.h>        // O_NONBLOCK
+#include <poll.h>         // poll(): the connect() timeout for the port probe
+#include <sys/socket.h>   // the port probe that replaced the shell-out (see tcpPortOpen)
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 static constexpr const char* kCliPathKey = "medusa-wallet/cliPath";
 static constexpr const char* kNetworkKey = "medusa-wallet/network";   // active zone id
@@ -62,10 +71,15 @@ static constexpr int kTorControlPort = 9251;
 // A just-spawned standalone sequencer needs a few seconds before checkHealth answers; only
 // after this window does a silent non-answer count as a reportable "unhealthy" failure.
 static constexpr qint64 kSeqLaunchGraceMs = 15000;
-static constexpr const char* kSeqModeKey = "medusa-wallet/seqMode";   // "local" | "hosted"
-static constexpr const char* kSeqUrlKey  = "medusa-wallet/seqUrl";    // hosted sequencer URL
-static constexpr const char* kSeqPortKey = "medusa-wallet/seqPort";   // local port (default 3071)
-static constexpr const char* kSeqPathKey = "medusa-wallet/seqPath";   // sequencer binary
+// seqMode/seqUrl are STORED AND REPORTED but influence nothing: applySequencer() derives the
+// endpoint from the active zone alone, and neither key is read on any execution path. They are
+// kept so an existing UI's settings round-trip still works. (medusa-wallet/seqPort was declared
+// here and never read at all; it is gone, so the enumeration of "settings that matter" is real.)
+static constexpr const char* kSeqModeKey = "medusa-wallet/seqMode";   // "local" | "hosted" (inert)
+static constexpr const char* kSeqUrlKey  = "medusa-wallet/seqUrl";    // hosted sequencer URL (inert)
+// Read in getSequencerConfig() and NOWHERE else: see seqPath() for why this stopped being the
+// thing the module executes.
+static constexpr const char* kSeqPathKey = "medusa-wallet/seqPath";   // sequencer binary (disowned)
 
 // The bundled standalone-sequencer config - the rc5-shaped genesis with a templated home
 // and a dead bedrock node_url (standalone mocks bedrock, so no L1 is ever contacted).
@@ -78,10 +92,12 @@ R"SEQ({"home":"__SEQ_HOME__","max_num_tx_in_block":20,"max_block_size":"1 MiB","
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-QString WalletPlugin::errorJson(const QString& msg)
+QString WalletPlugin::errorJson(const QString& msg, const QString& reason)
 {
     QJsonObject o;
     o[QStringLiteral("error")] = msg;
+    if (!reason.isEmpty())
+        o[QStringLiteral("reason")] = reason;
     return QJsonDocument(o).toJson(QJsonDocument::Compact);
 }
 
@@ -90,6 +106,99 @@ QString WalletPlugin::okJson()
     QJsonObject o;
     o[QStringLiteral("ok")] = true;
     return QJsonDocument(o).toJson(QJsonDocument::Compact);
+}
+
+// ── Proof-of-user gate ────────────────────────────────────────────────────────
+
+bool WalletPlugin::constantTimeEquals(const QString& a, const QString& b)
+{
+    // Hash first, then compare fixed-width digests: a byte-wise compare of the raw strings
+    // would return early on the first mismatch and would branch on length, which is a usable
+    // oracle for a caller that can invoke a gated verb in a loop. SHA-256 of a wrong guess
+    // tells the caller nothing about the right one, and both digests are always 32 bytes.
+    const QByteArray ha = QCryptographicHash::hash(a.toUtf8(), QCryptographicHash::Sha256);
+    const QByteArray hb = QCryptographicHash::hash(b.toUtf8(), QCryptographicHash::Sha256);
+    quint8 diff = static_cast<quint8>(ha.size() ^ hb.size());
+    for (int i = 0; i < ha.size() && i < hb.size(); ++i)
+        diff = static_cast<quint8>(diff | (static_cast<quint8>(ha[i]) ^ static_cast<quint8>(hb[i])));
+    return diff == 0;
+}
+
+// ── INVARIANT C: THE GATE IS A FUNCTION OF THE SECRET, AND OF NOTHING ELSE ────────────────────
+//
+// Two lines, in this order, and there is nothing else in this function on purpose:
+//     a session exists  ->  the presented password equals it, compared in constant time.
+//
+// What used to be here was a short-circuit `if (storageIsPlaintext()) return true;`, placed
+// BEFORE both checks, and it was the round-3 hole. The argument for it was sound about a store
+// that really is plaintext (its keys are in a file any process at this uid can read, so the gate
+// has no secret to defend there) and wrong about everything else: storageIsPlaintext() is not a
+// fact about protection, it is a 256-byte guess about a file a co-resident attacker fully
+// controls. Re-wrapping the still-encrypted store so its "kdf"/"ct" markers fall past byte 256 -
+// or catching the instant the CLI truncates it mid-write, or making it unreadable - flipped that
+// guess to true over a store that was still fully encrypted. authorize() then returned true
+// WITHOUT comparing anything, the verb called runWalletCommand, and runWalletCommand piped the
+// real in-memory session password to the CLI, which decrypted the real ciphertext and handed back
+// the seed. Observed: an attacker presented "i-do-not-know-the-password" and got the 24 words.
+//
+// The general rule this fixes, which is the one that lost rounds 1 to 3 in three different
+// disguises: A CHECK MUST NOT BE KEYED ON STATE THE ATTACKER CAN WRITE. QSettings was that state
+// for cliPath and seqPath; m_password.isEmpty() was that state for round 2's recovery gates;
+// storage.json's first 256 bytes was that state here. No file predicate can be repaired into
+// safety, because even a whole-file parse can be swapped between the check and the CLI spawn - so
+// the file is not consulted at all.
+//
+// The plaintext user is NOT stranded by this, and is not served by the gate either. See
+// authRefusal() below for the route they get instead (migration, which needs no session), and
+// the class-by-class walk in the WalletPlugin.h comment on this function.
+bool WalletPlugin::authorize(const QString& password)
+{
+    // Locked: there is no established password to compare against, so nothing can be proved.
+    // Fail closed - never treat "no password set" as "no password needed".
+    if (m_password.isEmpty())
+        return false;
+    if (!constantTimeEquals(m_password, password))
+        return false;
+    // Passing the gate IS the definition of user activity here, and it is the only honest one
+    // available: the module has no view of the UI, and the UI polls listAccounts every 10s, so
+    // treating any CLI call as activity would mean the idle lock never fired at all.
+    touchActivity();
+    return true;
+}
+
+// Can a password be proved against the store on disk at all? Note what this is NOT: it is not
+// "is a session live". Round 2 gated the recovery verbs on `!m_password.isEmpty() &&
+// !storageIsPlaintext()`, and the first half of that is flipped by clearSessionPassword(), which
+// is ungated by design - so an attacker turned a gated verb into an ungated one in one call. This
+// is a fact about the filesystem instead, which no caller can flip.
+bool WalletPlugin::storeCanProvePassword()
+{
+    return storageExists() && !storageIsPlaintext();
+}
+
+// The message only. authorize() has already decided, on the secret alone; nothing read here can
+// change that verdict, which is why consulting the store is safe HERE and was not safe there.
+// The order matters for honesty, not for enforcement: a live session means the store was
+// encrypted when it was opened, so "unauthorized" is the true reason even if the file on disk has
+// since been made to look like something else.
+QString WalletPlugin::authRefusal() const
+{
+    if (!m_password.isEmpty())
+        return errorJson(QStringLiteral("wallet password required for this operation"),
+                         QStringLiteral("unauthorized"));
+    // No session, and the store on disk carries no crypto envelope. There is no password that
+    // could pass this gate (unlock() refuses to hand out a session for a store it cannot verify a
+    // password against), so the refusal has to carry the ROUTE OUT with it: encryptPlaintextWallet
+    // needs no session, keeps the accounts, copies the old store aside, and afterwards the normal
+    // unlock works and every verb below is reachable again. The UI turns this reason into exactly
+    // that instruction (Security & Backup -> set a password).
+    if (storageIsPlaintext())
+        return errorJson(QStringLiteral("this wallet's storage is not encrypted, so no password "
+                                        "can prove who is asking - set a password on it (Security "
+                                        "& Backup) to use this operation; your accounts are kept"),
+                         QStringLiteral("unencrypted"));
+    return errorJson(QStringLiteral("wallet is locked - unlock first"),
+                     QStringLiteral("locked"));
 }
 
 // "token" → the token program; anything else → the native authenticated-transfer
@@ -172,45 +281,431 @@ QString moduleBinDir()
     return QString();
 }
 
-// Resolve a runtime binary: prefer the copy bundled INSIDE the module (self-contained
-// install), then the dev-staged ~/.local/bin/<name>, else the bare name (PATH lookup).
-QString resolveBin(const QString& name)
+// ── INVARIANT B: the single resolver for every binary this module executes ────────────────
+// Order, and there is no other order anywhere in this file:
+//   1. `envVar` from THIS PROCESS'S ENVIRONMENT. The environment belongs to whoever launched the
+//      module (Basecamp, a developer, the test suite); a co-resident module cannot write it.
+//   2. The module's OWN bundle, <dir containing this .so>/bin/<name>. If that directory exists at
+//      all the install is a packaged one and the bundle is the ONLY place consulted - the path is
+//      returned even when the file is missing, so the caller reports "reinstall the module"
+//      instead of silently running something else that happens to be lying around.
+//   3. Only when there is no bundle directory at all (the unpackaged dev install, where
+//      scripts/install-dev.sh stages everything into ~/.local/bin): ~/.local/bin/<name>, then the
+//      bare name for a PATH lookup.
+// QSettings is not in that list and is never consulted for a path (see cliPath() and seqPath()).
+//
+// What this defends and what it does not, stated plainly so no one reads more into it: it removes
+// PERSISTED CONFIGURATION as a code-execution primitive - a data write that needs no executable
+// bit, leaves the binaries untouched, survives a reboot and survives uninstalling the module that
+// planted it. It does NOT defend against an attacker who overwrites the bundled binaries
+// themselves. Nothing this module can do would: it runs at the same uid as its attacker, so
+// <module>/bin/wallet is as writable as ~/.local/bin/wallet. What is different about the two is
+// that overwriting the bundle destroys a shipped file (a reinstall undoes it, an integrity check
+// sees it) whereas step 3 lets an attacker ADD a file that was never there - which is why step 3
+// is confined to installs that have no bundle to speak of.
+// ── INVARIANT B2: nothing is ever launched by a BARE NAME ─────────────────────────────────
+// A bare program name is resolved by QProcess against the PATH this process INHERITED, and that
+// PATH is not ours: on an ordinary Linux desktop ~/.profile prepends ~/.local/bin (plus whatever
+// else: ~/.npm-global/bin, ~/go/bin), every one of them writable by a co-resident module at this
+// uid. Dropping a file called `curl` there and waiting for the 10-second status poll was
+// unauthenticated arbitrary code execution as the user, on a PACKAGED install, with nobody at the
+// keyboard - the same "persisted file becomes code execution" primitive that was removed from
+// cliPath (round 2) and seqPath (round 3), one call-site class over.
+//
+// So there are exactly two ways a program string may be produced in this file:
+//   • resolveBin()       - binaries this module SHIPS (wallet, sequencer, tor, forward, monitor):
+//                          launcher-owned env var, else the module's own bundle, else a dev
+//                          install's ~/.local/bin. Never a bare name any more (see below).
+//   • resolveSystemBin() - SYSTEM helpers this module does not ship (curl, python3): a fixed list
+//                          of root-owned system directories, checked for uid-writability, and
+//                          $PATH is never read. Returns "" when the helper is absent, and every
+//                          caller degrades gracefully instead of falling back to something else.
+// startChild() enforces the result: it refuses to launch anything that is not an absolute path.
+//
+// The directories a SYSTEM helper may come from. Root-owned on every platform this module ships
+// to; each one is still checked for writability at this uid before it is used, so a box where one
+// of them is group/user-writable (or a container running as root with a writable /usr/local/bin)
+// does not silently reintroduce the primitive.
+static const char* const kSystemBinDirs[] = {
+    "/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/local/bin",
+    "/run/current-system/sw/bin",         // NixOS system profile (the Basecamp runtime's box)
+    "/nix/var/nix/profiles/default/bin",  // nix multi-user default profile (root-managed)
+    "/opt/homebrew/bin", "/opt/local/bin" // macOS
+};
+
+// Is `dir` somewhere a co-resident module at this uid could drop a binary? Anything inside the
+// user's home is (that is where ~/.local/bin lives), as is anything this process can write.
+// Running as root defeats the whole question - everything is writable and the attacker model has
+// already lost - so there the write test is skipped rather than rejecting every directory.
+bool dirIsUidWritable(const QString& dir)
 {
-    const QString bdir = moduleBinDir();
-    if (!bdir.isEmpty()) {
-        const QString bundled = bdir + QStringLiteral("/") + name;
-        if (QFile::exists(bundled)) return bundled;
+    if (dir.isEmpty() || !dir.startsWith(QLatin1Char('/')))
+        return true;                                   // relative/empty: never trusted
+    const QString home = QDir::homePath();
+    if (!home.isEmpty() && (dir == home || dir.startsWith(home + QLatin1Char('/'))))
+        return true;
+    if (geteuid() == 0)
+        return false;
+    return ::access(QFile::encodeName(dir).constData(), W_OK) == 0;
+}
+
+// A SYSTEM helper (curl, python3), resolved WITHOUT consulting $PATH. Returns "" when the helper
+// is not installed in any trusted directory, which callers must handle - "not found" is a fact to
+// report, never a reason to fall back to a name lookup.
+QString resolveSystemBin(const QString& name, const char* envVar = nullptr)
+{
+    // The environment belongs to whoever launched the module (Basecamp, a developer, the test
+    // suite), not to a co-resident one - the same rule resolveBin() uses. An absolute path only:
+    // a bare name here would be a PATH lookup by another route.
+    if (envVar) {
+        const QString fromEnv = qEnvironmentVariable(envVar).trimmed();
+        if (fromEnv.startsWith(QLatin1Char('/')))
+            return fromEnv;
     }
+    for (const char* d : kSystemBinDirs) {
+        const QString dir = QString::fromLatin1(d);
+        const QString cand = dir + QLatin1Char('/') + name;
+        if (!QFileInfo(cand).isExecutable())
+            continue;
+        if (dirIsUidWritable(dir))
+            continue;   // a "system" dir this uid can write is not a system dir
+        return cand;
+    }
+    return QString();
+}
+
+// The PATH handed to CHILD processes. Our own launches never consult it, but a child can: the
+// wallet CLI is a `#!/usr/bin/env python3` script, so the kernel resolves python3 through the
+// child's PATH, and a planted ~/.local/bin/python3 would run inside the wallet with the session
+// password on its stdin. Entries writable at this uid are dropped rather than the whole variable
+// being replaced, so a Nix/Basecamp runtime keeps the /nix/store paths its own tools live in.
+QString sanitizedPath()
+{
+    const QString inherited = qEnvironmentVariable("PATH");
+    QStringList keep;
+    for (const QString& e : inherited.split(QLatin1Char(':'), Qt::SkipEmptyParts)) {
+        const QString dir = e.trimmed();
+        if (dir.isEmpty() || dirIsUidWritable(dir))
+            continue;
+        if (!keep.contains(dir))
+            keep << dir;
+    }
+    if (keep.isEmpty()) {
+        for (const char* d : kSystemBinDirs) {
+            const QString dir = QString::fromLatin1(d);
+            if (QDir(dir).exists() && !dirIsUidWritable(dir))
+                keep << dir;
+        }
+    }
+    return keep.join(QLatin1Char(':'));
+}
+
+// ── The OTHER search lists a child consults ──────────────────────────────────────────────────
+// $PATH decides which FILE runs; these decide what that file, once running, is allowed to LOAD.
+// Both filters use dirIsUidWritable(), so there is exactly one definition in this file of "a
+// directory a co-resident module could drop a file into". The full enumeration of which variable
+// feeds which runtime is above childEnv().
+
+// A colon-separated list of DIRECTORIES, minus every entry writable at this uid. Unlike
+// sanitizedPath() there is no "if nothing survives, use the system dirs" clause: an empty $PATH
+// would break every launch, whereas an empty LD_LIBRARY_PATH just means the loader's built-in
+// search, which is the correct and safe default.
+QString dropUidWritableDirs(const QString& list)
+{
+    QStringList keep;
+    for (const QString& e : list.split(QLatin1Char(':'), Qt::SkipEmptyParts)) {
+        const QString dir = e.trimmed();
+        if (dir.isEmpty() || dirIsUidWritable(dir))
+            continue;
+        if (!keep.contains(dir))
+            keep << dir;
+    }
+    return keep.join(QLatin1Char(':'));
+}
+
+// LD_PRELOAD / LD_AUDIT name FILES (space- or colon-separated) that the dynamic loader maps into
+// every dynamically linked child before main() runs. An entry survives only when it is an
+// absolute path in a directory this uid cannot write, so a distro-wide preload keeps working and
+// a planted one does not. A bare name is dropped outright: the loader would resolve it through
+// its own search, which is the same primitive as a bare program name reaching QProcess.
+QString dropUidWritableFiles(const QString& list)
+{
+    static const QRegularExpression sep(QStringLiteral("[\\s:]+"));
+    QStringList keep;
+    for (const QString& e : list.split(sep, Qt::SkipEmptyParts)) {
+        const QString f = e.trimmed();
+        if (!f.startsWith(QLatin1Char('/')) || dirIsUidWritable(QFileInfo(f).absolutePath()))
+            continue;
+        if (!keep.contains(f))
+            keep << f;
+    }
+    return keep.join(QLatin1Char(' '));
+}
+
+// Apply one of the two filters to `name` in `env`, dropping the variable entirely when nothing
+// survives (an empty LD_PRELOAD is not the same thing as no LD_PRELOAD to every loader).
+void filterSearchVar(QProcessEnvironment& env, const char* name, bool entriesAreFiles)
+{
+    const QString key = QString::fromLatin1(name);
+    const QString val = env.value(key);
+    if (val.isEmpty())
+        return;
+    const QString kept = entriesAreFiles ? dropUidWritableFiles(val) : dropUidWritableDirs(val);
+    if (kept.isEmpty()) env.remove(key);
+    else                env.insert(key, kept);
+}
+
+QString resolveBin(const QString& name, const char* envVar = nullptr)
+{
+    if (envVar) {
+        const QString fromEnv = qEnvironmentVariable(envVar).trimmed();
+        if (!fromEnv.isEmpty()) {
+            // A bare name from the environment is still a $PATH lookup, so it is resolved like a
+            // system helper rather than handed to QProcess. An env var that names something not
+            // installed resolves to "" and the caller reports it, which is the honest outcome.
+            if (fromEnv.contains(QLatin1Char('/')))
+                return QFileInfo(fromEnv).absoluteFilePath();
+            return resolveSystemBin(fromEnv);
+        }
+    }
+    const QString bdir = moduleBinDir();
+    if (!bdir.isEmpty() && QDir(bdir).exists())
+        return bdir + QStringLiteral("/") + name;   // packaged install: the bundle, or nothing
     const QString local = QDir::homePath() + QStringLiteral("/.local/bin/") + name;
     if (QFile::exists(local)) return local;
-    return name;
+    // Last resort on an unpackaged install: a trusted system directory. This used to `return
+    // name`, i.e. hand QProcess a bare name for a PATH lookup - the F1 primitive. Returning the
+    // (absolute, non-existent) ~/.local/bin path when nothing is installed keeps the error message
+    // pointing at where a dev install puts its binaries.
+    const QString sys = resolveSystemBin(name);
+    return sys.isEmpty() ? local : sys;
+}
+
+// Is something listening on 127.0.0.1:<port>? This used to be
+//     bash -c 'exec 3<>/dev/tcp/127.0.0.1/<port>'
+// which is (a) a bare-name launch of a shell resolved through $PATH and (b) a whole shell spawned
+// to open one socket. A non-blocking connect() with a poll() timeout answers the same question in
+// libc, so the shell - and with it the launch that had to be guarded - is simply gone.
+bool tcpPortOpen(quint16 port, int timeoutMs)
+{
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return false;
+    int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags >= 0)
+        ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    sockaddr_in sa;
+    std::memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port   = htons(port);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // loopback only: never a name lookup
+    bool open = false;
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == 0) {
+        open = true;
+    } else if (errno == EINPROGRESS) {
+        pollfd pf;
+        pf.fd = fd; pf.events = POLLOUT; pf.revents = 0;
+        if (::poll(&pf, 1, timeoutMs) > 0 && (pf.revents & POLLOUT)) {
+            int err = 0;
+            socklen_t len = sizeof(err);
+            open = (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0);
+        }
+    }
+    ::close(fd);
+    return open;
 }
 
 // Resolve a usable Tor binary the way ensureTor() does: the bundled medusa-tor first,
 // then a system tor. Returns "" when neither is present (Tor/onion zones can't connect).
 QString resolveTorBin()
 {
-    const QString bundled = resolveBin(QStringLiteral("medusa-tor"));
+    const QString bundled = resolveBin(QStringLiteral("medusa-tor"), "MEDUSA_TOR_BIN");
     if (QFileInfo::exists(bundled)) return bundled;
-    for (const QString& c : { QStringLiteral("/usr/bin/tor"), QStringLiteral("/usr/sbin/tor"),
-                              QStringLiteral("/usr/local/bin/tor") })
-        if (QFileInfo::exists(c)) return c;
-    return QString();
+    // A system tor, from a root-owned system directory only (resolveSystemBin checks that each
+    // candidate's directory is not writable at this uid, and never reads $PATH).
+    return resolveSystemBin(QStringLiteral("tor"));
 }
 }  // namespace
 
+// Which binary the module executes as "the wallet CLI". This decides where the session password
+// goes: runWalletCommandInput writes it to this binary's stdin on every call, so whoever controls
+// this string gets arbitrary code execution AND the user's password.
+//
+// The QSettings override (medusa-wallet/cliPath) that used to win here is GONE, not filtered.
+// A filter could not be a boundary, for two reasons that compound:
+//   • the setting lives in a plain, user-writable INI (~/.config/<Org>/<App>.conf), so a
+//     co-resident module writes the key directly - no IPC, no password, nothing to gate; and
+//   • the same module runs at the same uid, so any "it must be an executable named wallet* in a
+//     known bin dir" rule is satisfied by dropping a file into ~/.local/bin or the module's own
+//     bin dir, both of which it can write.
+// The alternative the reviewers named, verifying by CONTENT HASH, needs a trusted reference the
+// module does not have: the wallet binary is built per release and shipped inside this very
+// module, so the only hash available to compare against is the hash of the binary we would have
+// run anyway. That leaves removal, which costs nothing real: the legitimate need (a developer
+// running a custom build, and the test suite) is served by MEDUSA_WALLET_CLI, which comes from
+// THIS process's environment - set by whoever launched the module, not writable by a co-resident
+// one - and the user whose bundled binary is missing was never actually served by the setter
+// (Save needed the password, the password needed unlock, and unlock needed the CLI).
 QString WalletPlugin::cliPath() const
 {
-    QSettings s;
-    QString stored = s.value(QLatin1String(kCliPathKey)).toString().trimmed();
-    if (!stored.isEmpty())
-        return stored;
-
-    // Bundled (<module>/bin/wallet) -> ~/.local/bin/wallet -> PATH.
-    return resolveBin(QStringLiteral("wallet"));
+    // MEDUSA_WALLET_CLI (launcher-owned) -> the module's bundle -> (unpackaged installs only)
+    // ~/.local/bin -> PATH. See resolveBin() for the full rule and for what it does not defend.
+    return resolveBin(QStringLiteral("wallet"), "MEDUSA_WALLET_CLI");
 }
 
 // ── QProcess runner ──────────────────────────────────────────────────────────
+
+// ── INVARIANT B3: every code-search list a child of this module consults ─────────────────────
+//
+// startChild() decides WHICH FILE is executed. This decides what that file, once it is running,
+// is allowed to LOAD - a separate question, and until round 5 it was answered only for $PATH.
+// It matters here more than in most programs because the wallet CLI is not a native binary: it
+// is a `#!/usr/bin/env python3` script, so the process that receives the session password on its
+// stdin first runs a complete CPython startup, and CPython has code-search paths of its own. A
+// co-resident module needs no exec bit, no IPC, no user and no password to write a file into one
+// of them; round 4 shipped with ~/.local/lib/pythonX.Y/site-packages open, and a one-line .pth
+// there was arbitrary code execution inside the wallet CLI plus capture of the password off fd 0.
+//
+// THE ENUMERATION, per runtime this module can cause to execute. Callers build on childEnv()
+// rather than on systemEnvironment(), so no launch can opt out of any of it.
+//
+//  1. /usr/bin/env, run by the KERNEL for the CLI's shebang line. It resolves `python3` through
+//     the child's $PATH -> sanitizedPath(). CLOSED (rounds 3-4).
+//
+//  2. CPython: the wallet CLI (via its shebang) and the Tor onion-stage monitor (via an explicit
+//     interpreter). Its startup executes code found through:
+//       a. the PER-USER SITE directory, ~/.local/lib/pythonX.Y/site-packages. site.py exec()s
+//          any .pth line that begins with `import `, and imports usercustomize from there. This
+//          was the round-4 hole -> PYTHONNOUSERSITE=1. CLOSED.
+//       b. $PYTHONPATH, which is prepended AHEAD OF THE STDLIB (so an entry shadows `json`,
+//          `os`, `subprocess`) and from which site.py imports `sitecustomize` - which, unlike
+//          usercustomize, PYTHONNOUSERSITE does NOT disable -> removed. CLOSED.
+//       c. every other PYTHON* knob: $PYTHONHOME (relocates the whole stdlib), $PYTHONSTARTUP,
+//          $PYTHONBREAKPOINT, $PYTHONUSERBASE, $PYTHONPLATLIBDIR, $PYTHONINSPECT, and whatever
+//          the next release adds. Enumerating a set that grows is how this class keeps
+//          reappearing, so instead EVERY variable whose name starts with PYTHON is dropped and
+//          only the isolation flags are put back. That is `-E` delivered through the
+//          environment, and it is closed by construction rather than by list. CLOSED.
+//       d. sys.path[0], the directory the SCRIPT ITSELF lives in, searched BEFORE the stdlib.
+//          PYTHONSAFEPATH=1 removes it on CPython >= 3.11. On 3.10 and older it stays and this
+//          module cannot remove it: the CLI is launched by its own shebang, and the switches
+//          that drop it (`-P`, `-I`) exist only on a command line (see WHY THE ENVIRONMENT,
+//          below). NOT CLOSED on CPython <= 3.10 - stated plainly rather than certified. Its
+//          scope: that directory is the one holding the wallet binary itself (<module>/bin on a
+//          packaged install, ~/.local/bin on a dev one), so writing to it is the residual
+//          invariant B already concedes ("it does NOT defend against an attacker who overwrites
+//          the bundled binaries themselves"), not a new one.
+//       e. .pth files in the interpreter's OWN prefix (/usr/lib/python3/dist-packages,
+//          /usr/local/lib/pythonX.Y/dist-packages). Root-owned on a normal install. On a box
+//          where /usr/local is user-writable they are writable, and NOTHING this module can do
+//          changes that - it is compiled into the interpreter. NOT CLOSEABLE from here. What is
+//          closed is the interpreter itself: it is only ever taken from a directory this uid
+//          cannot write (resolveSystemBin() for the monitor, sanitizedPath() for the shebang).
+//
+//  3. ld.so and glibc, for every dynamically linked child (medusa-tor, diaphani-forward,
+//     sequencer_service, curl, and wallet-lez, which the wrapper execs with dict(os.environ),
+//     so this reaches the grandchild too): $LD_PRELOAD and $LD_AUDIT name objects mapped in
+//     before main(), $LD_LIBRARY_PATH is searched before the default paths, and $GCONV_PATH is
+//     a directory glibc dlopen()s character-set modules out of the moment anything converts an
+//     encoding. All four are FILTERED to entries this uid cannot write rather than deleted, so
+//     a Nix/Basecamp runtime keeps the /nix/store paths its own binaries need. DT_RPATH and
+//     DT_RUNPATH live INSIDE the binary and are the same conceded residual as 2d. CLOSED for
+//     the environment half.
+//
+//  4. A SHELL: none. Every `bash -c`/`sh -c` in this module was removed in rounds 3 and 4, so
+//     $BASH_ENV, $ENV, $SHELLOPTS and $IFS have no reader among its children. NOT APPLICABLE,
+//     and it stays that way only because startChild() is the single launch point.
+//
+//  5. Qt's plugin and QML import search ($QT_PLUGIN_PATH, $QT_QPA_PLATFORM_PLUGIN_PATH,
+//     $QML_IMPORT_PATH, $QML2_IMPORT_PATH): no child of this module is a Qt program, so
+//     filtering these cannot break anything today and is purely prophylactic for a future one.
+//     THIS PROCESS's own plugin path is a different question with an honest answer: it is fixed
+//     by the host application before this module is loaded, and a plugin that rewrote
+//     QCoreApplication::libraryPaths() would be sabotaging its host. NOT CLOSEABLE from here,
+//     and not this module's to close.
+//
+// WHY THE ENVIRONMENT, AND NOT `python3 -I <script>`. `-I` is stronger by exactly one item (2d
+// on CPython <= 3.10). Buying it would mean this module stops executing the file it resolved and
+// instead sniffs the file's first two bytes, decides it is python, resolves an interpreter, and
+// rebuilds the argv. That (a) FAILS OPEN when no python3 is found in a trusted directory, and
+// "fall back to running it directly" is exactly the silent degradation that has cost three
+// rounds; (b) breaks any CLI the launcher legitimately points MEDUSA_WALLET_CLI at that is not
+// python (the test suite's stand-ins today, a native build tomorrow); and (c) puts a second
+// program name on the execution path that startChild() would have to trust. The environment
+// reaches the CLI THROUGH its shebang for free, because exec() carries envp across both hops
+// (kernel -> /usr/bin/env -> python3). That is asserted, not assumed:
+// testAPlantedUserSitePthNeverExecutesInAChild drives a real `#!/usr/bin/env python3` script and
+// proves the same plant DOES fire without the hardening. Where the interpreter IS named on a
+// command line - the Tor monitor - `-I` is passed as well, because there it costs nothing.
+QProcessEnvironment WalletPlugin::childEnv()
+{
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    env.insert(QStringLiteral("PATH"), sanitizedPath());
+
+    // 2a-2d: CPython, isolated as far as an environment can reach.
+    const QStringList inherited = env.keys();
+    for (const QString& k : inherited)
+        if (k.startsWith(QStringLiteral("PYTHON")))
+            env.remove(k);
+    env.insert(QStringLiteral("PYTHONNOUSERSITE"), QStringLiteral("1"));  // no user site: no .pth, no usercustomize
+    env.insert(QStringLiteral("PYTHONSAFEPATH"),   QStringLiteral("1"));  // >= 3.11: drop sys.path[0]
+    env.insert(QStringLiteral("PYTHONBREAKPOINT"), QStringLiteral("0"));  // breakpoint() imports whatever this names
+    // Not a boundary, hygiene: the wallet must not leave __pycache__ entries in a directory it
+    // does not own. It does not close the "forge a .pyc" path, which needs the same write access
+    // as replacing the wallet binary (2d), and it is not claimed to.
+    env.insert(QStringLiteral("PYTHONDONTWRITEBYTECODE"), QStringLiteral("1"));
+
+    // 3: the dynamic loader and glibc, for the native children.
+    filterSearchVar(env, "LD_LIBRARY_PATH", false);
+    filterSearchVar(env, "LD_PRELOAD",      true);
+    filterSearchVar(env, "LD_AUDIT",        true);
+    filterSearchVar(env, "GCONV_PATH",      false);
+
+    // 5: Qt, prophylactically - no current child reads these.
+    filterSearchVar(env, "QT_PLUGIN_PATH",               false);
+    filterSearchVar(env, "QT_QPA_PLATFORM_PLUGIN_PATH",  false);
+    filterSearchVar(env, "QML_IMPORT_PATH",              false);
+    filterSearchVar(env, "QML2_IMPORT_PATH",             false);
+    return env;
+}
+
+// ── THE ONE LAUNCH POINT (invariant B2) ───────────────────────────────────────────────────────
+// Every QProcess in this module is started here, and this refuses anything that is not an
+// ABSOLUTE path. That is the whole enforcement: a bare name would be resolved by QProcess against
+// the inherited $PATH, which contains directories a co-resident module can write, and three
+// rounds of review have now found the same "attacker plants a file, the wallet executes it"
+// primitive at three different call sites. A name cannot reach QProcess from here even by
+// accident, and a future call site that tries fails loudly in the log instead of silently running
+// whatever was found first.
+//
+//     grep -n "\.start(\|->start(" WalletPlugin.cpp
+//         -> QProcess::start appears exactly once, in this function.
+//
+// It also installs childEnv(), which is a SEPARATE boundary and must not be read as part of this
+// one: this function controls which file runs, childEnv() controls what that file may then load.
+// The comment that used to stand here said a child "that resolves ITS own helpers by name (the
+// wallet CLI is a `#!/usr/bin/env python3` script) cannot be fed a planted one either", and that
+// was a certification of a class from one instance. It was true of $PATH and false of the python
+// interpreter's own import search, which round 4 shipped wide open: a .pth file in
+// ~/.local/lib/pythonX.Y/site-packages ran attacker code inside the wallet CLI and read the
+// session password off its stdin. What is and is not closed is now enumerated, per runtime and
+// per search list, above childEnv() - including two items that are NOT closed and say so.
+// A caller that has already set an environment (the sequencer's RISC0_DEV_MODE) keeps it - those
+// build theirs from childEnv().
+bool WalletPlugin::startChild(QProcess& p, const QString& program, const QStringList& args)
+{
+    if (program.isEmpty() || !program.startsWith(QLatin1Char('/'))) {
+        appendLog(QStringLiteral("refusing to launch a program that is not an absolute path: '")
+                      + (program.isEmpty() ? QStringLiteral("<empty>") : program)
+                      + QStringLiteral("' - a bare name would be resolved through $PATH"),
+                  QStringLiteral("error"));
+        return false;
+    }
+    if (p.processEnvironment().isEmpty())
+        p.setProcessEnvironment(childEnv());
+    p.start(program, args);
+    return true;
+}
 
 QString WalletPlugin::runWalletCommand(const QStringList& args, int timeoutMs)
 {
@@ -224,25 +719,76 @@ QString WalletPlugin::cleanStderr(const QString& raw)
     QString s = raw;
     s.remove(QStringLiteral("Input password: "));
     s.remove(QStringLiteral("Input recovery phrase: "));
+    s.remove(QStringLiteral("Input private key: "));
     return s.trimmed();
+}
+
+QString WalletPlugin::redactedArgs(const QStringList& args)
+{
+    // No secret travels in argv any more (the imported signing key was the last one and now
+    // goes on stdin), but the log line is built from whatever it is handed, so redact by flag
+    // name rather than trusting every future call site to remember.
+    static const QStringList kSecretFlags{
+        QStringLiteral("--private-key"), QStringLiteral("--password"),
+        QStringLiteral("--mnemonic"), QStringLiteral("--phrase"), QStringLiteral("--seed")
+    };
+    QStringList out;
+    out.reserve(args.size());
+    bool redactNext = false;
+    for (const QString& a : args) {
+        if (redactNext) { out << QStringLiteral("<redacted>"); redactNext = false; continue; }
+        const int eq = a.indexOf(QLatin1Char('='));   // --flag=value form
+        if (eq > 0 && kSecretFlags.contains(a.left(eq)))
+            out << a.left(eq) + QStringLiteral("=<redacted>");
+        else {
+            out << a;
+            redactNext = kSecretFlags.contains(a);
+        }
+    }
+    return out.join(QLatin1Char(' '));
+}
+
+bool WalletPlugin::outputIsSecret(const QStringList& args)
+{
+    // export-key prints a 64-char hex signing key and export-mnemonic prints the recovery
+    // phrase, so their stdout IS the secret; `account import` and restore-keys echo the
+    // offending value back on a parse error. 80 chars of an export was 56 of the 64 hex
+    // characters, i.e. 224 of 256 bits, and createEncryptedWallet calls exportMnemonic, so a
+    // truncated seed phrase used to enter the buffer at wallet CREATION.
+    if (args.contains(QStringLiteral("export-key"))
+        || args.contains(QStringLiteral("export-mnemonic"))
+        || args.contains(QStringLiteral("restore-keys")))
+        return true;
+    return args.value(0) == QStringLiteral("account")
+        && args.value(1) == QStringLiteral("import");
 }
 
 QString WalletPlugin::runWalletCommandInput(const QStringList& args,
                                             const QString& stdinData, int timeoutMs)
 {
     QString bin = cliPath();
-    appendLog(QStringLiteral("run: wallet ") + args.join(QLatin1Char(' ')));
+    const bool secret = outputIsSecret(args);
+    appendLog(QStringLiteral("run: wallet ") + redactedArgs(args));
 
     QProcess proc;
     // Keep channels separate: the CLI prompts on stderr and returns results on
     // stdout, so we must not let the "Input password: " prompt pollute stdout.
     proc.setProcessChannelMode(QProcess::SeparateChannels);
-    proc.start(bin, args);
+    if (!startChild(proc, bin, args)) {
+        return errorJson(QStringLiteral("wallet CLI not found: ")
+                         + (bin.isEmpty() ? QStringLiteral("<unresolved>") : bin)
+                         + QStringLiteral(" - reinstall the medusa_core module, or set "
+                                          "MEDUSA_WALLET_CLI to an absolute path before "
+                                          "launching"));
+    }
 
     if (!proc.waitForStarted(3000)) {
         appendLog(QStringLiteral("failed to start: ") + proc.errorString(), QStringLiteral("error"));
+        // NOT "configure the path in settings": there is no such setting any more (see
+        // cliPath()), and pointing the user at one would be advice into a dead end.
         return errorJson(QStringLiteral("wallet CLI not found: ") + bin
-                         + QStringLiteral(" - configure path in ⚙ settings"));
+                         + QStringLiteral(" - reinstall the medusa_core module, or set "
+                                          "MEDUSA_WALLET_CLI before launching"));
     }
 
     // Feed the password (and, for restore, the mnemonic line) to the CLI's stdin.
@@ -259,11 +805,17 @@ QString WalletPlugin::runWalletCommandInput(const QStringList& args,
     const QString err = cleanStderr(QString::fromUtf8(proc.readAllStandardError()));
     const int exitCode = proc.exitCode();
 
+    // Never echo a secret-bearing command's output: on success stdout IS the key/phrase, and on
+    // failure clap quotes the value it rejected. Only the size goes in the log.
     if (exitCode != 0)
-        appendLog(QStringLiteral("exit %1: ").arg(exitCode) + (err.isEmpty() ? out : err).left(120),
+        appendLog(QStringLiteral("exit %1: ").arg(exitCode)
+                      + (secret ? QStringLiteral("<redacted>")
+                                : (err.isEmpty() ? out : err).left(120)),
                   QStringLiteral("error"));
     else
-        appendLog(QStringLiteral("ok: ") + out.left(80));
+        appendLog(QStringLiteral("ok: ") + (secret ? QStringLiteral("<redacted, %1 bytes>")
+                                                         .arg(out.size())
+                                                   : out.left(80)));
 
     // On failure the message is on stderr; on success the result is on stdout.
     const QString effective = (exitCode != 0 && out.isEmpty()) ? err : out;
@@ -345,16 +897,12 @@ void WalletPlugin::initLogos(LogosAPI* api)
 
 QString WalletPlugin::getStatus() const
 {
-    QString bin = cliPath();
-    bool found = QFile::exists(bin) || (bin == QStringLiteral("wallet")); // PATH lookup: assume present if name only
-
-    // Attempt a real existence check for PATH-style name
-    if (bin == QStringLiteral("wallet")) {
-        QProcess check;
-        check.start(QStringLiteral("which"), {QStringLiteral("wallet")});
-        check.waitForFinished(2000);
-        found = (check.exitCode() == 0);
-    }
+    // This used to shell out to `which wallet` whenever cliPath() returned a bare name, which was
+    // both a $PATH-resolved launch of its own (F1) and a question about a state that no longer
+    // exists: cliPath() is always an absolute path now (see resolveBin), so the answer is a
+    // filesystem fact and needs no process at all. `which` is gone from this module.
+    const QString bin = cliPath();
+    const bool found = !bin.isEmpty() && QFileInfo(bin).isExecutable();
 
     QJsonObject o;
     o[QStringLiteral("cliFound")] = found;
@@ -365,39 +913,55 @@ QString WalletPlugin::getStatus() const
 QString WalletPlugin::getConfig() const
 {
     QSettings s;
-    QString stored = s.value(QLatin1String(kCliPathKey)).toString();
+    const QString stored = s.value(QLatin1String(kCliPathKey)).toString();
     QJsonObject o;
+    // The key is read here and NOWHERE else. An install poisoned before the override was removed
+    // still shows what was planted, which is the only visible trace it was ever there; it is
+    // never executed, whatever it points at.
     o[QStringLiteral("cliPath")]    = stored;
     o[QStringLiteral("cliPathEff")] = cliPath();
+    o[QStringLiteral("cliPathIgnored")]      = !stored.trimmed().isEmpty();
+    o[QStringLiteral("cliPathConfigurable")] = false;
     return QJsonDocument(o).toJson(QJsonDocument::Compact);
 }
 
-QString WalletPlugin::setCliPath(const QString& path)
+QString WalletPlugin::setCliPath(const QString& path, const QString& password)
 {
-    QString p = path.trimmed();
-    if (p.isEmpty())
-        return errorJson(QStringLiteral("path is empty"));
-
-    QSettings s;
-    s.setValue(QLatin1String(kCliPathKey), p);
-    s.sync();
-    appendLog(QStringLiteral("cliPath saved: ") + p);
-    return okJson();
+    // Always refused. Storing a CLI path was code execution plus password capture that outlived
+    // both a reboot and the module that planted it, and no gate on THIS function could protect
+    // it: the setting is an ordinary file that a co-resident module writes directly (see
+    // cliPath()). Nothing is stored, nothing is validated, and the caller is told where the
+    // remaining override lives so the message is not another dead end.
+    Q_UNUSED(path);
+    Q_UNUSED(password);
+    return errorJson(QStringLiteral("the wallet CLI path is no longer configurable - medusa runs "
+                                    "the binary bundled with the module; set MEDUSA_WALLET_CLI "
+                                    "before launching to use a different build"),
+                     QStringLiteral("not-supported"));
 }
 
 // ── Sequencer (local auto-launch / hosted) ──────────────────────────────────────
 
+// The sequencer binary this module SPAWNS (ensureSequencer -> QProcess::start). Whoever controls
+// this string gets arbitrary code execution as the user.
+//
+// It used to read medusa-wallet/seqPath out of QSettings and return it VERBATIM, with no check on
+// the read side and no gate anywhere: a co-resident module wrote the key into the shared,
+// user-writable INI (no IPC, no password, nothing to authorise) and then called the ungated
+// setActiveZone("devnet"), and the wallet spawned the attacker's binary. That is the exact
+// primitive that was removed from cliPath() one round earlier and left standing here - persistent
+// across reboots and across uninstalling the module that planted it.
+//
+// It is now resolved exactly like cliPath(): a launcher-owned env var, else the module's own
+// bundle. The setting is still REPORTED by getSequencerConfig (as seqPath/seqPathIgnored) so a
+// poisoned install shows what was planted, and it is never executed.
 QString WalletPlugin::seqPath() const
 {
-    QSettings s;
-    const QString stored = s.value(QLatin1String(kSeqPathKey)).toString().trimmed();
-    if (!stored.isEmpty())
-        return stored;
     // diaphani/Tor mode talks to a REAL shared Bedrock L1, so it needs the non-standalone
     // build (sequencer_service_l1); devnet/testnet use the L1-free standalone build.
     const QString binName = (netId() == QStringLiteral("diaphani"))
         ? QStringLiteral("sequencer_service_l1") : QStringLiteral("sequencer_service");
-    return resolveBin(binName);   // bundled <module>/bin -> ~/.local/bin -> PATH
+    return resolveBin(binName, "MEDUSA_SEQ_PATH");
 }
 
 // ── Zones ───────────────────────────────────────────────────────────────────────
@@ -499,13 +1063,27 @@ QString WalletPlugin::seqHome() const
          + (epoch.isEmpty() ? QString() : QStringLiteral("-") + epoch);
 }
 
+// curl, resolved to an absolute path in a root-owned system directory - never the bare name it
+// used to be launched with. "" when curl is not installed: the probe then reports "not healthy"
+// (see the callers), which is the honest answer and is not a reason to run something else.
+QString WalletPlugin::curlPath()
+{
+    return resolveSystemBin(QStringLiteral("curl"), "MEDUSA_CURL_BIN");
+}
+
 bool WalletPlugin::seqHealthyUrl(const QString& url, int timeoutMs)
 {
     // Probe the sequencer's JSON-RPC checkHealth at an arbitrary URL via curl (keeps the
     // dependency surface at zero - the rest of this file shells out the same way).
     if (url.trimmed().isEmpty()) return false;
+    const QString curl = curlPath();
+    if (curl.isEmpty()) {
+        appendLog(QStringLiteral("curl is not installed in any trusted system directory - the "
+                                 "sequencer health probe cannot run"), QStringLiteral("error"));
+        return false;
+    }
     QProcess p;
-    p.start(QStringLiteral("curl"), {
+    if (!startChild(p, curl, {
         // curl's own --max-time must track timeoutMs - a hardcoded "1" ignored the argument and
         // timed out on any real over-the-internet HTTPS round-trip (~2s incl. the TLS handshake).
         QStringLiteral("-s"), QStringLiteral("--max-time"), QString::number(qMax(1, timeoutMs / 1000)),
@@ -514,7 +1092,8 @@ bool WalletPlugin::seqHealthyUrl(const QString& url, int timeoutMs)
         QStringLiteral("-d"),
         QStringLiteral(R"({"jsonrpc":"2.0","id":1,"method":"checkHealth","params":[]})"),
         url
-    });
+    }))
+        return false;
     if (!p.waitForFinished(timeoutMs + 800)) { p.kill(); p.waitForFinished(300); return false; }
     return p.exitCode() == 0 &&
            QString::fromUtf8(p.readAllStandardOutput()).contains(QStringLiteral("\"result\""));
@@ -552,22 +1131,18 @@ void WalletPlugin::ensureTor()
         return;
     // Reuse any Tor already on our SOCKS port (e.g. one orphaned by a previous hard-kill
     // that still holds the data-dir lock) instead of launching a duplicate that would fail.
-    {
-        QProcess probe;
-        probe.start(QStringLiteral("bash"),
-                    { QStringLiteral("-c"),
-                      QStringLiteral("exec 3<>/dev/tcp/127.0.0.1/%1").arg(kTorSocksPort) });
-        if (probe.waitForFinished(700) && probe.exitCode() == 0) {
-            appendLog(QStringLiteral("reusing Tor already on 127.0.0.1:%1").arg(kTorSocksPort));
-            return;
-        }
+    // (This was a `bash -c 'exec 3<>/dev/tcp/...'` spawn - a $PATH-resolved shell to open one
+    // socket. tcpPortOpen() does it in libc, so the launch no longer exists to be attacked.)
+    if (tcpPortOpen(kTorSocksPort, 700)) {
+        appendLog(QStringLiteral("reusing Tor already on 127.0.0.1:%1").arg(kTorSocksPort));
+        return;
     }
-    // Prefer the bundled binary; fall back to a system tor if present.
-    QString torBin = resolveBin(QStringLiteral("medusa-tor"));
+    // Prefer the bundled binary (MEDUSA_TOR_BIN overrides, same rule as every other binary here);
+    // fall back to a system tor at an absolute, root-owned path if present.
+    QString torBin = resolveBin(QStringLiteral("medusa-tor"), "MEDUSA_TOR_BIN");
     if (!QFileInfo::exists(torBin)) {
-        for (const QString& c : { QStringLiteral("/usr/bin/tor"), QStringLiteral("/usr/sbin/tor"),
-                                  QStringLiteral("/usr/local/bin/tor") })
-            if (QFileInfo::exists(c)) { torBin = c; break; }
+        const QString sysTor = resolveSystemBin(QStringLiteral("tor"));
+        if (!sysTor.isEmpty()) torBin = sysTor;
     }
     if (!QFileInfo::exists(torBin)) {
         appendLog(QStringLiteral("bundled Tor not found (~/.local/bin/medusa-tor)"), QStringLiteral("error"));
@@ -579,7 +1154,7 @@ void WalletPlugin::ensureTor()
     m_torProc = new QProcess(this);
     m_torProc->setProcessChannelMode(QProcess::SeparateChannels);
     appendLog(QStringLiteral("launching bundled Tor (SOCKS 127.0.0.1:%1)").arg(kTorSocksPort));
-    m_torProc->start(torBin, {
+    startChild(*m_torProc, torBin, {
         QStringLiteral("--SocksPort"),       QStringLiteral("127.0.0.1:%1").arg(kTorSocksPort),
         QStringLiteral("--ControlPort"),     QStringLiteral("127.0.0.1:%1").arg(kTorControlPort),
         QStringLiteral("--CookieAuthentication"), QStringLiteral("1"),
@@ -597,14 +1172,32 @@ void WalletPlugin::ensureTor()
         m_torProc = nullptr;
         return;
     }
-    // Launch the control-port monitor → real onion-connection stages for the progress bar.
-    const QString mon = resolveBin(QStringLiteral("medusa-tor-monitor"));
-    if (QFileInfo::exists(mon)) {
+    // Launch the control-port monitor → real onion-connection stages for the progress bar. This
+    // one is a SCRIPT handed to python3, so the same rule applies for the same reason: the file
+    // is executed, whatever its exec bit says. The INTERPRETER is a system helper and used to be
+    // launched as the bare name "python3" - a $PATH lookup, i.e. arbitrary code execution for
+    // anyone who can write an earlier PATH entry. It is resolved to an absolute path in a
+    // root-owned directory now, and when there is no such python3 the monitor is simply skipped:
+    // the onion progress bar loses its per-stage detail and nothing else changes.
+    //
+    // This is the ONE python child whose interpreter this module names itself, so it gets `-I`
+    // (isolated mode) on top of childEnv(): -E -s -P, i.e. no PYTHON* variables, no per-user
+    // site directory, and - the part the environment cannot buy on CPython <= 3.10 - no
+    // sys.path[0], so nothing planted BESIDE the monitor script is importable either. The
+    // monitor imports only the standard library (binascii, json, os, socket, sys, time), so
+    // isolated mode costs it nothing. The wallet CLI cannot be launched this way: it is executed
+    // through its own shebang, and see childEnv() for why sniffing it would be worse.
+    const QString mon = resolveBin(QStringLiteral("medusa-tor-monitor"), "MEDUSA_TOR_MONITOR");
+    const QString py  = resolveSystemBin(QStringLiteral("python3"), "MEDUSA_PYTHON_BIN");
+    if (QFileInfo::exists(mon) && !py.isEmpty()) {
         if (m_torMonProc) { m_torMonProc->kill(); m_torMonProc->deleteLater(); }
         m_torMonProc = new QProcess(this);
         m_torMonProc->setProcessChannelMode(QProcess::SeparateChannels);
-        m_torMonProc->start(QStringLiteral("python3"),
-                            { mon, dataDir, QString::number(kTorControlPort) });
+        startChild(*m_torMonProc, py, { QStringLiteral("-I"), mon, dataDir,
+                                        QString::number(kTorControlPort) });
+    } else if (QFileInfo::exists(mon)) {
+        appendLog(QStringLiteral("no python3 in a trusted system directory - the Tor onion-stage "
+                                 "monitor will not run (connection progress stays coarse)"));
     }
 }
 
@@ -640,17 +1233,12 @@ void WalletPlugin::ensureForward(int listenPort, const QString& onion)
     // and broke the first. The forward is a shared tunnel to the same per-zone .onion, so
     // reusing it is safe (mirrors the Tor-reuse probe in ensureTor). m_fwdProc stays null;
     // the async health probe drives the connection status either way.
-    {
-        QProcess probe;
-        probe.start(QStringLiteral("bash"),
-                    { QStringLiteral("-c"),
-                      QStringLiteral("exec 3<>/dev/tcp/127.0.0.1/%1").arg(listenPort) });
-        if (probe.waitForFinished(700) && probe.exitCode() == 0) {
-            appendLog(QStringLiteral("reusing forward already on 127.0.0.1:%1").arg(listenPort));
-            return;
-        }
+    // (Same libc port probe as ensureTor: the `bash -c 'exec 3<>/dev/tcp/...'` spawn is gone.)
+    if (listenPort > 0 && listenPort < 65536 && tcpPortOpen(quint16(listenPort), 700)) {
+        appendLog(QStringLiteral("reusing forward already on 127.0.0.1:%1").arg(listenPort));
+        return;
     }
-    const QString fwd = resolveBin(QStringLiteral("diaphani-forward"));
+    const QString fwd = resolveBin(QStringLiteral("diaphani-forward"), "MEDUSA_FORWARD_BIN");
     const QString listen = QStringLiteral("127.0.0.1:%1").arg(listenPort);
     // The configured onion may carry a port ("host.onion:3077" - the netcup sequencer onion
     // publishes 3077, not 80). diaphani-forward strictly wants a BARE v3 host in --onion and
@@ -668,7 +1256,7 @@ void WalletPlugin::ensureForward(int listenPort, const QString& onion)
                        QStringLiteral("127.0.0.1:%1").arg(kTorSocksPort) };
     if (!onionPort.isEmpty())
         fargs << QStringLiteral("--onion-port") << onionPort;
-    m_fwdProc->start(fwd, fargs);
+    startChild(*m_fwdProc, fwd, fargs);
     if (!m_fwdProc->waitForStarted(3000)) {
         appendLog(QStringLiteral("diaphani-forward failed to start: ") + fwd, QStringLiteral("error"));
         m_fwdProc->deleteLater();
@@ -744,7 +1332,7 @@ void WalletPlugin::ensureSequencer()
     m_seqProc->setProcessChannelMode(QProcess::MergedChannels);
     m_seqProc->setStandardOutputFile(seqHome() + QStringLiteral("/sequencer.log"),
                                      QIODevice::Truncate);
-    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    QProcessEnvironment env = childEnv();   // inherited env with a $PATH nothing at this uid owns
     // Dev-mode (fake/fast proofs, no verification) ONLY for the local "devnet" sandbox; every real
     // zone (diaphani + user-added remote) must verify real proofs. Matches the wallet's prove mode.
     env.insert(QStringLiteral("RISC0_DEV_MODE"),
@@ -767,7 +1355,7 @@ void WalletPlugin::ensureSequencer()
 
     const QString bin = seqPath();
     appendLog(QStringLiteral("spawning sequencer: %1 --port %2").arg(bin).arg(port));
-    m_seqProc->start(bin, { QStringLiteral("--port"), QString::number(port), cfg });
+    startChild(*m_seqProc, bin, { QStringLiteral("--port"), QString::number(port), cfg });
     if (!m_seqProc->waitForStarted(3000)) {
         // Distinguish "no binary on disk" from "binary present but won't exec" - the UI
         // gives different advice for each (reinstall the module vs check the log/perms).
@@ -1053,8 +1641,14 @@ QString WalletPlugin::getSequencerConfig() const
     o[QStringLiteral("url")]     = s.value(QLatin1String(kSeqUrlKey)).toString();
     o[QStringLiteral("network")] = netId();
     o[QStringLiteral("port")]    = netPort();
-    o[QStringLiteral("seqPath")]    = s.value(QLatin1String(kSeqPathKey)).toString();
-    o[QStringLiteral("seqPathEff")] = seqPath();
+    // Same treatment as cliPath in getConfig(): the key is read HERE and nowhere else. An install
+    // poisoned before the override was removed still shows what was planted - the only visible
+    // trace it was ever there - and it is never executed, whatever it points at.
+    const QString storedSeq = s.value(QLatin1String(kSeqPathKey)).toString();
+    o[QStringLiteral("seqPath")]           = storedSeq;
+    o[QStringLiteral("seqPathEff")]        = seqPath();
+    o[QStringLiteral("seqPathIgnored")]    = !storedSeq.trimmed().isEmpty();
+    o[QStringLiteral("seqPathConfigurable")] = false;
     QFile f(walletHome() + QStringLiteral("/wallet_config.json"));
     if (f.open(QIODevice::ReadOnly))
         o[QStringLiteral("effectiveAddr")] =
@@ -1115,6 +1709,10 @@ void WalletPlugin::probeSeqHealthAsync(const QString& url)
     if (url.trimmed().isEmpty()) { m_lastSeqOk = false; return; }
     if (m_healthProbe && m_healthProbe->state() != QProcess::NotRunning)
         return;   // one probe at a time
+    // THE trigger surface of F1: this runs off a 10-second UI timer from app start, before any
+    // password exists, on every zone kind. It used to launch the bare name "curl".
+    const QString curl = curlPath();
+    if (curl.isEmpty()) { m_lastSeqOk = false; return; }
     if (m_healthProbe) { m_healthProbe->deleteLater(); m_healthProbe = nullptr; }
     m_healthProbe = new QProcess(this);
     QProcess* p = m_healthProbe;
@@ -1124,7 +1722,7 @@ void WalletPlugin::probeSeqHealthAsync(const QString& url)
             p->deleteLater();
             if (m_healthProbe == p) m_healthProbe = nullptr;
         });
-    p->start(QStringLiteral("curl"), {
+    startChild(*p, curl, {
         QStringLiteral("-s"), QStringLiteral("--max-time"), QStringLiteral("8"),
         QStringLiteral("-X"), QStringLiteral("POST"),
         QStringLiteral("-H"), QStringLiteral("content-type: application/json"),
@@ -1169,7 +1767,7 @@ void WalletPlugin::probeZoneCompatAsync()
             p->deleteLater();
             if (m_compatProbe == p) m_compatProbe = nullptr;
         });
-    p->start(cliPath(), { QStringLiteral("check-health") });
+    startChild(*p, cliPath(), { QStringLiteral("check-health") });
     if (!p->waitForStarted(3000)) {
         p->deleteLater();
         if (m_compatProbe == p) m_compatProbe = nullptr;
@@ -1305,7 +1903,8 @@ void WalletPlugin::fetchBalancesAsync()
             if (m_acctFetchProc == p) m_acctFetchProc = nullptr;
             p->deleteLater();
         });
-    p->start(cliPath(), { QStringLiteral("account"), QStringLiteral("list"), QStringLiteral("-l") });
+    startChild(*p, cliPath(), { QStringLiteral("account"), QStringLiteral("list"),
+                                QStringLiteral("-l") });
     if (p->waitForStarted(2000)) {
         p->write((m_password + QStringLiteral("\n")).toUtf8());
         p->closeWriteChannel();
@@ -1390,14 +1989,16 @@ QString WalletPlugin::getTokenRegistry()
     return runWalletCommand({ QStringLiteral("token-registry") }, 20000);
 }
 
-QString WalletPlugin::consolidateToken(const QString& accountId, const QString& definitionId)
+QString WalletPlugin::consolidateToken(const QString& accountId, const QString& definitionId,
+                                       const QString& password)
 {
     // WALLET-UI ONLY on-chain write (sweeps the user's own token ATAs into their vault).
     // NOT part of the Connect op surface (requestAction only dispatches send/shield/deshield/
-    // private, each user-approved) - do NOT add it there without an approval sheet. Requiring
-    // an unlocked wallet is the precondition gate: a locked wallet performs no writes.
-    if (m_password.isEmpty())
-        return errorJson(QStringLiteral("wallet is locked - unlock before consolidating"));
+    // private, each user-approved) - do NOT add it there without an approval sheet. The old
+    // "is the wallet unlocked" test was the file's only gate; it is now the full password gate,
+    // because unlocked-ness is not proof that this caller is the user.
+    if (!authorize(password))
+        return authRefusal();
     if (accountId.trimmed().isEmpty() || definitionId.trimmed().isEmpty())
         return errorJson(QStringLiteral("account and definitionId are required"));
     // Worst-case wrapper path on a slow zone: ATA read + ata send confirm + landing poll.
@@ -1580,7 +2181,7 @@ QString WalletPlugin::startSyncPrivate()
             if (m_syncProc == p) m_syncProc = nullptr;
             p->deleteLater();
         });
-    p->start(cliPath(), { QStringLiteral("account"), QStringLiteral("sync-private") });
+    startChild(*p, cliPath(), { QStringLiteral("account"), QStringLiteral("sync-private") });
     if (p->waitForStarted(2000)) {
         p->write((m_password + QStringLiteral("\n")).toUtf8());
         p->closeWriteChannel();
@@ -1715,8 +2316,13 @@ QString WalletPlugin::getTransactions(const QString& accountId)
 
 QString WalletPlugin::sendTransfer(const QString& from,
                                     const QString& to,
-                                    const QString& amount)
+                                    const QString& amount,
+                                    const QString& password)
 {
+    // The gate goes ahead of argument validation on every spend verb, so an unauthorised caller
+    // learns nothing from the shape of the error either.
+    if (!authorize(password))
+        return authRefusal();
     if (from.trimmed().isEmpty())
         return errorJson(QStringLiteral("from account is required"));
     if (to.trimmed().isEmpty())
@@ -1756,8 +2362,10 @@ QString WalletPlugin::sendTransfer(const QString& from,
 }
 
 QString WalletPlugin::startSendToken(const QString& from, const QString& to,
-                                     const QString& definitionId, const QString& amount)
+                                     const QString& definitionId, const QString& amount,
+                                     const QString& password)
 {
+    if (!authorize(password))             return authRefusal();
     if (from.trimmed().isEmpty())         return errorJson(QStringLiteral("from account is required"));
     if (to.trimmed().isEmpty())           return errorJson(QStringLiteral("to account is required"));
     if (definitionId.trimmed().isEmpty()) return errorJson(QStringLiteral("token is required"));
@@ -1771,8 +2379,9 @@ QString WalletPlugin::startSendToken(const QString& from, const QString& to,
 }
 
 QString WalletPlugin::startSendTransfer(const QString& from, const QString& to,
-                                        const QString& amount)
+                                        const QString& amount, const QString& password)
 {
+    if (!authorize(password))       return authRefusal();
     if (from.trimmed().isEmpty())   return errorJson(QStringLiteral("from account is required"));
     if (to.trimmed().isEmpty())     return errorJson(QStringLiteral("to account is required"));
     if (amount.trimmed().isEmpty()) return errorJson(QStringLiteral("amount is required"));
@@ -1793,6 +2402,8 @@ WalletPlugin::~WalletPlugin()
 {
     stopSequencer();   // don't orphan the child sequencer when the module unloads
     stopTor();         // and don't orphan the bundled Tor
+    if (m_idleLock)
+        m_idleLock->stop();   // no auto-lock callback while the plugin is unwinding
     if (QProcess* probe = m_compatProbe) {   // nor an in-flight `wallet check-health` compat probe
         m_compatProbe = nullptr;   // detach first: waitForFinished() below runs the finished
                                    // handler synchronously, and that handler nulls the member
@@ -1814,8 +2425,9 @@ WalletPlugin::~WalletPlugin()
 
 QString WalletPlugin::startShield(const QString& asset, const QString& from,
                                   const QString& to, const QString& amount,
-                                  const QString& definitionId)
+                                  const QString& definitionId, const QString& password)
 {
+    if (!authorize(password))       return authRefusal();
     if (from.trimmed().isEmpty())   return errorJson(QStringLiteral("from account is required"));
     if (to.trimmed().isEmpty())     return errorJson(QStringLiteral("to account is required"));
     if (amount.trimmed().isEmpty()) return errorJson(QStringLiteral("amount is required"));
@@ -1847,8 +2459,9 @@ QString WalletPlugin::startShield(const QString& asset, const QString& from,
 
 QString WalletPlugin::startDeshield(const QString& asset, const QString& from,
                                     const QString& to, const QString& amount,
-                                    const QString& definitionId)
+                                    const QString& definitionId, const QString& password)
 {
+    if (!authorize(password))       return authRefusal();
     if (from.trimmed().isEmpty())   return errorJson(QStringLiteral("from account is required"));
     if (to.trimmed().isEmpty())     return errorJson(QStringLiteral("to account is required"));
     if (amount.trimmed().isEmpty()) return errorJson(QStringLiteral("amount is required"));
@@ -1877,8 +2490,10 @@ QString WalletPlugin::startDeshield(const QString& asset, const QString& from,
 }
 
 QString WalletPlugin::startPrivateTransfer(const QString& asset, const QString& from,
-                                           const QString& to, const QString& amount)
+                                           const QString& to, const QString& amount,
+                                           const QString& password)
 {
+    if (!authorize(password))       return authRefusal();
     if (from.trimmed().isEmpty())   return errorJson(QStringLiteral("from account is required"));
     if (to.trimmed().isEmpty())     return errorJson(QStringLiteral("to account is required"));
     if (amount.trimmed().isEmpty()) return errorJson(QStringLiteral("amount is required"));
@@ -1900,8 +2515,12 @@ QString WalletPlugin::startPrivateTransfer(const QString& asset, const QString& 
 QString WalletPlugin::startPrivateTransferForeign(const QString& asset, const QString& from,
                                                   const QString& toNpk, const QString& toVpk,
                                                   const QString& toIdentifier,
-                                                  const QString& amount)
+                                                  const QString& amount,
+                                                  const QString& password)
 {
+    // Ungated this was the cleanest exfiltration primitive in the module: a real STARK proof
+    // paying an attacker-supplied foreign npk/vpk, private and unattributable.
+    if (!authorize(password))             return authRefusal();
     if (from.trimmed().isEmpty())         return errorJson(QStringLiteral("from account is required"));
     if (toNpk.trimmed().isEmpty())        return errorJson(QStringLiteral("recipient npk is required"));
     if (toVpk.trimmed().isEmpty())        return errorJson(QStringLiteral("recipient vpk is required"));
@@ -1990,7 +2609,9 @@ QString WalletPlugin::startPrivacyJob(const QString& op, const QString& asset,
     j->proc = proc;
     m_jobs.insert(jobId, j);
 
-    appendLog(QStringLiteral("%1 (%2): wallet %3").arg(op, j->asset, sendArgs.join(QLatin1Char(' '))));
+    // redactedArgs, not a raw join: this is the same log ring the synchronous runner redacts into,
+    // and it must not be the one place a future --password/--private-key call site leaks.
+    appendLog(QStringLiteral("%1 (%2): wallet %3").arg(op, j->asset, redactedArgs(sendArgs)));
 
     QObject::connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
                      this, [this, jobId](int code, QProcess::ExitStatus) {
@@ -2002,8 +2623,13 @@ QString WalletPlugin::startPrivacyJob(const QString& op, const QString& asset,
         Job* job = m_jobs.value(jobId, nullptr);
         if (!job || job->state != QStringLiteral("running")) return;
         job->state  = QStringLiteral("error");
+        // NOT "configure the path in settings": there is no such setting any more (see
+        // cliPath()). This is the async twin of the message in runWalletCommandInput, and it
+        // serves shield, deshield, private transfer, token send, plain send and the faucet - so
+        // it was the message most users would actually have seen.
         job->result = errorJson(QStringLiteral("wallet CLI not found: ") + bin
-                                + QStringLiteral(" - configure path in ⚙ settings"));
+                                + QStringLiteral(" - reinstall the medusa_core module, or set "
+                                                 "MEDUSA_WALLET_CLI before launching"));
         if (job->proc) { job->proc->deleteLater(); job->proc = nullptr; }
     });
 
@@ -2039,12 +2665,12 @@ QString WalletPlugin::startPrivacyJob(const QString& op, const QString& asset,
     // so it can't depend on inherited env.
     {
         const bool realProofs = (netId() != QStringLiteral("devnet"));
-        QProcessEnvironment penv = QProcessEnvironment::systemEnvironment();
+        QProcessEnvironment penv = childEnv();   // sanitised $PATH, then the proof mode on top
         penv.insert(QStringLiteral("RISC0_DEV_MODE"), realProofs ? QStringLiteral("0") : QStringLiteral("1"));
         proc->setProcessEnvironment(penv);
     }
 
-    proc->start(bin, sendArgs);
+    startChild(*proc, bin, sendArgs);
     // Feed the session password to the proof process's stdin (empty for plaintext
     // wallets), then close the channel so the CLI proceeds.
     if (proc->waitForStarted(3000)) {
@@ -2432,8 +3058,14 @@ QString WalletPlugin::requestAction(const QString& sessionId, const QString& act
     return QJsonDocument(o).toJson(QJsonDocument::Compact);
 }
 
-QString WalletPlugin::approveAction(const QString& requestId)
+QString WalletPlugin::approveAction(const QString& requestId, const QString& password)
 {
+    // Nothing here can tell the wallet UI from the dApp that raised the request, so without the
+    // password a module could run the whole chain against itself - connectRequest,
+    // approveConnect, requestAction, approveAction - and move funds with no window ever shown.
+    if (!authorize(password))
+        return authRefusal();
+
     ConnectRequest* r = m_requests.value(requestId.trimmed(), nullptr);
     if (!r || r->state != QStringLiteral("pending"))
         return errorJson(QStringLiteral("unknown or already-handled request"));
@@ -2453,21 +3085,24 @@ QString WalletPlugin::approveAction(const QString& requestId)
         return QJsonDocument(zo).toJson(QJsonDocument::Compact);
     }
 
-    // Dispatch to an EXISTING start* job - no new send/proof code (invariant §1).
+    // Dispatch to an EXISTING start* job - no new send/proof code (invariant §1). The gate was
+    // already satisfied above, so the dispatch re-presents the established password rather than
+    // duplicating each verb into a private ungated twin; if the wallet were locked, authorize()
+    // would have refused before reaching here.
     QString started;
     if (r->op == QStringLiteral("send")) {
         started = (r->asset == QStringLiteral("token"))
-                ? startSendToken(r->from, r->to, r->definitionId, r->amount)
-                : startSendTransfer(r->from, r->to, r->amount);
+                ? startSendToken(r->from, r->to, r->definitionId, r->amount, m_password)
+                : startSendTransfer(r->from, r->to, r->amount, m_password);
     } else if (r->op == QStringLiteral("shield")) {
-        started = startShield(r->asset, r->from, r->to, r->amount, r->definitionId);
+        started = startShield(r->asset, r->from, r->to, r->amount, r->definitionId, m_password);
     } else if (r->op == QStringLiteral("deshield")) {
-        started = startDeshield(r->asset, r->from, r->to, r->amount, r->definitionId);
+        started = startDeshield(r->asset, r->from, r->to, r->amount, r->definitionId, m_password);
     } else { // private
         started = r->to.isEmpty()
                 ? startPrivateTransferForeign(r->asset, r->from, r->toNpk, r->toVpk,
-                                              r->toIdentifier, r->amount)
-                : startPrivateTransfer(r->asset, r->from, r->to, r->amount);
+                                              r->toIdentifier, r->amount, m_password)
+                : startPrivateTransfer(r->asset, r->from, r->to, r->amount, m_password);
     }
 
     const QJsonObject so = QJsonDocument::fromJson(started.toUtf8()).object();
@@ -2567,8 +3202,20 @@ QString WalletPlugin::requestZone(const QString& sessionId, const QString& zoneJ
     return QJsonDocument(o).toJson(QJsonDocument::Compact);
 }
 
-QString WalletPlugin::approveZone(const QString& requestId)
+QString WalletPlugin::approveZone(const QString& requestId, const QString& password)
 {
+    // Gated exactly like approveAction, and for the same reason spelled with a different noun.
+    // approveAction was gated because leaving it open reopened every spend verb through
+    // connectRequest -> approveConnect -> requestAction -> approveAction; this is the identical
+    // chain one function along, ending in setActiveZone(attacker's sequencer) with the wallet
+    // LOCKED and nobody at the keyboard. A sequencer sees every public transaction, can censor
+    // them, and supplies every balance the UI renders, so a fake incoming balance is a working
+    // merchant scam and a missing one makes the user pay twice. The gate goes on the APPROVAL,
+    // not on zone selection: addZone/setActiveZone stay open because onboarding and the lock
+    // screen legitimately switch zones before there is any password to prove.
+    if (!authorize(password))
+        return authRefusal();
+
     ConnectRequest* r = m_requests.value(requestId.trimmed(), nullptr);
     if (!r || r->state != QStringLiteral("pending"))
         return errorJson(QStringLiteral("unknown or already-handled request"));
@@ -2710,16 +3357,136 @@ QString WalletPlugin::revokeSession(const QString& sessionId)
 
 // ── Wallet security: encrypted-storage unlock ───────────────────────────────────
 
-QString WalletPlugin::setSessionPassword(const QString& password)
+int WalletPlugin::idleLockMs()
 {
-    m_password = password;
-    appendLog(QStringLiteral("session password set"));
-    return okJson();
+    bool ok = false;
+    const int ms = qEnvironmentVariable("MEDUSA_IDLE_LOCK_MS").toInt(&ok);
+    if (!ok || ms < 100)   // a floor, so a typo can't turn the lock into a busy loop
+        return kIdleLockMs;
+    return ms;
+}
+
+void WalletPlugin::touchActivity()
+{
+    m_lastActivityMs = QDateTime::currentMSecsSinceEpoch();
+    if (m_password.isEmpty()) {          // nothing is being held - no timer needs to run
+        if (m_idleLock) m_idleLock->stop();
+        return;
+    }
+    if (!m_idleLock) {
+        m_idleLock = new QTimer(this);   // parented: destroyed with the plugin
+        m_idleLock->setSingleShot(true);
+        m_idleLock->setTimerType(Qt::VeryCoarseTimer);   // a lock clock needs no ms precision
+        QObject::connect(m_idleLock, &QTimer::timeout, this, [this]() {
+            // A real proof runs 20-40 minutes and the user is waiting on it, not away from the
+            // machine; locking underneath it would also leave the UI unable to refresh when it
+            // lands. An in-flight job therefore counts as activity.
+            for (auto it = m_jobs.constBegin(); it != m_jobs.constEnd(); ++it) {
+                if (it.value()->state == QStringLiteral("running")) {
+                    m_idleLock->start(idleLockMs());
+                    return;
+                }
+            }
+            if (m_password.isEmpty())
+                return;
+            clearSessionPassword();
+            appendLog(QStringLiteral("auto-locked after %1 ms idle").arg(idleLockMs()));
+        });
+    }
+    m_idleLock->start(idleLockMs());
+}
+
+// ── INVARIANT A: the one writer and the one clear ─────────────────────────────────────────────
+//
+// establishSession() below is the ONLY function in this file that assigns m_password, and
+// clearSessionPassword() is the ONLY one that clears it. Two greps state the whole rule:
+//
+//     grep -n "m_password = "       WalletPlugin.cpp   -> one line, inside establishSession()
+//     grep -n "m_password.clear()"  WalletPlugin.cpp   -> one line, inside clearSessionPassword()
+//
+// Round 1 deleted setSessionPassword, which was the front door. Round 2's rule ("a value unlock()
+// verified, or one the module just SEALED the store with") still had two side doors, because two
+// ungated verbs could cause a seal: encryptPlaintextWallet directly, and createEncryptedWallet
+// once an ungated resetWallet had removed the store that made it refuse. Both then handed the
+// caller a live session. The lesson is that "the store opens with this password" is only evidence
+// of who the caller is when the caller did NOT choose what the store was sealed with - so sealing
+// grants nothing here, and the two sealing verbs leave the wallet locked.
+
+QString WalletPlugin::establishSession(const QString& candidate)
+{
+    // No store: `account list` on an empty wallet home makes the CLI CREATE one, sealed with
+    // whatever password it was handed - so without this check unlock("anything") on a fresh
+    // install created a wallet and returned a live session for it. That is a credential-free mint
+    // through unlock() itself, and it is why this check comes before anything else.
+    if (!storageExists())
+        return errorJson(QStringLiteral("there is no wallet here to unlock - create or restore "
+                                        "one first"),
+                         QStringLiteral("no-wallet"));
+    // A plaintext store cannot verify anything: the CLI opens it with ANY password. Establishing
+    // a session against one would install a credential of the caller's choosing and, worse, would
+    // let the UI tell the user they are protected. The verbs still work there (see authorize());
+    // what is refused is the CLAIM.
+    if (storageIsPlaintext())
+        return errorJson(QStringLiteral("this wallet's storage is not encrypted - there is no "
+                                        "password to unlock; set one on it first"),
+                         QStringLiteral("unencrypted"));
+
+    // The backoff lives here rather than in unlock(), because every verb that can ask "does this
+    // password open the store?" is an unlock oracle by another name. resetWallet and restoreWallet
+    // both ask, and if they asked through their own code path they would be an unthrottled way to
+    // grind a password that unlock() throttles.
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (m_unlockRetryAtMs > now) {
+        QJsonObject o;
+        o[QStringLiteral("error")]  = QStringLiteral("too many failed unlock attempts - wait a moment");
+        o[QStringLiteral("reason")] = QStringLiteral("rate-limited");
+        o[QStringLiteral("retryAfterMs")] = m_unlockRetryAtMs - now;
+        return QJsonDocument(o).toJson(QJsonDocument::Compact);
+    }
+
+    // Probe with a LOCAL account list (no `-l` → no chain/balance fetch), so this is fast and
+    // works even when the active zone's sequencer is slow/unreachable (e.g. diaphani over Tor).
+    // A decryption failure still means the password was wrong. The candidate goes on the CLI's
+    // stdin EXPLICITLY: m_password is not touched until the store has opened, so a wrong guess
+    // cannot disturb a session that is already working.
+    const QString result = runWalletCommandInput({ QStringLiteral("account"), QStringLiteral("list") },
+                                                 candidate + QStringLiteral("\n"));
+    const QJsonObject o = QJsonDocument::fromJson(result.toUtf8()).object();
+    if (o.contains(QStringLiteral("error"))) {
+        const QString err = o.value(QStringLiteral("error")).toString();
+        if (err.contains(QStringLiteral("decrypt"), Qt::CaseInsensitive)
+            || err.contains(QStringLiteral("invalid password"), Qt::CaseInsensitive)) {
+            if (++m_unlockFails > kUnlockFreeAttempts) {
+                const int shift = qMin(m_unlockFails - kUnlockFreeAttempts - 1, 20);
+                const qint64 wait = qMin<qint64>(qint64(kUnlockBackoffBaseMs) << shift,
+                                                 kUnlockBackoffMaxMs);
+                m_unlockRetryAtMs = QDateTime::currentMSecsSinceEpoch() + wait;
+            }
+            return errorJson(QStringLiteral("invalid password"), QStringLiteral("unauthorized"));
+        }
+        return result;   // an unrelated failure (zone down, CLI missing) - not a wrong guess
+    }
+
+    m_password = candidate;   // ← THE ONLY ASSIGNMENT TO m_password IN THIS FILE
+    m_unlockFails = 0;
+    m_unlockRetryAtMs = 0;
+    touchActivity();
+    return result;            // the account list
 }
 
 QString WalletPlugin::clearSessionPassword()
 {
-    m_password.clear();
+    // The lock verb: deliberately ungated, since needing a password to lock would be absurd.
+    m_password.clear();   // ← THE ONLY CLEAR OF m_password IN THIS FILE
+    if (m_idleLock)
+        m_idleLock->stop();
+    // The log ring can hold truncated CLI output from before the redaction landed, and it has no
+    // reader, so nothing is lost by dropping it. Note what this does NOT do: QString::clear()
+    // returns the buffer to the allocator without zeroing it, and runWalletCommand builds a
+    // password + "\n" copy plus a toUtf8() copy on every call, so the plaintext can still be
+    // recovered from a core dump or a swapped-out page after a lock. Closing that needs a
+    // wiping string type end to end, not a clear() here.
+    m_log.clear();
     appendLog(QStringLiteral("session locked"));
     return okJson();
 }
@@ -2728,26 +3495,54 @@ QString WalletPlugin::getSecurityState() const
 {
     QJsonObject o;
     o[QStringLiteral("hasPassword")] = !m_password.isEmpty();
+    o[QStringLiteral("autoLockMs")]  = idleLockMs();
+    o[QStringLiteral("idleMs")]      = (m_password.isEmpty() || m_lastActivityMs == 0)
+        ? 0 : (QDateTime::currentMSecsSinceEpoch() - m_lastActivityMs);
+    // Say it out loud, in two fields the UI cannot misread. `unencrypted` is the fact; `protected`
+    // is the verdict, and it is FALSE on a plaintext store even when a password is held, because
+    // holding one there protects nothing. The gate does not refuse (see authorize()) - refusing
+    // would deny the attacker nothing, since the keys are in a file they can read, and would deny
+    // the owner their own wallet - so this field is where the honesty lives.
+    const bool plain = storageIsPlaintext();
+    o[QStringLiteral("unencrypted")] = plain;
+    o[QStringLiteral("protected")]   = !plain;
+    if (plain)
+        o[QStringLiteral("warning")] = QStringLiteral(
+            "this wallet's storage is NOT encrypted: every key in it can be read by any program "
+            "running as you, and no password can change that. Set a password on it to secure it.");
     return QJsonDocument(o).toJson(QJsonDocument::Compact);
 }
 
 QString WalletPlugin::unlock(const QString& password)
 {
-    m_password = password;
-    // Probe the password with a LOCAL account list (no `-l` → no chain/balance fetch), so
-    // unlock is fast and works even when the active zone's sequencer is slow/unreachable
-    // (e.g. diaphani over Tor). A decryption failure still means the password was wrong.
-    const QString result = runWalletCommand({ QStringLiteral("account"), QStringLiteral("list") });
-    const QJsonObject o = QJsonDocument::fromJson(result.toUtf8()).object();
-    if (o.contains(QStringLiteral("error"))) {
-        const QString err = o.value(QStringLiteral("error")).toString();
-        if (err.contains(QStringLiteral("decrypt"), Qt::CaseInsensitive)
-            || err.contains(QStringLiteral("invalid password"), Qt::CaseInsensitive)) {
-            m_password.clear();
-            return errorJson(QStringLiteral("invalid password"));
-        }
+    // The whole verb is establishSession(): the no-store, plaintext, backoff and verification
+    // rules all live there because resetWallet and restoreWallet need exactly the same ones, and
+    // a second copy of them is how a bypass gets built.
+    return establishSession(password);
+}
+
+// Defined further down with the other storage helpers; both sealing verbs need it to put a store
+// they could not make openable out of the user's way.
+static QString backupWalletStorage(const QString& storage, bool* failed);
+
+// A displaced-store path that is guaranteed not to exist yet. The aside/backup names are
+// second-granular, and the code used to REMOVE a colliding one ("a second call inside the same
+// second"). That falsified the guarantee the whole ungated reset/restore design rests on -
+// "nothing is deleted, the old store is always renamed aside" - and it was observable: two
+// backup-producing operations in the same wall-clock second and the first one's file, which could
+// be the user's only copy of an encrypted wallet, was gone. Nothing is removed here; a colliding
+// name gets a counter. "" only if a thousand copies already exist in the same second, and the
+// callers treat that as a failure rather than deleting anything.
+static QString uniqueAsidePath(const QString& base)
+{
+    if (!QFile::exists(base))
+        return base;
+    for (int n = 2; n < 1000; ++n) {
+        const QString cand = base + QStringLiteral("-%1").arg(n);
+        if (!QFile::exists(cand))
+            return cand;
     }
-    return result;   // the account list (or an unrelated error the UI surfaces)
+    return QString();
 }
 
 QString WalletPlugin::createEncryptedWallet(const QString& password)
@@ -2755,15 +3550,62 @@ QString WalletPlugin::createEncryptedWallet(const QString& password)
     if (password.trimmed().isEmpty())
         return errorJson(QStringLiteral("a non-empty password is required to encrypt the wallet"));
 
-    m_password = password;
+    // ONBOARDING ONLY. Ungated and with no existence check this was a one-call takeover of a
+    // legacy plaintext wallet: the CLI re-serialises the whole store on any write and seals it
+    // with whatever password it was handed, so a caller could re-encrypt the victim's own
+    // accounts under a password only the caller knew. The owner could no longer open the wallet,
+    // the caller could, and there was no way back - a plaintext store never held a mnemonic, so
+    // there is no phrase to restore from. Refuse whenever a store already exists. The legitimate
+    // case this used to cover, a plaintext user setting a password for the first time, is
+    // encryptPlaintextWallet(), which keeps a copy of what it re-seals.
+    if (storageIsPlaintext())
+        return errorJson(QStringLiteral("this wallet already exists and is not encrypted - "
+                                        "encrypt it (keeping its accounts) instead of "
+                                        "re-creating it"),
+                         QStringLiteral("wallet-not-encrypted"));
+    if (storageExists())
+        return errorJson(QStringLiteral("a wallet already exists here - unlock it, or reset / "
+                                        "restore before creating a new one"),
+                         QStringLiteral("wallet-exists"));
+
+    // The password goes to the CLI's stdin EXPLICITLY. It is deliberately not parked in
+    // m_password first: that is what made this verb a session mint after an ungated resetWallet
+    // had cleared the store out of its way (invariant A).
     // The first command on empty storage creates the (encrypted) wallet; creating a
     // public account is the natural trigger and yields a first usable account.
-    const QString result = runWalletCommand(
-        { QStringLiteral("account"), QStringLiteral("new"), QStringLiteral("public") }, 60000);
+    const QString result = runWalletCommandInput(
+        { QStringLiteral("account"), QStringLiteral("new"), QStringLiteral("public") },
+        password + QStringLiteral("\n"), 60000);
     const QJsonObject o = QJsonDocument::fromJson(result.toUtf8()).object();
-    if (o.contains(QStringLiteral("error"))) {
-        m_password.clear();
+    if (o.contains(QStringLiteral("error")))
         return result;
+    if (!storageExists())
+        return errorJson(QStringLiteral("the wallet CLI reported success but wrote no wallet at ")
+                             + storagePath(),
+                         QStringLiteral("not-created"));
+    if (storageIsPlaintext()) {
+        // The CLI reported success but wrote an unencrypted store (an engine built without
+        // encrypted storage would do exactly this). Never return {ok} here: the user would be
+        // told their wallet is password-protected while nothing protects it. The store is LEFT
+        // IN PLACE, not deleted - it holds a real key now - and getWalletState will report it as
+        // the unprotected wallet it is, which is a state the user can still act on.
+        return errorJson(QStringLiteral("the wallet CLI created an UNENCRYPTED store - this build "
+                                        "cannot password-protect a wallet"),
+                         QStringLiteral("not-encrypted"));
+    }
+
+    // Prove the store that was just written actually OPENS with the password the user chose,
+    // before telling them it is theirs. Then drop the session again: see below.
+    const QString probe = establishSession(password);
+    if (QJsonDocument::fromJson(probe.toUtf8()).object().contains(QStringLiteral("error"))) {
+        bool failed = false;
+        const QString aside = backupWalletStorage(storagePath(), &failed);
+        QJsonObject bad;
+        bad[QStringLiteral("error")]  = QStringLiteral("the wallet CLI sealed a store that will "
+            "not open with the password you chose - nothing was kept");
+        bad[QStringLiteral("reason")] = QStringLiteral("not-encrypted");
+        if (!aside.isEmpty()) bad[QStringLiteral("backup")] = aside;
+        return QJsonDocument(bad).toJson(QJsonDocument::Compact);
     }
 
     QJsonObject out;
@@ -2771,9 +3613,126 @@ QString WalletPlugin::createEncryptedWallet(const QString& password)
     enrichFromOutput(result, out);   // parses "account_id Public/<id>" from the text
     // (the account registers on-chain lazily on its first faucet claim - kept fast here)
     // Fetch the recovery phrase cleanly via export rather than scraping create output.
-    const QJsonObject mn = QJsonDocument::fromJson(exportMnemonic().toUtf8()).object();
+    const QJsonObject mn = QJsonDocument::fromJson(exportMnemonic(password).toUtf8()).object();
     if (mn.value(QStringLiteral("ok")).toBool())
         out[QStringLiteral("mnemonic")] = mn.value(QStringLiteral("mnemonic")).toString();
+
+    // CREATING A WALLET AND HOLDING ITS SESSION ARE SEPARATE CONCERNS (invariant A). The password
+    // just verified against this store is one the CALLER chose and the CALLER installed a moment
+    // ago, so "it opens" is not evidence about who the caller is - the only session provenance
+    // this module accepts is a password proved against a store the caller did not just write. The
+    // cost to a genuine first-run user is one unlock with the password they chose seconds ago,
+    // which is also a real confirmation that the store opens; the benefit is that no future verb
+    // that seals a store can ever be composed into a session mint again, which is exactly how
+    // rounds 1 and 2 were defeated. `locked` says so explicitly, so the UI never has to guess.
+    clearSessionPassword();
+    out[QStringLiteral("locked")] = true;
+    out[QStringLiteral("note")]   = QStringLiteral(
+        "unlock with the password you just chose to start using this wallet");
+    return QJsonDocument(out).toJson(QJsonDocument::Compact);
+}
+
+// Encrypt a legacy PLAINTEXT store in place, keeping its accounts. This is the half of the old
+// createEncryptedWallet that was legitimate, split out and named for what it is.
+//
+// It cannot demand a credential, and no version of it ever could: the store is plaintext, so
+// every key in it is already readable by anything running at this uid, and a co-resident module
+// can call this exactly as the user can. What IS guaranteed is that it is reversible - the
+// plaintext store is COPIED aside first (copied, not renamed: the CLI has to find it in place to
+// re-seal it), so a migration nobody asked for costs one file copy to undo instead of the wallet.
+// That is the same resolution resetWallet and restoreWallet already use for the same reason.
+QString WalletPlugin::encryptPlaintextWallet(const QString& password)
+{
+    if (password.trimmed().isEmpty())
+        return errorJson(QStringLiteral("a non-empty password is required to encrypt the wallet"));
+    if (!storageExists())
+        return errorJson(QStringLiteral("there is no wallet here to encrypt"),
+                         QStringLiteral("no-wallet"));
+    // A LIVE SESSION means unlock() verified a password against an ENCRYPTED store - it refuses
+    // plaintext ones - so this cannot be a genuine plaintext migration whatever the file header
+    // currently says. Refusing here removes the last way the coerced-plaintext reading that
+    // defeated round 3's authorize() could still reach a verb that REWRITES the store, and it
+    // costs the real plaintext user nothing: they never hold a session, because there is nothing
+    // for unlock() to verify. (Deciding on the session rather than on the file is the whole point:
+    // the file check below stays, but it can no longer be the only thing standing here.)
+    if (!m_password.isEmpty())
+        return errorJson(QStringLiteral("this wallet is unlocked, so it is already encrypted - "
+                                        "lock it first if you meant to work on a different store"),
+                         QStringLiteral("already-encrypted"));
+    if (!storageIsPlaintext())
+        return errorJson(QStringLiteral("this wallet is already encrypted"),
+                         QStringLiteral("already-encrypted"));
+
+    const QString storage = storagePath();
+    // Never overwrite an existing copy-aside: it may be the ONLY copy of a wallet (see
+    // uniqueAsidePath).
+    const QString backup = uniqueAsidePath(storage + QStringLiteral(".plain-")
+        + QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMdd-hhmmss")));
+    if (backup.isEmpty() || !QFile::copy(storage, backup))
+        return errorJson(QStringLiteral("could not copy the unencrypted wallet storage aside at ")
+                         + storage);
+
+    // Put the plaintext store back exactly as it was. Used on every failure path below: a
+    // migration that half-worked must never be the thing that takes the wallet away, and a
+    // plaintext store has no recovery phrase to fall back on.
+    auto rollback = [&]() {
+        if (!QFile::exists(backup)) return;
+        QFile::remove(storage);
+        QFile::copy(backup, storage);
+    };
+
+    // The password goes to the CLI's stdin explicitly - m_password is not touched (invariant A:
+    // this verb used to assign it directly, which made one ungated call enough to seize a legacy
+    // wallet AND hand the caller a full session on it).
+    // The save is the migration: every write path in the CLI calls store_persistent_data(),
+    // which re-serialises the whole store and seals it once the password is non-empty. Creating
+    // a public account is the same trigger createEncryptedWallet uses; it costs one fresh empty
+    // account, which is exactly why this is not folded back into that verb silently.
+    const QString result = runWalletCommandInput(
+        { QStringLiteral("account"), QStringLiteral("new"), QStringLiteral("public") },
+        password + QStringLiteral("\n"), 60000);
+    const QJsonObject o = QJsonDocument::fromJson(result.toUtf8()).object();
+    if (o.contains(QStringLiteral("error"))) {
+        rollback();
+        return result;
+    }
+    if (storageIsPlaintext()) {
+        // The CLI ran but the store is still plaintext. Never report success here: the user would
+        // be told they are protected while nothing protects them.
+        rollback();
+        return errorJson(QStringLiteral("the wallet CLI did not encrypt the store - it is still "
+                                        "unencrypted at ") + storage,
+                         QStringLiteral("not-encrypted"));
+    }
+
+    // MIGRATION MUST NOT LOCK THE OWNER OUT. A plaintext store holds no recovery phrase, so if
+    // the sealed store does not open with the password that sealed it there is nothing to restore
+    // from except the copy taken above - so check, and put the copy back if it does not.
+    const QString probe = establishSession(password);
+    if (QJsonDocument::fromJson(probe.toUtf8()).object().contains(QStringLiteral("error"))) {
+        rollback();
+        return errorJson(QStringLiteral("the wallet CLI sealed a store that will not open with "
+                                        "the password you chose - your unencrypted wallet has "
+                                        "been put back, unchanged"),
+                         QStringLiteral("not-encrypted"));
+    }
+    // Verified, and immediately given up: sealing a store is not proof of who asked for it
+    // (invariant A). The owner unlocks with the password they just chose.
+    clearSessionPassword();
+    appendLog(QStringLiteral("wallet encrypted - unencrypted copy kept at ") + backup);
+
+    QJsonObject out;
+    out[QStringLiteral("ok")]       = true;
+    out[QStringLiteral("migrated")] = true;
+    out[QStringLiteral("backup")]   = backup;
+    out[QStringLiteral("locked")]   = true;
+    enrichFromOutput(result, out);
+    // A plaintext store never carried a mnemonic, so the encrypted one cannot have one either.
+    // Say so here rather than letting the user find out when a backup prompt comes up empty.
+    out[QStringLiteral("mnemonic")] = QString();
+    out[QStringLiteral("note")]     = QStringLiteral(
+        "this wallet predates encrypted storage and has no recovery phrase - back it up by "
+        "exporting each account's private key. Unlock with the password you just chose.");
     return QJsonDocument(out).toJson(QJsonDocument::Compact);
 }
 
@@ -2789,47 +3748,192 @@ QString WalletPlugin::walletHome()
     return home;
 }
 
+QString WalletPlugin::storagePath()
+{
+    return walletHome() + QStringLiteral("/storage.json");
+}
+
+bool WalletPlugin::storageExists()
+{
+    return QFile::exists(storagePath());
+}
+
+bool WalletPlugin::storageIsPlaintext()
+{
+    // The encrypted envelope leads with {"v":…,"kdf":…,"ct":…}; plaintext storage leads with
+    // {"accounts":…}. The header is enough to tell. A store that exists but cannot be read, or
+    // is empty, counts as NOT encrypted: this decides whether a password can protect anything,
+    // and "unreadable" is not a reason to assume it can.
+    QFile f(storagePath());
+    if (!f.exists())
+        return false;                    // no store at all - nothing to mis-protect
+    if (!f.open(QIODevice::ReadOnly))
+        return true;
+    const QByteArray head = f.read(256);
+    return !(head.contains("\"kdf\"") || head.contains("\"ct\""));
+}
+
 QString WalletPlugin::getWalletState() const
 {
-    const QString storage = walletHome() + QStringLiteral("/storage.json");
     QJsonObject o;
-    const bool exists = QFile::exists(storage);
-    bool encrypted = false;
-    if (exists) {
-        QFile f(storage);
-        if (f.open(QIODevice::ReadOnly)) {
-            // The encrypted envelope leads with {"v":…,"kdf":…,"ct":…}; plaintext
-            // storage leads with {"accounts":…}. The header is enough to tell.
-            const QByteArray head = f.read(256);
-            encrypted = head.contains("\"kdf\"") || head.contains("\"ct\"");
-        }
-    }
+    const bool exists = storageExists();
     o[QStringLiteral("exists")]    = exists;
-    o[QStringLiteral("encrypted")] = encrypted;
+    o[QStringLiteral("encrypted")] = exists && !storageIsPlaintext();
     o[QStringLiteral("unlocked")]  = !m_password.isEmpty();
+    // Every store this module has ever moved aside (reset, restore) or copied aside (migration)
+    // is still on disk, and until now NOTHING reported that. "My wallet vanished and the reset
+    // link buried it deeper" was a real outcome of that silence, so the paths are listed here:
+    // displacing a store is reversible only if the user can find out that it happened.
+    QDir d(walletHome());
+    const QStringList aside = d.entryList({ QStringLiteral("storage.json.bak-*"),
+                                            QStringLiteral("storage.json.plain-*") },
+                                          QDir::Files, QDir::Name);
+    if (!aside.isEmpty()) {
+        QJsonArray arr;
+        for (const QString& f : aside) arr.append(d.filePath(f));
+        o[QStringLiteral("displacedStores")] = arr;
+    }
     return QJsonDocument(o).toJson(QJsonDocument::Compact);
 }
 
-QString WalletPlugin::resetWallet()
+// Move the current storage.json aside rather than letting it be deleted or overwritten. Both
+// destructive verbs have to stay usable while LOCKED (that is precisely the state the user who
+// forgot their password is in), so the only honest way to keep recovery open without leaving a
+// one-call wipe primitive is to make the destruction reversible. Returns the backup path, or ""
+// when there was nothing to move; *failed is set only when the rename itself failed.
+static QString backupWalletStorage(const QString& storage, bool* failed)
 {
-    // Removing storage.json lets the next setup create a brand-new wallet.
-    const QString storage = walletHome() + QStringLiteral("/storage.json");
-    if (QFile::exists(storage) && !QFile::remove(storage))
-        return errorJson(QStringLiteral("could not remove wallet storage at ") + storage);
+    if (failed) *failed = false;
+    if (!QFile::exists(storage))
+        return QString();
+    const QString backup = uniqueAsidePath(storage + QStringLiteral(".bak-")
+        + QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMdd-hhmmss")));
+    // NOTHING IS EVER REMOVED HERE. A colliding same-second name gets a counter instead: this
+    // function is the entire reason resetWallet and restoreWallet can stay usable while locked,
+    // and that argument is only true while displacement is reversible.
+    if (backup.isEmpty() || !QFile::rename(storage, backup)) {
+        if (failed) *failed = true;
+        return QString();
+    }
+    return backup;
+}
 
-    m_password.clear();
-    appendLog(QStringLiteral("wallet reset - storage removed"));
-    return okJson();
+QString WalletPlugin::resetWallet(const QString& password)
+{
+    // ── The rule, and why it is this rule ────────────────────────────────────────────────────
+    // Round 2 wrote `if (sessionIsProvable() && !authorize(password))`, and a hostile caller
+    // deleted the condition in one ungated call: clearSessionPassword() empties m_password, so
+    // sessionIsProvable() goes false and the gate is skipped. Keying a gate on a fact the caller
+    // controls is not a gate. So:
+    //
+    //  1. If a password is PRESENTED, it must be one the STORE accepts - checked by opening the
+    //     store on disk (establishSession), not by comparing against the in-memory session. That
+    //     is what makes clearSessionPassword() irrelevant here, and it shares unlock()'s backoff
+    //     so it is not a new password oracle.
+    //  2. If a SESSION IS LIVE and nothing is presented, refuse. The user has the password (the
+    //     UI is holding it); a caller that does not is not the user.
+    //  3. If the wallet is LOCKED and nothing is presented, PROCEED. This is the forgot-password
+    //     path and it is the entire reason the verb exists.
+    //
+    // Rule 3 is a deliberate, bounded residual, not an oversight. What it grants a hostile caller
+    // is displacing storage.json - and that is not a capability this module holds exclusively: a
+    // co-resident module runs at the same uid and can rename or overwrite that file itself, with
+    // no plugin, no verb and no gate. Gating it would therefore protect nothing and would cost
+    // the forgotten-password user the only door they have. What DOES matter is that displacing a
+    // store must not be composable into anything worse, and it no longer is: nothing is deleted
+    // (always renamed aside, and getWalletState now lists what was displaced), and creating a
+    // wallet in the freed slot grants no session (invariant A), which is what turned this verb
+    // into step 2 of a session mint in round 2.
+    //
+    // Round 4 amendment to rule 1: the decision of WHETHER to enforce is taken on the session,
+    // which lives in memory, before any question is asked about the file. It used to read
+    // `storeCanProvePassword() && …`, i.e. it asked storage.json whether to run the check at all,
+    // and the same coerced-plaintext reading that defeated authorize() (a re-wrapped store whose
+    // markers fall past byte 256) also turned this check off. What that bought an attacker was
+    // only displacement - which rule 3 hands to any caller anyway, and which rename(2) hands to
+    // them without this module - but a check that a file can switch off is not a check, and this
+    // one is now switched by the secret.
+    if (!m_password.isEmpty()) {
+        // A live session: the presented password must equal it. No file can turn this off.
+        if (!authorize(password))
+            return authRefusal();
+    } else if (!password.isEmpty() && storeCanProvePassword()) {
+        // No session, but a credential was presented: it must open the STORE (shared backoff, so
+        // this is not a second unthrottled oracle). On a store no password can be proved against
+        // there is nothing to check it with, and refusing would stand between the plaintext /
+        // forgotten-password user and their only escape - which rule 3 already leaves open to
+        // exactly the same caller, so nothing is gained by an attacker who forces this branch.
+        const QString probe = establishSession(password);
+        const QJsonObject po = QJsonDocument::fromJson(probe.toUtf8()).object();
+        if (po.contains(QStringLiteral("error")))
+            return probe;
+    }
+
+    const QString storage = walletHome() + QStringLiteral("/storage.json");
+    bool failed = false;
+    const QString backup = backupWalletStorage(storage, &failed);
+    if (failed)
+        return errorJson(QStringLiteral("could not move wallet storage aside at ") + storage);
+
+    clearSessionPassword();   // also drops the log ring and stops the idle timer
+    appendLog(backup.isEmpty() ? QStringLiteral("wallet reset - no storage to move")
+                               : QStringLiteral("wallet reset - storage moved to ") + backup);
+    QJsonObject o;
+    o[QStringLiteral("ok")] = true;
+    if (!backup.isEmpty())
+        o[QStringLiteral("backup")] = backup;
+    return QJsonDocument(o).toJson(QJsonDocument::Compact);
 }
 
 // ── Import / export ─────────────────────────────────────────────────────────────
 
-QString WalletPlugin::restoreWallet(const QString& phrase, const QString& password, int depth)
+QString WalletPlugin::restoreWallet(const QString& phrase, const QString& password, int depth,
+                                    const QString& sessionPassword)
 {
+    // Same shape as resetWallet, and the same reason. The CLI intercepts restore-keys BEFORE the
+    // store is loaded - it never decrypts the old one - so ungated this overwrote a locked
+    // victim's storage.json with no credential whatsoever. On the locked path the recovery
+    // phrase IS the credential (only the owner has it) and that path must stay open, because a
+    // user restoring after forgetting their password has no session password by definition. A
+    // live session still costs the password, and either way the outgoing store is moved aside
+    // first, so a restore nobody asked for is undoable.
+    //
+    // What the locked path must NOT do is hand the caller a session: `password` is whatever the
+    // caller chose, so sealing the new store with it and then keeping it in m_password made this
+    // ungated verb a way to install a session password of one's own choosing - the same mint that
+    // removing setSessionPassword closed - which then satisfied every gated verb. Only a caller
+    // that PROVED the live session gets the session carried over to the new password. A genuine
+    // recovery still works exactly as before: the store is rebuilt from the phrase and the user
+    // unlocks with the password they just chose.
+    //
+    // The proof is the same one resetWallet uses and for the same reason: presented credentials
+    // are checked against the STORE, so emptying the in-memory session first no longer turns the
+    // checked path into the unchecked one.
+    //
+    // Round 4 amendment, the same one resetWallet carries: whether a proof is REQUIRED is decided
+    // on the in-memory session, not on a predicate about storage.json that a co-resident module
+    // can flip.
+    bool proved = false;
+    if (!m_password.isEmpty()) {
+        if (!authorize(sessionPassword))
+            return authRefusal();
+        proved = true;
+    } else if (!sessionPassword.isEmpty() && storeCanProvePassword()) {
+        const QString probe = establishSession(sessionPassword);
+        if (QJsonDocument::fromJson(probe.toUtf8()).object().contains(QStringLiteral("error")))
+            return probe;
+        proved = true;
+    }
     if (phrase.trimmed().isEmpty())
         return errorJson(QStringLiteral("recovery phrase is required"));
     if (depth <= 0)
         depth = 5;
+
+    bool failed = false;
+    const QString backup = backupWalletStorage(walletHome() + QStringLiteral("/storage.json"),
+                                               &failed);
+    if (failed)
+        return errorJson(QStringLiteral("could not move the existing wallet storage aside"));
 
     appendLog(QStringLiteral("restore wallet (depth %1)").arg(depth));
     const QStringList args{ QStringLiteral("restore-keys"),
@@ -2838,14 +3942,46 @@ QString WalletPlugin::restoreWallet(const QString& phrase, const QString& passwo
     const QString stdinData = phrase.trimmed() + QStringLiteral("\n") + password + QStringLiteral("\n");
     const QString result = runWalletCommandInput(args, stdinData, 300000);  // derives + syncs
 
-    const QJsonObject o = QJsonDocument::fromJson(result.toUtf8()).object();
-    if (!o.contains(QStringLiteral("error")))
-        m_password = password;   // the restored store is now sealed with this password
-    return result;
+    const QJsonDocument doc = QJsonDocument::fromJson(result.toUtf8());
+    const QJsonObject o = doc.object();
+    if (o.contains(QStringLiteral("error"))) {
+        // A failed restore (a mistyped phrase is the usual one) must not leave the user with no
+        // wallet at all: if the CLI wrote nothing, put the store we moved aside back.
+        const QString storage = walletHome() + QStringLiteral("/storage.json");
+        if (!backup.isEmpty() && !QFile::exists(storage))
+            QFile::rename(backup, storage);
+        return result;
+    }
+
+    // Whatever was held before certainly does not open the store that was just written, so it is
+    // dropped either way and must never be mistaken for a session on the new store.
+    clearSessionPassword();
+    if (!doc.isObject())
+        return result;               // an array/scalar result: nothing to annotate
+    QJsonObject annotated = o;
+    if (proved) {
+        // The caller proved the OLD session, so carrying one over is legitimate - but it is
+        // carried the only way this module ever establishes a session: by opening the NEW store
+        // with the new password. If that fails the wallet simply stays locked; the store is
+        // there, and the user unlocks with the password they chose.
+        const QString probe = establishSession(password);
+        annotated[QStringLiteral("locked")] =
+            QJsonDocument::fromJson(probe.toUtf8()).object().contains(QStringLiteral("error"));
+    } else {
+        annotated[QStringLiteral("locked")] = true;
+    }
+    if (!backup.isEmpty())
+        annotated[QStringLiteral("backup")] = backup;   // where the replaced store went
+    return QJsonDocument(annotated).toJson(QJsonDocument::Compact);
 }
 
-QString WalletPlugin::exportMnemonic()
+QString WalletPlugin::exportMnemonic(const QString& password)
 {
+    // The 24 words are every account this wallet will ever hold, on every zone, forever - and
+    // unlike a balance they are not testnet-scoped. Nothing else in the module is worth as much.
+    if (!authorize(password))
+        return authRefusal();
+
     const QString result = runWalletCommand(
         { QStringLiteral("account"), QStringLiteral("export-mnemonic") });
     const QJsonObject o = QJsonDocument::fromJson(result.toUtf8()).object();
@@ -2858,8 +3994,10 @@ QString WalletPlugin::exportMnemonic()
     return QJsonDocument(out).toJson(QJsonDocument::Compact);
 }
 
-QString WalletPlugin::exportKey(const QString& accountId)
+QString WalletPlugin::exportKey(const QString& accountId, const QString& password)
 {
+    if (!authorize(password))
+        return authRefusal();
     if (accountId.trimmed().isEmpty())
         return errorJson(QStringLiteral("accountId is required"));
 
@@ -2884,12 +4022,23 @@ QString WalletPlugin::importKey(const QString& privateKey, const QString& label)
     if (privateKey.trimmed().isEmpty())
         return errorJson(QStringLiteral("private key is required"));
 
-    // Upstream has no `import-key`: it is `account import public --private-key <hex>`, which
-    // takes no --label, so a label is applied afterwards with `account label`.
-    const QString result = runWalletCommand({
-        QStringLiteral("account"), QStringLiteral("import"), QStringLiteral("public"),
-        QStringLiteral("--private-key"), privateKey.trimmed()
-    });
+    // Upstream has no `import-key`: it is `account import public`, which takes no --label, so a
+    // label is applied afterwards with `account label`.
+    //
+    // The key goes on STDIN, not argv. `--private-key <hex>` put a raw signing key on a
+    // world-readable /proc/<pid>/cmdline (two of them, since the wrapper re-execs argv verbatim)
+    // for the length of the import. Stdin line 1 is the password, which the CLI reads before
+    // dispatching any subcommand, so the key is line 2 - the same two-line convention
+    // restore-keys already uses for the recovery phrase.
+    //
+    // DEPENDENCY: this needs the CLI to accept the stdin form, which is
+    // wallet/patches-v020/0003-fix-wallet-take-the-imported-signing-key-on-stdin-no.patch plus
+    // the matching module/scripts/wallet-wrapper change. Against an engine built without that
+    // patch, clap rejects the missing --private-key and the import fails closed (no silent
+    // fallback to argv: that would put the key back on the command line).
+    const QString result = runWalletCommandInput(
+        { QStringLiteral("account"), QStringLiteral("import"), QStringLiteral("public") },
+        m_password + QStringLiteral("\n") + privateKey.trimmed() + QStringLiteral("\n"));
     const QJsonObject o = QJsonDocument::fromJson(result.toUtf8()).object();
     if (o.contains(QStringLiteral("error")))
         return result;
