@@ -72,6 +72,12 @@ Medusa.prototype.status = function (requestId) { return this._invoke("actionStat
 Medusa.prototype.session = function (sessionId) { return this._invoke("sessionInfo", [sessionId]); };
 
 // ── reads ────────────────────────────────────────────────────────────────────
+// HONEST NOTE ON sessionId: getBalance/getTokens/getJob take it for call-shape symmetry, but
+// the SDK DISCARDS it and the wallet-side verbs take no session at all: they answer any caller,
+// connected or not. A successful read is NOT evidence that your session is live, and the wallet
+// is not enforcing the "accounts" grant on them. Use isConnected(sessionId) to test liveness.
+// getAccounts is the exception: it really is session-scoped (it reads sessionInfo).
+//
 // Granted account ids for the session (needs the "accounts" permission, without it the wallet
 // returns an empty list). Returns { accounts: [...] } | { error }.
 Medusa.prototype.getAccounts = function (sessionId) {
@@ -79,7 +85,10 @@ Medusa.prototype.getAccounts = function (sessionId) {
     if (s && s.error) return s;
     return { accounts: (s && s.accounts) || [] };
 };
-// Public on-chain LEZ balance of an account → { balance, … } | { error }.
+// Public on-chain state of an account, as the wallet CLI prints it, wrapped:
+// { ok: true, output: "<raw account-get text>" } | { error }. There is NO `balance` key at the
+// top level: `output` is an "Account owned by …" line followed by the account JSON line
+// ({"balance":…,"program_owner":…,"data":…,"nonce":…}), or "Account is Uninitialized".
 Medusa.prototype.getBalance = function (sessionId, accountId) { return this._invoke("getBalance", [accountId]); };
 // Token holdings of an account → [{ definitionId, ticker, balance }] | { error }.
 Medusa.prototype.getTokens = function (sessionId, accountId) { return this._invoke("getTokens", [accountId]); };

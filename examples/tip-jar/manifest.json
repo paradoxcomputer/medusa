@@ -8,6 +8,6 @@
   "manifestVersion": "0.2.0",
   "name": "tip_jar",
   "type": "ui_qml",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "view": "qml/Main.qml"
 }

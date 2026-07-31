@@ -1,6 +1,6 @@
 {
   "name": "tip_jar",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "ui_qml",
   "category": "blockchain",
   "description": "Tip Jar: a Connect-with-Medusa SDK demo (connect + tip)",

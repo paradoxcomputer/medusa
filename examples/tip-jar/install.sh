@@ -9,6 +9,17 @@ SDK="$REPO/sdk/medusa-connect.js"
 
 [[ -f "$SDK" ]] || { echo "!! missing SDK at $SDK"; exit 1; }
 
+# The vendored copy under qml/ is what the .lgx ships; $SDK is what npm ships. They drifted once
+# (fixed in a8971c4) and the two install routes then delivered different bytes. Fail loudly here
+# rather than let it happen silently again: resync with `cp "$SDK" "$VENDORED"`.
+VENDORED="$HERE/qml/medusa-connect.js"
+if ! cmp -s "$SDK" "$VENDORED"; then
+    echo "!! SDK DRIFT: $VENDORED differs from the canonical $SDK"
+    echo "   fix with:  cp '$SDK' '$VENDORED'"
+    diff -u "$SDK" "$VENDORED" | head -40 || true
+    exit 1
+fi
+
 ROOTS=()
 [[ -n "${BASECAMP_DATA:-}" ]] && ROOTS+=("$BASECAMP_DATA")
 ROOTS+=("$HOME/.local/share/Logos/LogosBasecamp" "$HOME/.local/share/Logos/LogosBasecampDev")

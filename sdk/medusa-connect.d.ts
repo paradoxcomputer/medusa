@@ -36,7 +36,8 @@ export interface StatusResult {
   jobId?: string;
   /** Present when an APPROVED zone request resolves, the active/added zone id. */
   zoneId?: string;
-  /** Set when rejected, includes "approval timed out" if the request expired (TTL). */
+  /** Set when rejected, includes "approval timed out" if the request expired. The TTL is
+   *  15 minutes (`kReqTtlMs`), applied when you poll, so keep polling that long. */
   error?: string;
 }
 
@@ -66,13 +67,17 @@ export interface SessionInfo {
 }
 
 export interface AccountsResult { accounts?: string[]; error?: string; }
-export interface BalanceResult { balance?: number | string; error?: string; [k: string]: unknown; }
+/** What `getBalance` actually returns: the wallet wraps the CLI's free-text `account get`
+ *  output. There is NO top-level `balance` field. `output` is an "Account owned by …" line
+ *  followed by the account JSON line (`{"balance":…,"program_owner":…,"data":…,"nonce":…}`),
+ *  or the single line "Account is Uninitialized". Parse the balance out of `output` yourself. */
+export interface BalanceResult { ok?: boolean; output?: string; error?: string; [k: string]: unknown; }
 export interface TokenHolding {
   definitionId: string;
   ticker: string;
   /** ATA balance + vault balance combined (what the wallet can actually spend). */
   balance: string;
-  /** Portion in the owner's associated token account, NOT shieldable on rc5. */
+  /** Portion in the owner's associated token account, NOT shieldable on LEZ v0.2.0. */
   ataBalance?: string;
   /** Portion in the wallet's direct vault holding, the shieldable part. */
   vaultBalance?: string;
@@ -118,20 +123,25 @@ export declare class Medusa {
   status(requestId: string): StatusResult;
   /** Session details once connected. */
   session(sessionId: string): SessionInfo;
-  /** Granted account ids for the session (needs the "accounts" permission; else empty). */
+  /** Granted account ids for the session (needs the "accounts" permission; else empty).
+   *  The only genuinely session-scoped read: it goes through sessionInfo. */
   getAccounts(sessionId: string): AccountsResult;
-  /** Public on-chain balance of an account. */
+  /** Public on-chain state of an account. `sessionId` is ACCEPTED AND DISCARDED, see the note
+   *  above `getBalance` in medusa-connect.js: the wallet verb takes no session and answers any
+   *  caller. Returns `{ ok, output }`, not `{ balance }`. */
   getBalance(sessionId: string, accountId: string): BalanceResult;
-  /** Token holdings of an account. */
+  /** Token holdings of an account. `sessionId` is ACCEPTED AND DISCARDED (ungated wallet-side). */
   getTokens(sessionId: string, accountId: string): TokenHolding[] | { error: string };
-  /** Resolve a jobId from an approved action; poll until state !== "running" for the txId. */
+  /** Resolve a jobId from an approved action; poll until state !== "running" for the txId.
+   *  `sessionId` is ACCEPTED AND DISCARDED (ungated wallet-side), so any caller that knows a
+   *  jobId can read it, including one that did not raise the action. */
   getJob(sessionId: string, jobId: string): JobResult;
   /** True while the session is still live; poll to detect disconnect. */
   isConnected(sessionId: string): boolean;
   /** Submit a transfer for approval. Op auto-derived from the from/to prefixes when omitted. */
   send(sessionId: string, action: Action): ActionRequestResult;
   /** send() with op pinned to "shield" (public → private). Token asset: requires
-   *  definitionId, and on LEZ v0.2.0-rc5 only DIRECT-owned holdings (e.g. a token the
+   *  definitionId, and on LEZ v0.2.0 only DIRECT-owned holdings (e.g. a token the
    *  user minted, or the wallet's vault) can source it, ATA balances cannot shield. */
   shield(sessionId: string, action: Action): ActionRequestResult;
   /** send() with op pinned to "deshield" (private → public). Token asset: requires
