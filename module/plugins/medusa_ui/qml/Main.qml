@@ -661,6 +661,19 @@ Rectangle {
         root.seqLogPath     = (s && s.logPath) ? s.logPath : ""
         root.seqExitCode    = (s && s.exitCode !== undefined) ? s.exitCode : 0
         root.seqEndpoint    = (s && s.endpoint) ? s.endpoint : ""
+        // The ACTIVE zone's port, so netExpectedDial can name the loopback address a local or
+        // Tor zone is supposed to dial instead of accepting any 127.0.0.1:<anything>.
+        root.seqDialPort    = (s && s.port) ? s.port : 0
+        // Watch the address the wallet actually dials, so the approval sheets can say "this
+        // moved N minutes ago". The FIRST observation of a session is not a change.
+        if (root.seqEndpoint !== "") {
+            if (root.netDialSeen === "") root.netDialSeen = root.seqEndpoint
+            else if (root.netDialSeen !== root.seqEndpoint) {
+                root.netDialSeen      = root.seqEndpoint
+                root.netDialChangedAt = Date.now()
+            }
+        }
+        root.netTick = root.netTick + 1   // ages netChangedRecently / netChangedAgo()
         // Only accept a real verdict: "unknown" must not erase a mismatch learned from an
         // op error (the plugin re-probes lazily). Zone switches reset this explicitly.
         if (s && (s.compat === "ok" || s.compat === "mismatch")) root.zoneCompat = s.compat
@@ -738,6 +751,164 @@ Rectangle {
                 return root.zones[i].endpoint
         return root.seqEndpoint
     }
+
+    // ── Operating-network disclosure for the Connect approval surfaces ─────────
+    // RESIDUAL RISK THIS CLOSES. Keys and signing are local and stay local, but any program
+    // running as the user can rewrite ~/.medusa/wallet_config.json's `sequencer_addr` and
+    // repoint the wallet at its own sequencer. Nothing is stolen by that write; instead every
+    // balance the UI renders and every transaction the wallet broadcasts belong to whoever
+    // owns that address - a fake incoming balance is a working merchant scam, and a censored
+    // outgoing one makes the user pay twice. There is no way to PREVENT the write from inside
+    // the UI, so the mitigation is disclosure at the only moment it matters: whenever the
+    // wallet is about to act because the SDK asked it to, it names the network it will act on,
+    // ADDRESS FIRST. The name is what a repoint keeps; the address is what it changes.
+    //
+    // SOURCING RULE (the whole point - a spoofable banner is worse than none):
+    // every value below comes back from medusa_core, either getZones() (the wallet's own zone
+    // list + its own active-zone id) or getSequencerStatus() (which re-reads sequencer_addr
+    // off disk on every poll). NOTHING here reads root.pendingConn, so a dApp contributes no
+    // input to any of it. The zone sheet does pass the dApp's PROPOSED address into
+    // knownZoneFor()/zoneReqIsCurrent(), but those return the WALLET's verdict about it,
+    // never the dApp's own string.
+
+    property int    seqDialPort:      0     // netPort() for the ACTIVE zone (from getSequencerStatus)
+    property int    netTick:          0     // bumped every status poll: gives the time-based
+                                            // bindings below a dependency that actually moves
+    property string netDialSeen:      ""    // last dialled address this session has observed
+    property real   netDialChangedAt: 0     // ms epoch of the last CHANGE ("" -> x is not a change)
+
+    // The zone record the wallet is actually on (plugin's list, plugin's active id).
+    function activeZoneObj() {
+        for (var i = 0; i < root.zones.length; i++)
+            if (root.zones[i].id === root.network) return root.zones[i]
+        return null
+    }
+    // Compare two endpoints the way applySequencer()/addZone() write them: trim, case-fold,
+    // default a missing scheme to http (addZone does exactly this), ignore a trailing slash.
+    // Deliberately FORGIVING - a false "repointed" on an ordinary tip is precisely the alarm
+    // fatigue this surface exists to avoid.
+    function sameEndpoint(a, b) {
+        var norm = function(s) {
+            var t = String(s || "").trim().toLowerCase()
+            if (t === "") return ""
+            if (t.indexOf("://") < 0) t = "http://" + t
+            while (t.length > 1 && t.charAt(t.length - 1) === "/") t = t.slice(0, -1)
+            return t
+        }
+        var x = norm(a)
+        return x !== "" && x === norm(b)
+    }
+    // What the ACTIVE zone's own record says this wallet ought to be dialling:
+    //   local zone, or ANY Tor zone -> the loopback sequencer / tunnel entrance on the zone's
+    //                                  port (the .onion is reached THROUGH it, so the address
+    //                                  actually dialled is loopback, by design)
+    //   remote clearnet             -> the zone's URL, verbatim
+    // "" means "not established yet" (zones not loaded, port unknown) and deliberately
+    // suppresses the repoint verdict rather than guessing.
+    readonly property string netExpectedDial: {
+        var z = root.activeZoneObj()
+        if (!z) return ""
+        if (z.kind === "local-standalone" || z.kind === "local-l1-tor" || z.tor === true)
+            return root.seqDialPort > 0 ? "http://127.0.0.1:" + root.seqDialPort + "/" : ""
+        return z.endpoint || ""
+    }
+    // The address the wallet ACTUALLY dials. getSequencerStatus() reads this straight back out
+    // of wallet_config.json on every poll, so if anything tampered with that file, THIS is the
+    // tampered value - which is exactly why it is the one compared and the one printed.
+    readonly property string netActualDial: root.seqEndpoint
+    // The address to PRINT as the network's identity. For a Tor zone the loopback forwarder is
+    // an implementation detail and the .onion is the identity, so print the .onion; for every
+    // other zone the identity IS the dialled address.
+    readonly property string netShownAddr: {
+        var z = root.activeZoneObj()
+        if (z && z.tor === true && z.endpoint) return z.endpoint
+        return root.netActualDial !== "" ? root.netActualDial : root.zoneEndpointDesc()
+    }
+    // THE repoint tell: the address on disk is not the one this zone declares.
+    readonly property bool netRepointed: root.netExpectedDial !== "" && root.netActualDial !== ""
+                                         && !root.sameEndpoint(root.netExpectedDial, root.netActualDial)
+    // Did the dialled address move recently? The first observation of a session is NOT a change
+    // (the wallet has to start somewhere); every later one is timestamped in refreshSeqStatus().
+    readonly property bool netChangedRecently: {
+        var t = root.netTick    // dependency: re-evaluate on every status poll so this expires
+        return t >= 0 && root.netDialChangedAt > 0
+               && (Date.now() - root.netDialChangedAt) < 600000   // 10 min
+    }
+    function netChangedAgo() {
+        var t = root.netTick    // same dependency, so the wording ages with the clock
+        if (t < 0 || root.netDialChangedAt <= 0) return ""
+        var m = Math.floor((Date.now() - root.netDialChangedAt) / 60000)
+        return m <= 0 ? "just now" : (m === 1 ? "1 minute ago" : m + " minutes ago")
+    }
+    // Severity for the banner, worst first. "" keeps the sheet CALM, and that is a feature:
+    // a warning that fires on every ordinary tip is a warning nobody reads. Note "starting"
+    // (the async health probe still in flight) is NOT an alert - it renders as "checking…".
+    //   repoint  - the address on disk is not the one this zone declares   (the attack)
+    //   mismatch - the zone answers but runs a different LEZ build         (compat probe)
+    //   offline  - the zone does not answer at all                         (health probe)
+    //   changed  - the dialled address moved within the last 10 minutes    (recency)
+    readonly property string netAlert: {
+        if (root.netRepointed)                return "repoint"
+        if (root.zoneCompat === "mismatch")   return "mismatch"
+        if (root.seqStatus === "unreachable") return "offline"
+        if (root.netChangedRecently)          return "changed"
+        return ""
+    }
+    // Only the repoint gets the error colour; the rest reuse the file's existing amber-warning
+    // treatment (errorTint fill + amber rule), the same pairing as the "not encrypted" banner.
+    readonly property color netAlertColor: root.netAlert === "repoint" ? root.errorRed
+                                         : root.netAlert === ""        ? root.borderColor
+                                                                       : root.warningAmber
+    function netAlertTitle() {
+        if (root.netAlert === "repoint")  return "This is not the address this network should have"
+        if (root.netAlert === "mismatch") return "This network runs a different build"
+        if (root.netAlert === "offline")  return "This network is not answering"
+        if (root.netAlert === "changed")  return "This network changed " + root.netChangedAgo()
+        return ""
+    }
+    function netAlertBody() {
+        if (root.netAlert === "repoint")
+            return "Something rewrote this wallet's sequencer address. Balances and any "
+                 + "broadcast would go to the address below, not to the zone you picked. "
+                 + "Reject this, then re-select the zone under Network."
+        if (root.netAlert === "mismatch")
+            return "Its program ids differ from this wallet's, so this would fail on-chain. "
+                 + "Update the Medusa module or switch zone."
+        if (root.netAlert === "offline")
+            return "The wallet cannot confirm this address is live, so it cannot confirm "
+                 + "what it would be acting on."
+        if (root.netAlert === "changed")
+            return "If you did not switch networks yourself, reject this and check Network."
+        return ""
+    }
+    // A zone NAME is only as trustworthy as whoever added the zone. Built-in names are the
+    // wallet's own; a user zone's name is free text, and approveZone() names an auto-added
+    // zone after the dApp's own `label`. So a dApp that once got a zone request approved can
+    // have put the string "Paradox Computer · clearnet" into this list. That is exactly why
+    // the ADDRESS is the load-bearing line on every sheet and the name is only a label - and
+    // why a non-builtin active zone is tagged "custom" wherever its name is shown.
+    readonly property bool activeZoneIsCustom: {
+        var z = root.activeZoneObj()
+        return z !== null && z.builtin !== true
+    }
+    // Does the wallet ALREADY know an endpoint? Mirrors approveZone()'s reuse rule (same
+    // transport AND same endpoint), so the answer describes what the core would really do.
+    // Returns the zone RECORD (callers need .name and .builtin), or null for a new network.
+    function knownZoneFor(endpoint, tor) {
+        for (var i = 0; i < root.zones.length; i++) {
+            var z = root.zones[i]
+            if (!z.endpoint || (z.tor === true) !== (tor === true)) continue
+            if (root.sameEndpoint(z.endpoint, endpoint)) return z
+        }
+        return null
+    }
+    // Would approving a zone request actually change the network, or is it a no-op?
+    function zoneReqIsCurrent(endpoint, tor) {
+        var z = root.activeZoneObj()
+        if (!z || (z.tor === true) !== (tor === true)) return false
+        return root.sameEndpoint(z.endpoint || root.netActualDial, endpoint)
+    }
+
     function seqProblemTitle() {
         return root.seqProblem === "mismatch" ? "Zone build mismatch" : "Local sequencer not running"
     }
@@ -4663,17 +4834,122 @@ Rectangle {
                     }
                     ColumnLayout {
                         Layout.fillWidth: true; spacing: 1
+                        // dApp-CONTROLLED STRING, rendered in the wallet's own title style, so
+                        // it is hard-clamped to ONE line. connectRequest() only trims appName -
+                        // it has no length or newline limit - and Text honours embedded "\n"
+                        // even with wrapMode NoWrap, so without maximumLineCount an appName of
+                        // "Tip Jar\nNetwork: Paradox Computer · clearnet\nhttps://…" would paint
+                        // extra lines in 15px bold textPrimary right above the network card and
+                        // read as the wallet's own statement of the network.
                         Text {
                             Layout.fillWidth: true
                             text: connectSheet.req && connectSheet.req.app
                                   ? (connectSheet.req.app.appName || "An app") : "An app"
                             color: root.textPrimary; font.family: root.faceFont
-                            font.pixelSize: 15; font.bold: true; elide: Text.ElideRight
+                            font.pixelSize: 15; font.bold: true
+                            maximumLineCount: 1; elide: Text.ElideRight
                         }
                         Text {
                             Layout.fillWidth: true
                             text: "wants to connect to your wallet"
                             color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 11
+                        }
+                    }
+                }
+
+                // ── Operating network (see the disclosure block above refreshSeqStatus) ──
+                // WALLET-OWNED FACTS ONLY: name, address, health and alert verdict all come
+                // back from medusa_core; connectSheet.req contributes nothing. Placed directly
+                // under the app header rather than next to the CTA because the account picker
+                // below is unbounded in length - this must not be pushed out of sight by a
+                // wallet with many accounts. It also states the zone the session is minted
+                // against (approveConnect stamps the session with the ACTIVE zone).
+                Rectangle {
+                    Layout.fillWidth: true; radius: 10
+                    color: root.netAlert === "" ? root.inputBg : root.errorTint
+                    border.color: root.netAlertColor; border.width: 1
+                    implicitHeight: connNetCol.implicitHeight + 20
+                    ColumnLayout {
+                        id: connNetCol
+                        anchors { left: parent.left; right: parent.right; top: parent.top; margins: 10 }
+                        spacing: 4
+                        RowLayout {
+                            Layout.fillWidth: true; spacing: 6
+                            Rectangle {
+                                Layout.preferredWidth: 8; Layout.preferredHeight: 8; radius: 4
+                                Layout.alignment: Qt.AlignVCenter
+                                color: root.seqStatus === "running"  ? root.greenBright
+                                     : root.seqStatus === "starting" ? root.connectGray : root.errorRed
+                            }
+                            Text {
+                                text: "CONNECTING YOU ON"
+                                color: root.textSecondary; font.family: root.faceFont
+                                font.pixelSize: 10; font.letterSpacing: 1
+                            }
+                            Item { Layout.fillWidth: true }
+                            Text {
+                                visible: root.seqStatus === "starting"
+                                text: "checking…"; color: root.textDisabled
+                                font.family: root.faceFont; font.pixelSize: 9
+                            }
+                        }
+                        // Name line, clamped + "custom"-tagged (see the action sheet's copy).
+                        RowLayout {
+                            Layout.fillWidth: true; spacing: 6
+                            Text {
+                                Layout.fillWidth: true
+                                text: root.zoneName(root.network)
+                                color: root.textPrimary; font.family: root.faceFont
+                                font.pixelSize: 12; font.bold: true
+                                maximumLineCount: 1; elide: Text.ElideRight
+                            }
+                            Text {
+                                visible: root.activeZoneIsCustom
+                                text: "custom"; color: root.textDisabled
+                                font.family: root.faceFont; font.pixelSize: 9
+                            }
+                        }
+                        // Load-bearing: WRAPPED, never elided (see the action sheet's copy).
+                        Text {
+                            Layout.fillWidth: true; visible: text.length > 0
+                            text: root.netShownAddr
+                            color: root.textSecondary; font.family: root.monoFont
+                            font.pixelSize: 10; wrapMode: Text.WrapAnywhere
+                        }
+                        RowLayout {
+                            visible: root.netAlert !== ""
+                            Layout.fillWidth: true; Layout.topMargin: 2; spacing: 6
+                            Text { text: "⚠"; color: root.netAlertColor; font.pixelSize: 12
+                                   Layout.alignment: Qt.AlignTop }
+                            ColumnLayout {
+                                Layout.fillWidth: true; spacing: 1
+                                Text {
+                                    Layout.fillWidth: true; text: root.netAlertTitle()
+                                    color: root.netAlertColor; font.family: root.faceFont
+                                    font.pixelSize: 10; font.bold: true
+                                    wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                                }
+                                Text {
+                                    Layout.fillWidth: true; text: root.netAlertBody()
+                                    color: root.textSecondary; font.family: root.faceFont
+                                    font.pixelSize: 9; wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                                }
+                                ColumnLayout {
+                                    visible: root.netAlert === "repoint"
+                                    Layout.fillWidth: true; Layout.topMargin: 3; spacing: 1
+                                    Text { text: "configured for this zone"; color: root.textDisabled
+                                           font.family: root.faceFont; font.pixelSize: 9 }
+                                    Text { Layout.fillWidth: true; text: root.netExpectedDial
+                                           color: root.textSecondary; font.family: root.monoFont
+                                           font.pixelSize: 9; wrapMode: Text.WrapAnywhere }
+                                    Text { text: "actually dialling"; color: root.textDisabled
+                                           font.family: root.faceFont; font.pixelSize: 9
+                                           Layout.topMargin: 2 }
+                                    Text { Layout.fillWidth: true; text: root.netActualDial
+                                           color: root.errorRed; font.family: root.monoFont
+                                           font.pixelSize: 9; wrapMode: Text.WrapAnywhere }
+                                }
+                            }
                         }
                     }
                 }
@@ -4883,7 +5159,9 @@ Rectangle {
         Rectangle {
             anchors.centerIn: parent
             width: Math.min(root.width - 40, 380)
-            height: actionCol.implicitHeight + 32
+            // Clamped like connectSheet/zoneOfflineSheet: the network card can grow this sheet
+            // (a wrapped .onion is two lines), and a sheet taller than the window has no CTA.
+            height: Math.min(root.height - 40, actionCol.implicitHeight + 32)
             radius: root.rSheet
             color: root.surface2; border.color: root.borderStrong; border.width: 1
             // Deeper elevation for the floating modal (autoPadding stops the shadow clipping).
@@ -4960,6 +5238,110 @@ Rectangle {
                             Item { Layout.fillWidth: true }
                             Text { text: actionSheet.req ? (actionSheet.req.op || "send") : ""
                                    color: root.silver; font.family: root.faceFont; font.pixelSize: 11 }
+                        }
+                    }
+                }
+
+                // ── Operating network (see the disclosure block above refreshSeqStatus) ──
+                // WALLET-OWNED FACTS ONLY: name, address, health and the alert verdict all
+                // come back from medusa_core. actionSheet.req contributes NOTHING here, so a
+                // dApp cannot influence a single character of this card. It sits directly
+                // above the CTA because it is the last thing that should be read before
+                // approving: what -> where -> approve.
+                Rectangle {
+                    Layout.fillWidth: true; radius: 10
+                    color: root.netAlert === "" ? root.inputBg : root.errorTint
+                    border.color: root.netAlertColor; border.width: 1
+                    implicitHeight: actNetCol.implicitHeight + 20
+                    ColumnLayout {
+                        id: actNetCol
+                        anchors { left: parent.left; right: parent.right; top: parent.top; margins: 10 }
+                        spacing: 4
+                        RowLayout {
+                            Layout.fillWidth: true; spacing: 6
+                            Rectangle {
+                                Layout.preferredWidth: 8; Layout.preferredHeight: 8; radius: 4
+                                Layout.alignment: Qt.AlignVCenter
+                                color: root.seqStatus === "running"  ? root.greenBright
+                                     : root.seqStatus === "starting" ? root.connectGray : root.errorRed
+                            }
+                            Text {
+                                text: "NETWORK THIS RUNS ON"
+                                color: root.textSecondary; font.family: root.faceFont
+                                font.pixelSize: 10; font.letterSpacing: 1
+                            }
+                            Item { Layout.fillWidth: true }
+                            Text {
+                                visible: root.seqStatus === "starting"
+                                text: "checking…"; color: root.textDisabled
+                                font.family: root.faceFont; font.pixelSize: 9
+                            }
+                        }
+                        // Name line. Clamped to ONE line: a custom zone's name is free text
+                        // (see activeZoneIsCustom) and Text renders embedded newlines even
+                        // with NoWrap, so an unclamped name could paint extra wallet-styled
+                        // lines. The "custom" tag says the name is not one of the wallet's.
+                        RowLayout {
+                            Layout.fillWidth: true; spacing: 6
+                            Text {
+                                Layout.fillWidth: true
+                                text: root.zoneName(root.network)
+                                color: root.textPrimary; font.family: root.faceFont
+                                font.pixelSize: 12; font.bold: true
+                                maximumLineCount: 1; elide: Text.ElideRight
+                            }
+                            Text {
+                                visible: root.activeZoneIsCustom
+                                text: "custom"; color: root.textDisabled
+                                font.family: root.faceFont; font.pixelSize: 9
+                            }
+                        }
+                        // The load-bearing line. WRAPPED, never elided: a repoint keeps the
+                        // name above and changes only this, so a truncated address would
+                        // defeat the entire purpose. WrapAnywhere so a 62-char .onion reads
+                        // in full in a 380px sheet.
+                        Text {
+                            Layout.fillWidth: true; visible: text.length > 0
+                            text: root.netShownAddr
+                            color: root.textSecondary; font.family: root.monoFont
+                            font.pixelSize: 10; wrapMode: Text.WrapAnywhere
+                        }
+                        RowLayout {
+                            visible: root.netAlert !== ""
+                            Layout.fillWidth: true; Layout.topMargin: 2; spacing: 6
+                            Text { text: "⚠"; color: root.netAlertColor; font.pixelSize: 12
+                                   Layout.alignment: Qt.AlignTop }
+                            ColumnLayout {
+                                Layout.fillWidth: true; spacing: 1
+                                Text {
+                                    Layout.fillWidth: true; text: root.netAlertTitle()
+                                    color: root.netAlertColor; font.family: root.faceFont
+                                    font.pixelSize: 10; font.bold: true
+                                    wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                                }
+                                Text {
+                                    Layout.fillWidth: true; text: root.netAlertBody()
+                                    color: root.textSecondary; font.family: root.faceFont
+                                    font.pixelSize: 9; wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                                }
+                                // Repoint only: both addresses together, because the tell is
+                                // precisely that they differ.
+                                ColumnLayout {
+                                    visible: root.netAlert === "repoint"
+                                    Layout.fillWidth: true; Layout.topMargin: 3; spacing: 1
+                                    Text { text: "configured for this zone"; color: root.textDisabled
+                                           font.family: root.faceFont; font.pixelSize: 9 }
+                                    Text { Layout.fillWidth: true; text: root.netExpectedDial
+                                           color: root.textSecondary; font.family: root.monoFont
+                                           font.pixelSize: 9; wrapMode: Text.WrapAnywhere }
+                                    Text { text: "actually dialling"; color: root.textDisabled
+                                           font.family: root.faceFont; font.pixelSize: 9
+                                           Layout.topMargin: 2 }
+                                    Text { Layout.fillWidth: true; text: root.netActualDial
+                                           color: root.errorRed; font.family: root.monoFont
+                                           font.pixelSize: 9; wrapMode: Text.WrapAnywhere }
+                                }
+                            }
                         }
                     }
                 }
@@ -5044,7 +5426,9 @@ Rectangle {
         Rectangle {
             anchors.centerIn: parent
             width: Math.min(root.width - 40, 380)
-            height: zoneCol.implicitHeight + 32
+            // Clamped like connectSheet/zoneOfflineSheet: this sheet now carries two address
+            // cards, and a sheet taller than the window would put its CTAs off-screen.
+            height: Math.min(root.height - 40, zoneCol.implicitHeight + 32)
             radius: root.rSheet
             color: root.surface2; border.color: root.borderStrong; border.width: 1
             // Deeper elevation for the floating modal (autoPadding stops the shadow clipping).
@@ -5076,45 +5460,181 @@ Rectangle {
                     }
                     ColumnLayout {
                         Layout.fillWidth: true; spacing: 1
+                        // THE WALLET'S OWN SENTENCE - a constant, never interpolated with dApp
+                        // text. It used to read `appName + " wants to switch your wallet's
+                        // sequencer"` in one wrapping 15px-bold run, which handed a dApp the
+                        // wallet's title voice: an appName carrying newlines could paint whole
+                        // extra lines that read as the wallet talking.
                         Text {
                             Layout.fillWidth: true
-                            text: (zoneSheet.req ? (zoneSheet.req.appName || "An app") : "An app")
-                                  + " wants to switch your wallet's sequencer"
+                            text: "An app wants to change your network"
                             color: root.textPrimary; font.family: root.faceFont
                             font.pixelSize: 15; font.bold: true
-                            wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                            maximumLineCount: 1; elide: Text.ElideRight
                         }
+                        // The dApp's name for itself: attributed, subordinate colour, one line.
                         Text {
                             Layout.fillWidth: true
-                            text: "Review the requested zone before approving"
+                            text: "asked by " + (zoneSheet.req ? (zoneSheet.req.appName || "an app")
+                                                               : "an app")
                             color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 11
+                            maximumLineCount: 1; elide: Text.ElideRight
                         }
                     }
                 }
 
-                // Requested zone detail card.
+                // ── THE change, shown AS a change: what you are on now, then what is asked ──
+                // Requirement of this sheet: a dApp is asking to repoint the wallet itself, so
+                // the two addresses have to sit together or the diff is not legible.
+
+                // CURRENT - wallet-owned facts only (medusa_core), identical treatment to the
+                // connect/action sheets so the "where am I" line reads the same everywhere.
                 Rectangle {
                     Layout.fillWidth: true; radius: 10
-                    color: root.inputBg; border.color: root.borderColor
-                    implicitHeight: zoneDetailCol.implicitHeight + 20
+                    color: root.netAlert === "" ? root.inputBg : root.errorTint
+                    border.color: root.netAlertColor; border.width: 1
+                    implicitHeight: zoneNowCol.implicitHeight + 20
                     ColumnLayout {
-                        id: zoneDetailCol
+                        id: zoneNowCol
                         anchors { left: parent.left; right: parent.right; top: parent.top; margins: 10 }
-                        spacing: 6
+                        spacing: 4
                         RowLayout {
-                            Layout.fillWidth: true
-                            Text { text: "Label"; color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 11 }
+                            Layout.fillWidth: true; spacing: 6
+                            Rectangle {
+                                Layout.preferredWidth: 8; Layout.preferredHeight: 8; radius: 4
+                                Layout.alignment: Qt.AlignVCenter
+                                color: root.seqStatus === "running"  ? root.greenBright
+                                     : root.seqStatus === "starting" ? root.connectGray : root.errorRed
+                            }
+                            Text {
+                                text: "YOU ARE ON NOW"
+                                color: root.textSecondary; font.family: root.faceFont
+                                font.pixelSize: 10; font.letterSpacing: 1
+                            }
                             Item { Layout.fillWidth: true }
-                            Text { text: zoneSheet.req ? (zoneSheet.req.label || "-") : ""
-                                   color: root.textPrimary; font.family: root.faceFont; font.pixelSize: 11; font.bold: true
-                                   elide: Text.ElideRight; Layout.maximumWidth: 200 }
+                            Text {
+                                visible: root.seqStatus === "starting"
+                                text: "checking…"; color: root.textDisabled
+                                font.family: root.faceFont; font.pixelSize: 9
+                            }
                         }
-                        Text { text: "Sequencer"; color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 11 }
+                        RowLayout {
+                            Layout.fillWidth: true; spacing: 6
+                            Text {
+                                Layout.fillWidth: true
+                                text: root.zoneName(root.network)
+                                color: root.textPrimary; font.family: root.faceFont
+                                font.pixelSize: 12; font.bold: true
+                                maximumLineCount: 1; elide: Text.ElideRight
+                            }
+                            Text {
+                                visible: root.activeZoneIsCustom
+                                text: "custom"; color: root.textDisabled
+                                font.family: root.faceFont; font.pixelSize: 9
+                            }
+                        }
+                        Text {
+                            Layout.fillWidth: true; visible: text.length > 0
+                            text: root.netShownAddr
+                            color: root.textSecondary; font.family: root.monoFont
+                            font.pixelSize: 10; wrapMode: Text.WrapAnywhere
+                        }
+                        RowLayout {
+                            visible: root.netAlert !== ""
+                            Layout.fillWidth: true; Layout.topMargin: 2; spacing: 6
+                            Text { text: "⚠"; color: root.netAlertColor; font.pixelSize: 12
+                                   Layout.alignment: Qt.AlignTop }
+                            ColumnLayout {
+                                Layout.fillWidth: true; spacing: 1
+                                Text {
+                                    Layout.fillWidth: true; text: root.netAlertTitle()
+                                    color: root.netAlertColor; font.family: root.faceFont
+                                    font.pixelSize: 10; font.bold: true
+                                    wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                                }
+                                Text {
+                                    Layout.fillWidth: true; text: root.netAlertBody()
+                                    color: root.textSecondary; font.family: root.faceFont
+                                    font.pixelSize: 9; wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                                }
+                                ColumnLayout {
+                                    visible: root.netAlert === "repoint"
+                                    Layout.fillWidth: true; Layout.topMargin: 3; spacing: 1
+                                    Text { text: "configured for this zone"; color: root.textDisabled
+                                           font.family: root.faceFont; font.pixelSize: 9 }
+                                    Text { Layout.fillWidth: true; text: root.netExpectedDial
+                                           color: root.textSecondary; font.family: root.monoFont
+                                           font.pixelSize: 9; wrapMode: Text.WrapAnywhere }
+                                    Text { text: "actually dialling"; color: root.textDisabled
+                                           font.family: root.faceFont; font.pixelSize: 9
+                                           Layout.topMargin: 2 }
+                                    Text { Layout.fillWidth: true; text: root.netActualDial
+                                           color: root.errorRed; font.family: root.monoFont
+                                           font.pixelSize: 9; wrapMode: Text.WrapAnywhere }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Text {
+                    Layout.alignment: Qt.AlignHCenter
+                    text: "↓"; color: root.silver; font.pixelSize: 14
+                }
+
+                // PROPOSED - every value in this card except the wallet's verdict line comes
+                // from the dApp, so the card SAYS SO and nothing in it is styled as a wallet
+                // statement: the address is mono (it is the proposal being judged) but the
+                // app's own label is quoted, unbolded, textDisabled and explicitly attributed,
+                // so it can never be read as the wallet's name for a network.
+                Rectangle {
+                    id: zoneWantCard
+                    Layout.fillWidth: true; radius: 10
+                    // The wallet's verdict about the proposal, computed from ITS zone list.
+                    readonly property bool isCurrent: zoneSheet.req !== null
+                        && root.zoneReqIsCurrent(zoneSheet.req.sequencer || "", zoneSheet.req.tor === true)
+                    readonly property var known: zoneSheet.req
+                        ? root.knownZoneFor(zoneSheet.req.sequencer || "", zoneSheet.req.tor === true)
+                        : null
+                    // Calm when the wallet already knows this address; amber only for a network
+                    // it has never used - which on THIS sheet is the case worth stopping at.
+                    readonly property bool isNew: !isCurrent && known === null
+                    color: root.inputBg
+                    border.color: isNew ? root.warningAmber : root.borderColor; border.width: 1
+                    implicitHeight: zoneWantCol.implicitHeight + 20
+                    ColumnLayout {
+                        id: zoneWantCol
+                        anchors { left: parent.left; right: parent.right; top: parent.top; margins: 10 }
+                        spacing: 4
+                        RowLayout {
+                            Layout.fillWidth: true; spacing: 6
+                            Text {
+                                text: "THE APP WANTS YOU ON"
+                                color: root.textSecondary; font.family: root.faceFont
+                                font.pixelSize: 10; font.letterSpacing: 1
+                            }
+                            Item { Layout.fillWidth: true }
+                            Text {
+                                text: "supplied by the app"
+                                color: root.textDisabled; font.family: root.faceFont; font.pixelSize: 9
+                            }
+                        }
+                        // The proposal itself: wrapped in full, never elided. This used to be
+                        // ElideMiddle, which hides the middle of an .onion - the only part that
+                        // distinguishes it from a lookalike.
                         Text {
                             Layout.fillWidth: true
                             text: zoneSheet.req ? (zoneSheet.req.sequencer || "") : ""
-                            color: root.textPrimary; font.family: root.monoFont; font.pixelSize: 11
-                            elide: Text.ElideMiddle
+                            color: root.textPrimary; font.family: root.monoFont
+                            font.pixelSize: 11; wrapMode: Text.WrapAnywhere
+                        }
+                        // The app's own label, clearly marked as the app's words.
+                        Text {
+                            Layout.fillWidth: true
+                            visible: zoneSheet.req !== null && (zoneSheet.req.label || "") !== ""
+                            text: "the app calls it \"" + (zoneSheet.req ? (zoneSheet.req.label || "") : "") + "\""
+                            color: root.textDisabled; font.family: root.faceFont; font.pixelSize: 9
+                            maximumLineCount: 1; elide: Text.ElideRight
                         }
                         RowLayout {
                             Layout.fillWidth: true; spacing: 6
@@ -5126,6 +5646,27 @@ Rectangle {
                                 text: (zoneSheet.req && zoneSheet.req.tor)
                                       ? "Routed over Tor" : "Clearnet (not over Tor)"
                                 color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 10
+                            }
+                        }
+                        // THE WALLET'S VERDICT on the proposal - derived from getZones(), not
+                        // from anything the dApp said about itself.
+                        Text {
+                            Layout.fillWidth: true; Layout.topMargin: 2
+                            wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                            font.family: root.faceFont; font.pixelSize: 9
+                            color: zoneWantCard.isNew ? root.warningAmber : root.textSecondary
+                            text: {
+                                if (!zoneSheet.req) return ""
+                                if (zoneWantCard.isCurrent)
+                                    return "This is the network you are already on - approving changes nothing."
+                                if (zoneWantCard.known !== null)
+                                    return zoneWantCard.known.builtin === true
+                                        ? "Your wallet knows this address as a built-in network: "
+                                          + (zoneWantCard.known.name || "")
+                                        : "Your wallet already has this address saved, under a name that "
+                                          + "was not chosen by the wallet."
+                                return "Your wallet has never used this address. Approving points every "
+                                     + "balance you see and everything you send at it."
                             }
                         }
                     }
