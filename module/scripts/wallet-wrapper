@@ -12,6 +12,9 @@ wrapper adapts it and smooths over a couple of on-chain lifecycle quirks:
                           credits without claiming, so the chain rejects an
                           unregistered (default-owned) recipient; we run
                           `auth-transfer init` for it when needed, then claim.
+                          Native LEZ only: the token half of a faucet claim is the
+                          on-chain medusa_faucet program and is driven by the module,
+                          sequenced after this call. See the note further down.
   • `account import`   → the private key is read from stdin (line 2, after the password
                           line), never from argv: /proc/<pid>/cmdline is world-readable.
   • everything else    → JSON passed through; otherwise success text is wrapped as
@@ -22,7 +25,6 @@ Point $WALLET_LEZ at the real wallet binary; $LOGOS_SEQUENCER at the sequencer.
 """
 import json
 import os
-import random
 import re
 import subprocess
 import sys
@@ -224,12 +226,22 @@ ZONE_MISMATCH = ("this zone runs a different LEZ build than this wallet (program
                  "switch zone, or install a Medusa built for it")
 
 
-# ── Token faucet treasury - a separate wallet that mints the whitelist tokens, holds
-#    their supplies, and gives each claimant a random amount of each on `pinata claim`
-#    (a user wallet can't mint tokens it doesn't own the supply of). ──
-TREASURY_HOME = os.environ.get(
-    "MEDUSA_TREASURY_HOME", os.path.expanduser("~/.local/share/medusa-treasury")
-)
+# ── THE CLIENT-SIDE TOKEN FAUCET IS GONE ───────────────────────────────────────────────
+# `pinata claim` used to do two things: claim native LEZ on-chain, and then have a SEPARATE
+# treasury wallet (~/.local/share/medusa-treasury) `token send` a random amount of each
+# whitelist token to the claimant. That second half read its whitelist from
+# faucet_tokens-<zone>.json inside that treasury directory, and it could never work anywhere
+# but the operator's own machine:
+#   • the directory is not part of the install. Deleting it (or resetting the wallet, or
+#     installing on a second machine) silently removed the tokens from every claim while the
+#     LEZ half kept succeeding, which is exactly how the bug presented: "I claimed the faucet
+#     and got LEZ but no tokens", with nothing in any log to say why.
+#   • it needed the treasury's PRIVATE KEYS locally, so on a remote zone a user could not have
+#     run it even with the file: you cannot spend a supply account you do not hold.
+# The replacement is on-chain: the deployed `medusa_faucet` program owns its treasuries as PDAs
+# and dispenses from them itself. The module drives it with medusa-faucet-client
+# (WalletPlugin::startTokenFaucet), so no token distribution happens in this wrapper at all.
+# `bootstrap-treasury.sh` stays, as the operator tool that MINTS and funds those treasuries.
 
 
 def active_seq():
@@ -247,9 +259,9 @@ def active_port():
 
 
 def zone_key():
-    """A stable per-zone key for scoping the token registry/whitelist. The module writes
-    the active zone id into wallet_config.json; fall back to the sequencer port (so older
-    per-port treasuries keep working)."""
+    """A stable per-zone key for scoping the token registry. The module writes the active
+    zone id into wallet_config.json; fall back to the sequencer port (so older per-port
+    registries keep working)."""
     try:
         with open(os.path.join(home, "wallet_config.json")) as f:
             z = json.load(f).get("zone")
@@ -258,64 +270,6 @@ def zone_key():
     except (OSError, ValueError):
         pass
     return active_port()
-
-
-def faucet_config():
-    # Each zone has its OWN treasury/token set (faucet_tokens-<zone>.json). Built-in LOCAL
-    # zones may fall back to the legacy per-port file so already-bootstrapped treasuries
-    # still resolve; remote zones must NOT (they share port 3080 → would collide).
-    zk = zone_key()
-    by_zone = os.path.join(TREASURY_HOME, "faucet_tokens-%s.json" % zk)
-    if os.path.exists(by_zone):
-        return by_zone
-    if zk in ("devnet", "diaphani", "3071", "3077"):
-        return os.path.join(TREASURY_HOME, "faucet_tokens-%s.json" % active_port())
-    return by_zone   # remote/unknown zone: its own (likely absent) file → empty whitelist
-
-
-def load_whitelist():
-    try:
-        with open(faucet_config()) as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return []
-
-
-def run_treasury(cmd):
-    """Run a wallet command AS THE TREASURY wallet, pointed at the user's active sequencer."""
-    os.makedirs(TREASURY_HOME, exist_ok=True)
-    # keep the treasury on the same network the user is on
-    tcfg = os.path.join(TREASURY_HOME, "wallet_config.json")
-    try:
-        c = json.load(open(tcfg)) if os.path.exists(tcfg) else {}
-    except (OSError, ValueError):
-        c = {}
-    c["sequencer_addr"] = active_seq()
-    for k, v in {"seq_poll_timeout": "20s", "seq_tx_poll_max_blocks": 8,
-                 "seq_poll_max_retries": 8, "seq_block_poll_max_amount": 200}.items():
-        c.setdefault(k, v)
-    json.dump(c, open(tcfg, "w"))
-    env = dict(os.environ, LEE_WALLET_HOME_DIR=TREASURY_HOME, LOGOS_SEQUENCER=active_seq())
-    try:
-        return subprocess.run([WALLET, *cmd], capture_output=True, text=True, input="\n", env=env, timeout=90)
-    except subprocess.TimeoutExpired as e:
-        return subprocess.CompletedProcess(cmd, 124, e.stdout or "", "timed out")
-
-
-def seed_whitelist(reg):
-    """Ensure the user's registry knows the whitelist tokens so they always show up."""
-    changed = False
-    for t in load_whitelist():
-        d = t["def"]
-        if d not in reg["definitions"]:
-            reg["definitions"].append(d)
-            changed = True
-        if d not in reg["names"]:
-            reg["names"][d] = t["name"]
-            changed = True
-    if changed:
-        save_reg(reg)
-    return reg
 
 
 def ata_balance(user_bare, defb):
@@ -336,51 +290,6 @@ def poll_ata(user_bare, defb, predicate, timeout=150):
             return bal
         time.sleep(3)
     return ata_balance(user_bare, defb)
-
-
-def faucet_tokens(user_id):
-    """Send the claimant a random amount of each whitelist token. Delivery target, in
-    order of preference:
-      1. the wallet's INITIALIZED direct vault holding for the def (tokens arrive
-         SHIELDABLE - keytree-signed). Only an EXISTING holding can receive from the
-         treasury: a cross-wallet credit to a pristine account is REJECTED on-chain
-         (the claiming tx needs the recipient key's co-signature, which only the
-         recipient wallet has - verified live).
-      2. the user's ATA (derived, always creditable) - the classic flow. These tokens
-         cannot shield on rc5 until an upstream fix or issuer-assisted route.
-    Returns [{ticker, amount}] (a credit landing after the poll window is under-reported;
-    balances catch up)."""
-    given = []
-    user_bare = user_id.split("/")[-1]
-    seed_whitelist(load_reg())          # make sure `tokens` knows these defs
-    for t in load_whitelist():
-        defb, sup = t["def"], t["sup"]
-        amt = random.randint(int(t.get("min", 10)), int(t.get("max", 500)))
-        vault = vault_for(defb)
-        if vault and holding_state(vault)[0] == defb:
-            _d, before = holding_state(vault)
-            before = before or 0
-            run_treasury(["token", "send", "--from", "Public/" + sup,
-                          "--to", "Public/" + vault, "--amount", str(amt)])
-            landed = poll_holding(vault, defb, lambda b: b is not None and b > before)
-            if landed is not None and landed > before:
-                given.append({"ticker": t["name"], "amount": amt})
-            continue
-        # ATA fallback - recipient creates its OWN ATA (it holds the owner key); the
-        # treasury only spends the supply. `run` is the user's home (the claim runs there).
-        before = ata_balance(user_bare, defb) or 0
-        run(["ata", "create", "--owner", "Public/" + user_bare, "--token-definition", defb])
-        poll_ata(user_bare, defb, lambda b: b is not None)        # ATA exists (balance >= 0)
-        addr = run(["ata", "address", "--owner", user_bare, "--token-definition", defb])
-        m = re.search(r"([1-9A-HJ-NP-Za-km-z]{40,46})", addr.stdout or "")
-        if not m:
-            continue
-        run_treasury(["token", "send", "--from", "Public/" + sup,
-                      "--to", "Public/" + m.group(1), "--amount", str(amt)])
-        landed = poll_ata(user_bare, defb, lambda b: b is not None and b > before)
-        if landed is not None and landed > before:
-            given.append({"ticker": t["name"], "amount": amt})
-    return given
 
 
 def emit(proc):
@@ -557,7 +466,7 @@ if len(args) >= 2 and args[0] == "token" and args[1] == "new":
 if args and args[0] == "tokens":
     if not zone_compatible():
         print(json.dumps({"error": ZONE_MISMATCH})); sys.exit(1)
-    reg = seed_whitelist(load_reg())
+    reg = load_reg()
     owner_bare = (args[1].split("/")[-1] if len(args) > 1 else "")
     holdings = []
     if owner_bare and reg["definitions"]:
@@ -567,15 +476,22 @@ if args and args[0] == "tokens":
             m = re.match(r"\s*ATA\s+\S+\s+\(definition\s+(\S+)\):\s*balance\s*(\d+)", line)
             if m:
                 balances[m.group(1)] = m.group(2)
-        # Return EVERY registered token (whitelist + manually added). The DESIGNATED vault
+        # Return EVERY registered token (faucet + manually added). The DESIGNATED vault
         # (direct holding - where the faucet delivers, shieldable) counts toward the
         # balance; the ATA remainder is reported separately so a consolidate can move it.
+        #
+        # The vault counts ONLY for the account that IS it. `vaults` is keyed by definition
+        # alone (one designated holding per definition, wallet-wide), and a direct holding is
+        # itself one of the wallet's accounts. Adding it unconditionally therefore showed the
+        # SAME token balance on every account, and implied every account could shield tokens
+        # that in reality live in exactly one holding. A balance shown against an account must
+        # be a balance that account can actually spend.
         vaults = reg.get("vaults") or {}
         for defid in reg["definitions"]:
             ata_b = int(balances.get(defid, "0"))
             v_b = 0
             vb = vaults.get(defid)
-            if vb:
+            if vb and vb == owner_bare:
                 d, b = holding_state(vb)
                 if d == defid:
                     v_b = b
@@ -585,10 +501,10 @@ if args and args[0] == "tokens":
     print(json.dumps(holdings))
     sys.exit(0)
 
-# `whitelist` (wrapper verb) → the curated token list the treasury offers: [{name, def}].
-if args and args[0] == "whitelist":
-    print(json.dumps([{"name": t["name"], "def": t["def"]} for t in load_whitelist()]))
-    sys.exit(0)
+# NOTE: there is no `whitelist` verb any more. It read faucet_tokens-<zone>.json out of the
+# treasury directory, which is operator state outside the install (see the top of this file).
+# The curated per-zone token list is a property of the ZONE and now lives in the module's own
+# zone table (kFaucetZones in WalletPlugin.cpp); getWhitelist() reads it from there.
 
 # `token-transfer <from-owner> <to-owner> <def> <amount>` → move a token from the sender's
 # ATA to the recipient's ATA: derive both ATAs, create the recipient's (permissionless,
@@ -803,10 +719,36 @@ if args and args[0] == "consolidate" and len(args) >= 3:
     msg = (snd.stderr or snd.stdout or "consolidate did not land").strip()
     print(json.dumps({"error": msg.replace("Input password: ", "").strip()})); sys.exit(1)
 
-# `token-registry list` / `token-registry add <def-id>` (wrapper verbs) → manage the
-# set of known token definitions (for tokens the user received but didn't mint).
+# `token-registry list` / `token-registry add <def-id>` /
+# `token-registry vault <def-id> <bare-account-id>` (wrapper verbs) → manage the set of known
+# token definitions (for tokens the user received but didn't mint) and the wallet's designated
+# DIRECT holding for each.
 if args and args[0] == "token-registry":
     reg = load_reg()
+    # `vault` designates an account this wallet owns as the holding for a definition. The
+    # on-chain faucet needs one per token before it can claim, and on a wallet that has never
+    # held that token there is none to find: the claim path creates the account and records it
+    # HERE, so the next claim reuses it. That matters beyond tidiness - the faucet's cooldown
+    # marker PDA is derived from the first recipient, so a claim that invented a fresh account
+    # each time would derive a fresh marker each time and the 6h cooldown would bind to nothing.
+    if len(args) >= 4 and args[1] == "vault":
+        defid = args[2].split("/")[-1]
+        bare  = args[3].split("/")[-1]
+        for v in (defid, bare):
+            if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,50}", v):
+                print(json.dumps({"error": "not a valid account id (expected base58)"}))
+                sys.exit(1)
+        # It must be an account THIS wallet owns: a vault is signed as the claimant on every
+        # claim, so recording somebody else's account would produce a tx the chain rejects.
+        if not any((a.get("id") or "").split("/")[-1] == bare for a in owned_accounts()):
+            print(json.dumps({"error": "that account is not in this wallet"}))
+            sys.exit(1)
+        reg.setdefault("vaults", {})[defid] = bare
+        if defid not in reg["definitions"]:
+            reg["definitions"].append(defid)
+        save_reg(reg)
+        print(json.dumps({"ok": True, "definitionId": defid, "vault": bare}))
+        sys.exit(0)
     if len(args) >= 3 and args[1] == "add":
         defid = args[2].split("/")[-1]
         # 1) format: a base58-encoded 32-byte account id is ~32-44 chars, base58 alphabet.
@@ -830,18 +772,56 @@ if args and args[0] == "token-registry":
                       "privateDests": reg.get("privateDests", [])}))
     sys.exit(0)
 
-# `pinata claim --to <id>` → register the recipient first if the chain has no record
-# of it yet (auth-transfer init is free + needs no proof), claim the native LEZ, then
-# have the treasury drop a random amount of each whitelist token on the same account.
+# ── Recipient registration: the free `auth-transfer init` an outbound transfer may need ──────
+#
+# THE FAILURE THIS PREVENTS, and it is not an error path - it is a silent one. On LEZ an
+# auth-transfer whose recipient is still PRISTINE (default-owned: created locally, never
+# registered on-chain) is accepted by the client, submitted, and then dropped at block-build
+# time with nothing reported anywhere. The CLI goes on polling seq_tx_poll_max_blocks=8 blocks
+# for a transaction that will never land - EIGHT MINUTES on a 60s-block zone - and finally says
+# "Transaction not found in preconfigured amount of blocks", which reads like a network fault
+# and is not one. The owner hit this sending a Tip Jar tip to a brand-new account.
+#
+# `auth-transfer init --account-id <id>` puts the record on-chain. It is free, needs no proof
+# and is permissionless, which is why `pinata claim` below has always been able to run it for
+# ITS recipient - the pinata program credits without claiming, so the chain rejects a credit to
+# an account it has no record of. Same on-chain fact, same fix; this is now ONE implementation
+# with two callers instead of a trick that only the faucet path knew.
+#
+# BEST EFFORT, NEVER FATAL. A probe that cannot reach the chain, an unreadable reply, or an
+# init that fails leaves the caller exactly where it would have been without this function. It
+# can only turn a doomed transfer into a working one, never a working one into a failure.
+def ensure_recipient_registered(dest, timeout=180):
+    """Register `dest` on-chain iff the chain has no record of it yet. Returns True when an
+    init was actually run. Never raises, never blocks the caller's own error handling."""
+    if not dest:
+        return False
+    # 45s, not the default 90s: on a healthy zone this answers in well under a second, and on a
+    # zone that cannot answer at all the transfer behind it is doomed anyway - so this is the
+    # whole latency the common case (a recipient that already exists) ever pays.
+    got = run(["account", "get", "--account-id", dest], timeout=45)
+    if "Uninitialized" not in (got.stdout or ""):
+        return False        # registered already, or unreadable/transient - proceed either way
+    run(["auth-transfer", "init", "--account-id", dest], timeout=timeout)
+    return True
+
+
+# `pinata claim --to <id>` → register the recipient first if the chain has no record of it
+# yet (auth-transfer init is free + needs no proof), then claim the native LEZ.
+#
+# NATIVE LEZ ONLY. The token half of a faucet claim is the on-chain medusa_faucet program,
+# driven by the module (startTokenFaucet → medusa-faucet-client), and it is sequenced AFTER
+# this call precisely because of the registration below: the pinata program credits an account
+# without claiming it, so the chain rejects a credit to an account it has no record of, and
+# this is where that record gets created. Nothing here distributes tokens any more; see the
+# note at the top of this file for why the treasury-wallet version could not work.
 if len(args) >= 2 and args[0] == "pinata" and args[1] == "claim":
     to = id_arg()
     # The claim is a background job (30-min budget in the module), so the per-call cap here
     # is the only artificial limit. Over Tor the init + the pinata PoW/submit/confirm each
     # take a while, so give them generous windows instead of the default 90s.
     if to:
-        got = run(["account", "get", "--account-id", to])
-        if "Uninitialized" in (got.stdout or ""):
-            run(["auth-transfer", "init", "--account-id", to], timeout=180)
+        ensure_recipient_registered(to)
     claim = run(args, timeout=240)
     out = (claim.stdout or "").strip()
     # RESILIENCE: the PoW + tx submission happen BEFORE the confirmation poll. Once a
@@ -849,19 +829,14 @@ if len(args) >= 2 and args[0] == "pinata" and args[1] == "claim":
     # regardless of what happens to this client afterwards. So a poll timeout / client
     # disconnect must NOT be reported as failure: the claim "runs in the sequencer".
     ok = (claim.returncode == 0) or submitted(claim)
-    # Token distribution is best-effort - never let it block or fail the LEZ claim.
-    try:
-        given = faucet_tokens(to) if (to and ok) else []
-    except Exception:
-        given = []
     if ok:
-        res = {"ok": True, "output": out, "tokens": given}
+        res = {"ok": True, "output": out}
         if claim.returncode != 0:
             res["pending"] = True   # submitted but not client-confirmed; the balance catches up
         print(json.dumps(res))
         sys.exit(0)
     msg = (claim.stderr or "").strip() or out or "faucet claim failed"
-    print(json.dumps({"error": msg.replace("Input password: ", "").strip(), "tokens": given}))
+    print(json.dumps({"error": msg.replace("Input password: ", "").strip()}))
     sys.exit(claim.returncode)
 
 # A private SPEND (sending FROM a Private account: private→private or deshield) proves the
@@ -886,6 +861,34 @@ if "send" in args:
             if _blocked:
                 print(json.dumps({"error": _blocked})); sys.exit(1)
             break
+
+# AUTO-REGISTER THE RECIPIENT of an outbound native transfer (see ensure_recipient_registered
+# above for the eight-minute silent failure this prevents). Placed here, on the passthrough
+# path, so it covers EVERY outbound transfer at once rather than one verb: the Send screen
+# (startSendTransfer), the legacy synchronous sendTransfer, a native deshield landing in a
+# fresh public account, and a dApp's approved Connect action all reach the CLI as
+# `auth-transfer send`. Before the private-state sync below, so a first-time recipient is
+# registered before the expensive steps rather than after them.
+#
+# Scoped deliberately:
+#   • auth-transfer ONLY. A token send's recipient is a token holding/ATA, created by
+#     `ata create` (see token-transfer/token-deshield above); an auth-transfer record is not
+#     what it needs and initialising one would be meaningless.
+#   • PUBLIC destinations only. A private destination must stay default-owned - that is
+#     precisely what LEZ v0.2.0 requires of a private OUTPUT (see private_dest_block), so
+#     initialising one would break the very transfers it was meant to help.
+#   • NOT cached between calls. A remembered "already initialized" would be wrong for good the
+#     first time a zone is reset (which has happened to this project's own zones) and would
+#     fail the way this bug failed: silently, eight minutes at a time. One cheap read per
+#     outbound transfer, against an operation that already costs at least one 60s block.
+if args[:2] == ["auth-transfer", "send"]:
+    _dest = None
+    for _i in range(len(args) - 1):
+        if args[_i] == "--to":
+            _dest = args[_i + 1]
+            break
+    if _dest and not _dest.startswith("Private/"):
+        ensure_recipient_registered(_dest if "/" in _dest else "Public/" + _dest)
 
 if "send" in args and _sends_from_private(args):
     # scan+decrypt → tree matches the chain. A first FULL sync of a mature chain takes

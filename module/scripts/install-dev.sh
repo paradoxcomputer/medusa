@@ -149,6 +149,29 @@ if [[ $QML_ONLY -eq 0 ]]; then
     else
         echo "  (i) diaphani-forward not staged (only the Paradox·Tor zone needs it) - run: bash $REPO/../wallet/build.sh"
     fi
+    # medusa-faucet-client: the on-chain token faucet helper. resolveBin("medusa-faucet-client")
+    # in WalletPlugin.cpp looks for it, and without it the token half of the faucet button reports
+    # "the on-chain faucet helper is not installed with this wallet" while the LEZ half still works.
+    FAUCET_SRC="${FAUCET_SRC:-$REPO/../wallet/faucet/client/target/release/medusa-faucet-client}"
+    if [[ -x "$FAUCET_SRC" ]]; then
+        install -m755 "$FAUCET_SRC" "$HOME/.local/bin/medusa-faucet-client"
+        echo "  staged faucet client → ~/.local/bin/medusa-faucet-client"
+    else
+        echo "  !! medusa-faucet-client not found at \$FAUCET_SRC ($FAUCET_SRC)"
+        echo "     the token faucet will be unavailable; build it: bash $REPO/../wallet/build.sh"
+    fi
+    # The risc0 GUEST program itself. faucetGuestBin() looks in the module bundle first, then
+    # ~/.local/share/medusa/ and ~/.local/bin/ for unpackaged dev installs. The client re-derives
+    # its ImageID on every call and faucetPreflight() proves that against kFaucetProgramId, so a
+    # planted file is refused rather than trusted: staging it here is convenience, not trust.
+    GUEST_SRC="${GUEST_SRC:-$REPO/../wallet/target/riscv32im-risc0-zkvm-elf/docker/medusa_faucet.bin}"
+    if [[ -f "$GUEST_SRC" ]]; then
+        install -Dm644 "$GUEST_SRC" "$HOME/.local/share/medusa/medusa_faucet.bin"
+        echo "  staged faucet guest → ~/.local/share/medusa/medusa_faucet.bin"
+    else
+        echo "  !! medusa_faucet.bin not found at \$GUEST_SRC ($GUEST_SRC)"
+        echo "     the token faucet will be unavailable; build it: cargo risczero build (see wallet/faucet/README.md)"
+    fi
     # Bundle Tor so users need NO external Tor - the module launches this on a private SOCKS
     # port (9250). Prefer an explicit $TOR_SRC, else copy the system tor binary.
     TOR_SRC="${TOR_SRC:-$(command -v tor || true)}"
