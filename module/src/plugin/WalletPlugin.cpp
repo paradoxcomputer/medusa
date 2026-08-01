@@ -14,6 +14,7 @@
 #include <QUrl>
 #include <QRandomGenerator>
 #include <QCryptographicHash>
+#include <QSet>
 
 #include <algorithm>
 #include <utility>   // std::as_const
@@ -83,10 +84,96 @@ static QString logosTestnetUrl()
 static constexpr const char* kFaucetProgramId =
     "523320bdfff97cdbec1f01fdb5de9c37b4555abb7585cd123d77e9d09756e571";
 
+// ── WHICH ZONES HAVE THE TOKEN FAUCET, AND WHAT IT DISPENSES ON EACH ──────────────────────────
+// The program ID above is one constant for every zone (see why, above). The TOKENS are not: a
+// token definition is an account on one specific chain, and its treasury is a PDA holding on that
+// same chain. So the per-zone facts live here, in ONE table keyed by zone id, and nowhere else.
+// Adding a zone to the faucet is adding a row; there is no second list to keep in step.
+//
+// THIS TABLE *IS* THE CAPABILITY. A zone with no row has no token faucet, and the token half is
+// never attempted there, which is the rule stated per zone class:
+//   • "devnet"   - a local sandbox chain this wallet starts itself. Nothing is deployed on it.
+//   • "diaphani" - the Tor-fronted operator sequencer, not yet carrying the faucet.
+//   • every USER-ADDED zone - somebody else's sequencer. The program is not deployed there, and
+//     even if an operator deployed it, THESE definitions are accounts on OUR chains and do not
+//     exist on theirs. A user zone can therefore never acquire the capability by configuration.
+// On all of those the faucet claims native LEZ through pinata and nothing else, which is exactly
+// the behaviour the owner specified.
+//
+// The lookup below is by zone id against THIS table only. It never reads the stored zone record,
+// so a userZones entry planted straight into QSettings (an ordinary user-writable INI - see
+// cliPath()) cannot grant itself a token faucet by carrying a "tokenFaucet":true key. getZones()
+// and zoneObj() PUBLISH the flag they compute here; they never echo a stored one back.
+//
+// The treasury is the faucet program's own PDA for a definition, derived by medusa_faucet_shared
+// as AccountId::for_public_pda(program_id, SHA-256("MEDUSA/treasury/" || definition_id)).
+// medusa-faucet-client re-derives it on every call and the module never sends it - re-deriving a
+// PDA in C++ is precisely the drift that shared crate exists to prevent. It is recorded here
+// because it is the account an operator funds and the account faucetStatus() has to be able to
+// name, and because a row that gives only the definition is half a fact.
+//
+// Verified on chain 2026-07-31 (decoded from raw getAccount bytes): every treasury below is
+// initialized and funded, 1000000 / 5000000 / 20000000 respectively on each zone.
+struct FaucetToken {
+    const char* ticker;      // display name, e.g. "GOLD"
+    const char* definition;  // token definition account id (base58)
+    const char* treasury;    // the faucet program's treasury PDA for that definition (base58)
+};
+struct FaucetZoneRow {
+    const char* zoneId;      // must match a zone id getZones() publishes
+    FaucetToken tokens[3];
+};
+static constexpr FaucetZoneRow kFaucetZones[] = {
+    // Paradox Computer clearnet - https://seq-testnet.paradox.computer/
+    { "paradox-clearnet", {
+        { "GOLD", "5YEhWdY2edtRFkCruXjtnFH5F62VkCiCxXmNAvHuVkEY",
+                  "A9NwZksDYPzZzpdnbHmJkcEwgHvbGmmYNsYV9rHGoxAF" },
+        { "SILV", "HUDERmRqyX6swMnuk9FT5vmqNbcdLNbVxDRtLEdzsMXk",
+                  "5iG2BTUhWCmgviBw54ZMtr3qjSMyLfPz7pMNAwvk6kiQ" },
+        { "BRNZ", "3zS3bGdToZcqPU9jBZC8c1aK9MQvpekse9EJ52nD1wiM",
+                  "89MWMvGchyEVq4FZFQPsXS747LQjLe4L9ev4hXMBY8PK" } } },
+    // Logos public testnet - https://testnet.lez.logos.co/
+    { "logos-testnet", {
+        { "GOLD", "7ZZGE941fzSGCAfxxdkPWQszSspBhZEcjHUkLqWrrnz6",
+                  "8LM3oT3tBjd1yjU4bUWgSqbNuiBx4KCevoqDC8wJ2Ygc" },
+        { "SILV", "CfuvpaUhbxEzWd6ZtLDiKWVg5DZLiYj14Q8HgtDUwuS6",
+                  "y9ri8KzcYcDepcwLBPzr6J9LgGo2av95zzM7juKLX98" },
+        { "BRNZ", "EEMUsdWL1WxrQBi1SmNFUKVcMUjgVcky12NRv2BjBuxp",
+                  "51M7wrFPUKpo9dZAd53U8RdUmrgARXtqT3Ls9DksuALm" } } },
+};
+
+// The row for a zone, or nullptr when that zone has no token faucet. The ONE place the
+// capability is decided.
+static const FaucetZoneRow* faucetZoneRow(const QString& zoneId)
+{
+    const QString z = zoneId.trimmed();
+    for (const FaucetZoneRow& row : kFaucetZones)
+        if (z == QLatin1String(row.zoneId))
+            return &row;
+    return nullptr;
+}
+
 // Bundled-Tor SOCKS port (distinct from a system Tor on 9050, so the two never clash).
 static constexpr int kTorSocksPort = 9250;
 // Bundled-Tor control port (for the onion-connection-stage monitor).
 static constexpr int kTorControlPort = 9251;
+// …unless the LAUNCHER's environment names different ones. This is NOT a crack in invariant B:
+// invariant B is about which BINARY runs, and a loopback port number names no program. The
+// environment belongs to whoever started this process (Basecamp, a developer, the test suite) and
+// a co-resident module cannot write it - one that could would already own MEDUSA_WALLET_CLI, i.e.
+// outright code execution, so this adds no capability to that attacker. Same knob idiom as
+// MEDUSA_IDLE_LOCK_MS. It buys two things the bare constants could not: a second wallet instance
+// (or a box where 9250 is already taken by something else) brings up its OWN Tor instead of
+// silently adopting a stranger's, and the suite can exercise the real bring-up/teardown on a
+// developer box that is already running the wallet's Tor on the default port.
+static int torPortFromEnv(const char* envVar, int fallback)
+{
+    bool ok = false;
+    const int p = qEnvironmentVariableIntValue(envVar, &ok);
+    return (ok && p >= 1024 && p <= 65535) ? p : fallback;
+}
+int WalletPlugin::torSocksPort()   { return torPortFromEnv("MEDUSA_TOR_SOCKS_PORT",   kTorSocksPort); }
+int WalletPlugin::torControlPort() { return torPortFromEnv("MEDUSA_TOR_CONTROL_PORT", kTorControlPort); }
 // A just-spawned standalone sequencer needs a few seconds before checkHealth answers; only
 // after this window does a silent non-answer count as a reportable "unhealthy" failure.
 static constexpr qint64 kSeqLaunchGraceMs = 15000;
@@ -227,6 +314,112 @@ QString WalletPlugin::assetProgram(const QString& asset)
     return (asset.trimmed().toLower() == QStringLiteral("token"))
          ? QStringLiteral("token")
          : QStringLiteral("auth-transfer");
+}
+
+// ── The two spec parsers ──────────────────────────────────────────────────────
+// Why these exist at all: the Logos bridge invokes 0-5 arguments and silently drops anything
+// wider (qt_provider_object.cpp:20-34 - the full account is at the top of the header). Each
+// parser collapses arguments that were always one concept, which is what keeps every spend
+// verb at 4 and leaves the session password on the end where callGated() puts it.
+
+bool WalletPlugin::parseValueSpec(const QString& spec, QString* asset, QString* definitionId,
+                                  QString* amount, QString* error)
+{
+    const auto fail = [&](const QString& msg) {
+        if (error) *error = msg;
+        return false;
+    };
+    if (asset)        asset->clear();
+    if (definitionId) definitionId->clear();
+    if (amount)       amount->clear();
+    if (error)        error->clear();
+
+    const QString s = spec.trimmed();
+    if (s.isEmpty())
+        return fail(QStringLiteral("amount is required"));
+
+    QString a = QStringLiteral("native"), def, amt;
+    if (s.startsWith(QLatin1Char('{'))) {
+        const QJsonDocument doc = QJsonDocument::fromJson(s.toUtf8());
+        if (!doc.isObject())
+            return fail(QStringLiteral("value must be an amount (\"12\") or a JSON object "
+                                       "{\"asset\":\"token\",\"definitionId\":…,\"amount\":…}"));
+        const QJsonObject o = doc.object();
+        // A JSON number is as legitimate a way to write 12 as the string "12"; take either.
+        // Via QVariant, which never ROUNDS: a fixed-precision conversion would turn 12.5 into
+        // "13", i.e. quietly move an amount the caller did not ask to move. Anything that does
+        // not survive as a plain number fails the check below and is reported, not spent.
+        const QJsonValue amtV = o.value(QStringLiteral("amount"));
+        amt = amtV.isDouble() ? amtV.toVariant().toString().trimmed()
+                              : amtV.toString().trimmed();
+        def = o.value(QStringLiteral("definitionId")).toString().trimmed();
+        const QString rawAsset = o.value(QStringLiteral("asset")).toString().trimmed();
+        if (!rawAsset.isEmpty()) a = rawAsset.toLower();
+    } else {
+        amt = s;   // the bare form is a native amount
+    }
+
+    if (a != QStringLiteral("native") && a != QStringLiteral("token"))
+        return fail(QStringLiteral("unknown asset \"%1\" - use \"native\" or \"token\"").arg(a));
+    if (amt.isEmpty())
+        return fail(QStringLiteral("amount is required"));
+    static const QRegularExpression amtRe(QStringLiteral("^[0-9]+(\\.[0-9]+)?$"));
+    if (!amtRe.match(amt).hasMatch())
+        return fail(QStringLiteral("\"%1\" is not an amount - pass a number, or "
+                                   "{\"asset\":…,\"definitionId\":…,\"amount\":…}").arg(amt));
+    if (a == QStringLiteral("token") && def.isEmpty())
+        return fail(QStringLiteral("a token value needs its definitionId "
+                                   "({\"asset\":\"token\",\"definitionId\":…,\"amount\":…})"));
+    if (a == QStringLiteral("native") && !def.isEmpty())
+        return fail(QStringLiteral("a definitionId only belongs on a token value - "
+                                   "set \"asset\":\"token\""));
+
+    if (asset)        *asset        = a;
+    if (definitionId) *definitionId = def;
+    if (amount)       *amount       = amt;
+    return true;
+}
+
+bool WalletPlugin::parseRecipientSpec(const QString& spec, QString* accountId, QString* npk,
+                                      QString* vpk, QString* identifier, QString* error)
+{
+    const auto fail = [&](const QString& msg) {
+        if (error) *error = msg;
+        return false;
+    };
+    if (accountId)  accountId->clear();
+    if (npk)        npk->clear();
+    if (vpk)        vpk->clear();
+    if (identifier) identifier->clear();
+    if (error)      error->clear();
+
+    const QString s = spec.trimmed();
+    if (s.isEmpty())
+        return fail(QStringLiteral("to account is required"));
+
+    if (!s.startsWith(QLatin1Char('{'))) {   // an owned account id
+        if (accountId) *accountId = s;
+        return true;
+    }
+
+    const QJsonDocument doc = QJsonDocument::fromJson(s.toUtf8());
+    if (!doc.isObject())
+        return fail(QStringLiteral("recipient must be an account id or a JSON object "
+                                   "{\"npk\":…,\"vpk\":…,\"identifier\":…}"));
+    const QJsonObject o = doc.object();
+    const QString n = o.value(QStringLiteral("npk")).toString().trimmed();
+    const QString v = o.value(QStringLiteral("vpk")).toString().trimmed();
+    const QString i = o.value(QStringLiteral("identifier")).toString().trimmed();
+    // Named individually: a foreign private transfer is unattributable and unrecoverable, so
+    // "which of the three keys did I leave out" has to be answerable before the proof runs.
+    if (n.isEmpty()) return fail(QStringLiteral("recipient npk is required"));
+    if (v.isEmpty()) return fail(QStringLiteral("recipient vpk is required"));
+    if (i.isEmpty()) return fail(QStringLiteral("recipient identifier is required"));
+
+    if (npk)        *npk        = n;
+    if (vpk)        *vpk        = v;
+    if (identifier) *identifier = i;
+    return true;
 }
 
 // Normalise an account id to the canonical "<kind>/<bare>" the CLI expects (it
@@ -1027,6 +1220,7 @@ QJsonObject WalletPlugin::zoneObj(const QString& id) const
         o[QStringLiteral("url")]   = clearnetUrl();
         o[QStringLiteral("onion")] = QString();
         o[QStringLiteral("tor")]   = false;
+        o[QStringLiteral("tokenFaucet")] = (faucetZoneRow(id) != nullptr);
         return o;
     }
     // Built-in remote zone: the official Logos public testnet (logos-co, LEZ v0.2.0).
@@ -1037,15 +1231,29 @@ QJsonObject WalletPlugin::zoneObj(const QString& id) const
         o[QStringLiteral("url")]   = logosTestnetUrl();
         o[QStringLiteral("onion")] = QString();
         o[QStringLiteral("tor")]   = false;
+        o[QStringLiteral("tokenFaucet")] = (faucetZoneRow(id) != nullptr);
         return o;
     }
     const QJsonArray arr = userZones();
     for (const auto& v : arr) {
-        const QJsonObject o = v.toObject();
-        if (o.value(QStringLiteral("id")).toString() == id)
+        QJsonObject o = v.toObject();
+        if (o.value(QStringLiteral("id")).toString() == id) {
+            // OVERWRITTEN, never read: the stored record is a user-writable INI value, so a
+            // planted "tokenFaucet":true would otherwise hand a foreign sequencer the token
+            // half. The capability is a fact about kFaucetZones and is recomputed here.
+            o[QStringLiteral("tokenFaucet")] = (faucetZoneRow(id) != nullptr);
             return o;
+        }
     }
     return {};
+}
+
+// The per-zone capability, in one predicate. Everything that asks "does this zone have the
+// on-chain token faucet" goes through here, so the answer cannot differ between the zone list
+// the UI renders, the preflight the status call reports, and the claim that actually runs.
+bool WalletPlugin::zoneHasTokenFaucet(const QString& zoneId) const
+{
+    return faucetZoneRow(zoneId) != nullptr;
 }
 
 // True only for user-added zones. zoneObj() also returns a record for the built-in clearnet zone,
@@ -1158,12 +1366,21 @@ void WalletPlugin::ensureTor()
 {
     if (m_torProc && m_torProc->state() != QProcess::NotRunning)
         return;
+    // This is a FRESH bring-up attempt: the failure record describes THIS one, not a previous
+    // one (mirrors ensureSequencer's m_seqLaunchError/m_seqExited reset).
+    m_torLaunchError.clear();
+    m_torExited = false;
+    m_torExitCode = 0;
     // Reuse any Tor already on our SOCKS port (e.g. one orphaned by a previous hard-kill
     // that still holds the data-dir lock) instead of launching a duplicate that would fail.
     // (This was a `bash -c 'exec 3<>/dev/tcp/...'` spawn - a $PATH-resolved shell to open one
     // socket. tcpPortOpen() does it in libc, so the launch no longer exists to be attacked.)
-    if (tcpPortOpen(kTorSocksPort, 700)) {
-        appendLog(QStringLiteral("reusing Tor already on 127.0.0.1:%1").arg(kTorSocksPort));
+    // RECORDED, because an adopted Tor is not ours to reap: stopTor() must not kill another
+    // wallet window's Tor, and cancelConnect() has to be able to SAY that rather than claim a
+    // teardown it did not perform.
+    if (tcpPortOpen(quint16(torSocksPort()), 700)) {
+        appendLog(QStringLiteral("reusing Tor already on 127.0.0.1:%1").arg(torSocksPort()));
+        m_torAdopted = true;
         return;
     }
     // Prefer the bundled binary (MEDUSA_TOR_BIN overrides, same rule as every other binary here);
@@ -1174,6 +1391,8 @@ void WalletPlugin::ensureTor()
         if (!sysTor.isEmpty()) torBin = sysTor;
     }
     if (!QFileInfo::exists(torBin)) {
+        m_torLaunchError = QStringLiteral("no Tor binary found (looked for ") + torBin
+                         + QStringLiteral(" and a system tor)");
         appendLog(QStringLiteral("bundled Tor not found (~/.local/bin/medusa-tor)"), QStringLiteral("error"));
         return;
     }
@@ -1243,6 +1462,99 @@ void WalletPlugin::stopTor()
     };
     reap(m_torMonProc);
     reap(m_torProc);
+}
+
+// An ADOPTED Tor (another wallet window's, reused by ensureTor's single-instance guard) is not
+// our child, so QProcess tells us nothing about it. The only honest test that covers both cases
+// is whether the SOCKS port still answers.
+bool WalletPlugin::torRunning()
+{
+    if (m_torProc && m_torProc->state() != QProcess::NotRunning)
+        return true;
+    return tcpPortOpen(quint16(torSocksPort()), 400);
+}
+
+// THE one predicate for "does this zone reach its sequencer over Tor". Read off the zone RECORD,
+// never off "is it built in": a user-added zone is a Tor zone whenever addZone was given an
+// .onion, and the built-in diaphani zone is one by kind. getSequencerStatus, applySequencer's
+// teardown and cancelConnect all route through here so they cannot drift apart.
+bool WalletPlugin::zoneUsesTor(const QString& id) const
+{
+    if (zoneKind(id) == QStringLiteral("local-l1-tor"))
+        return true;
+    return zoneObj(id).value(QStringLiteral("tor")).toBool();
+}
+
+// The zone a fresh install starts on, and the zone an aborted connect lands on. netId()'s
+// default derives from the same rule, so the two cannot disagree.
+QString WalletPlugin::defaultZoneId()
+{
+    return clearnetUrl().isEmpty() ? QStringLiteral("devnet")
+                                   : QStringLiteral("paradox-clearnet");
+}
+
+// Abort a connect in flight: the escape hatch from a Tor bootstrap that is taking minutes or has
+// already failed. Before this existed the wallet was simply stuck on the connect screen.
+//
+// UNGATED, deliberately. Every other verb that changes what the wallet does is gated, but this
+// one only STOPS things: it spends nothing, reveals nothing, and moves the wallet toward the
+// safe default zone. Gating it would mean a locked wallet could not escape a hung bootstrap,
+// which is precisely when a user most needs to. It is also idempotent, so a double-tap is safe.
+//
+// Why it does not simply stay on the abandoned zone: a Tor zone with its tunnel torn down is not
+// a resting state. Every op would fail at the transport with nothing to explain it, and the UI
+// would show a zone that cannot work. Landing on the default clearnet zone leaves the wallet in
+// a state where the next thing the user does can succeed.
+QString WalletPlugin::cancelConnect()
+{
+    const QString zone       = netId();
+    const bool    wasTorZone = zoneUsesTor(zone);
+    // "Connecting" in the sense the UI means it: the transport is up but the zone has not
+    // answered a health check yet. Recorded before the teardown, or the reply would always
+    // say false.
+    const bool    wasConnecting = wasTorZone ? !m_lastSeqOk : false;
+
+    // An adopted Tor belongs to another wallet window: stopping it would break that window, so
+    // report it rather than killing it. Ours is a child of this process and is ours to stop.
+    const bool ours = (m_torProc && m_torProc->state() != QProcess::NotRunning);
+    const bool torForeign = wasTorZone && !ours && torRunning();
+    const bool fwdWasUp   = (m_fwdProc && m_fwdProc->state() != QProcess::NotRunning);
+
+    if (ours) stopTor();
+    stopForward();
+
+    m_connectAborted = true;
+    m_abortedZone    = zone;
+    m_lastSeqOk      = false;
+
+    // Only a Tor zone needs relocating: a clearnet or local zone is perfectly usable after a
+    // cancel, so moving the user off it would be gratuitous.
+    bool switched = false;
+    QString landed = zone;
+    if (wasTorZone && zone != defaultZoneId()) {
+        const QString target = defaultZoneId();
+        QSettings s;
+        s.setValue(QLatin1String(kNetworkKey), target);
+        applySequencer();          // re-point the wallet; this clears m_connectAborted…
+        m_connectAborted = true;   // …so re-assert it: the UI must still be able to say WHY.
+        m_abortedZone    = zone;
+        landed   = target;
+        switched = true;
+    }
+
+    appendLog(QStringLiteral("connect aborted on zone %1%2")
+                  .arg(zone, switched ? QStringLiteral(" - switched to ") + landed : QString()));
+
+    QJsonObject o;
+    o[QStringLiteral("ok")]             = true;
+    o[QStringLiteral("zone")]           = landed;
+    o[QStringLiteral("abortedZone")]    = zone;
+    o[QStringLiteral("switched")]       = switched;
+    o[QStringLiteral("wasConnecting")]  = wasConnecting;
+    o[QStringLiteral("torStopped")]     = ours;
+    o[QStringLiteral("torForeign")]     = torForeign;
+    o[QStringLiteral("forwardStopped")] = fwdWasUp;
+    return QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact));
 }
 
 // Launch diaphani-forward: maps 127.0.0.1:<listenPort> -> a v3 .onion over the bundled Tor.
@@ -1514,6 +1826,11 @@ QString WalletPlugin::getZones() const
         o[QStringLiteral("id")] = id; o[QStringLiteral("name")] = name;
         o[QStringLiteral("kind")] = kind; o[QStringLiteral("builtin")] = true;
         o[QStringLiteral("tor")] = (kind == QStringLiteral("local-l1-tor"));
+        // The token faucet is a property OF THE ZONE, published on the zone record so the UI
+        // reads it off the thing it already has instead of keeping a second list of zone ids.
+        // Derived from kFaucetZones, which is why "devnet" and "diaphani" come back false here
+        // without either being named: they simply have no row.
+        o[QStringLiteral("tokenFaucet")] = (faucetZoneRow(id) != nullptr);
         return o;
     };
     out.append(builtin(QStringLiteral("devnet"),   QStringLiteral("Devnet"),                  QStringLiteral("local-standalone")));
@@ -1545,6 +1862,11 @@ QString WalletPlugin::getZones() const
         o[QStringLiteral("endpoint")] = z.value(QStringLiteral("tor")).toBool()
             ? z.value(QStringLiteral("onion")).toString() : z.value(QStringLiteral("url")).toString();
         o[QStringLiteral("builtin")] = false;
+        // Computed, not copied from `z`: see zoneObj(). A user zone is somebody else's
+        // sequencer, so it has no row in kFaucetZones and this is always false - but it is
+        // false because the TABLE says so, not because the stored record was trusted.
+        o[QStringLiteral("tokenFaucet")] =
+            (faucetZoneRow(z.value(QStringLiteral("id")).toString()) != nullptr);
         out.append(o);
     }
     QJsonObject res;
@@ -1553,29 +1875,49 @@ QString WalletPlugin::getZones() const
     return QJsonDocument(res).toJson(QJsonDocument::Compact);
 }
 
-QString WalletPlugin::addZone(const QString& name, const QString& url,
-                              const QString& onion, bool tor)
+// One endpoint argument in, the (url, onion) pair the zone record stores out. Shared by
+// addZone and editZone, which had this validation twice and now cannot drift.
+bool WalletPlugin::normalizeZoneEndpoint(const QString& endpoint, bool tor, QString* url,
+                                         QString* onion, QString* error)
+{
+    const auto fail = [&](const QString& msg) {
+        if (error) *error = msg;
+        return false;
+    };
+    if (url)   url->clear();
+    if (onion) onion->clear();
+    if (error) error->clear();
+
+    const QString ep = endpoint.trimmed();
+    if (tor) {
+        if (ep.isEmpty() || !ep.contains(QStringLiteral(".onion")))
+            return fail(QStringLiteral("a Tor zone needs a valid .onion address"));
+        if (onion) *onion = ep;
+        return true;
+    }
+    // Normalize + validate the clearnet URL so a dead zone can't be created silently.
+    if (ep.isEmpty())
+        return fail(QStringLiteral("a clearnet zone needs a sequencer URL"));
+    QString u = ep;
+    if (!u.contains(QStringLiteral("://"))) u = QStringLiteral("http://") + u;
+    const QUrl qu(u, QUrl::StrictMode);
+    const QString sch = qu.scheme().toLower();
+    if (!qu.isValid() || qu.host().isEmpty()
+        || (sch != QStringLiteral("http") && sch != QStringLiteral("https")))
+        return fail(QStringLiteral("enter a full sequencer URL, e.g. https://host:3072/"));
+    if (qu.host().endsWith(QStringLiteral(".onion")))
+        return fail(QStringLiteral("a .onion address requires the Tor transport"));
+    if (url) *url = u;
+    return true;
+}
+
+QString WalletPlugin::addZone(const QString& name, const QString& endpoint, bool tor)
 {
     const QString nm = name.trimmed();
     if (nm.isEmpty()) return errorJson(QStringLiteral("name is required"));
-    QString cleanUrl;
-    if (tor) {
-        if (onion.trimmed().isEmpty() || !onion.contains(QStringLiteral(".onion")))
-            return errorJson(QStringLiteral("a Tor zone needs a valid .onion address"));
-    } else {
-        // Normalize + validate the clearnet URL so a dead zone can't be created silently.
-        QString u = url.trimmed();
-        if (u.isEmpty()) return errorJson(QStringLiteral("a clearnet zone needs a sequencer URL"));
-        if (!u.contains(QStringLiteral("://"))) u = QStringLiteral("http://") + u;
-        const QUrl qu(u, QUrl::StrictMode);
-        const QString sch = qu.scheme().toLower();
-        if (!qu.isValid() || qu.host().isEmpty()
-            || (sch != QStringLiteral("http") && sch != QStringLiteral("https")))
-            return errorJson(QStringLiteral("enter a full sequencer URL, e.g. https://host:3072/"));
-        if (qu.host().endsWith(QStringLiteral(".onion")))
-            return errorJson(QStringLiteral("a .onion address requires the Tor transport"));
-        cleanUrl = u;
-    }
+    QString cleanUrl, cleanOnion, epErr;
+    if (!normalizeZoneEndpoint(endpoint, tor, &cleanUrl, &cleanOnion, &epErr))
+        return errorJson(epErr);
     QSettings s;
     QJsonArray arr = userZones();
     // id = slug of name + a short disambiguator
@@ -1586,7 +1928,7 @@ QString WalletPlugin::addZone(const QString& name, const QString& url,
     int n = 1; while (!zoneObj(id).isEmpty()) id = QStringLiteral("z-%1-%2").arg(base).arg(++n);
     QJsonObject z;
     z[QStringLiteral("id")] = id; z[QStringLiteral("name")] = nm;
-    z[QStringLiteral("url")] = cleanUrl; z[QStringLiteral("onion")] = onion.trimmed();
+    z[QStringLiteral("url")] = cleanUrl; z[QStringLiteral("onion")] = cleanOnion;
     z[QStringLiteral("tor")] = tor;
     arr.append(z);
     s.setValue(QLatin1String(kZonesKey), QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact)));
@@ -1595,30 +1937,16 @@ QString WalletPlugin::addZone(const QString& name, const QString& url,
     return QJsonDocument(o).toJson(QJsonDocument::Compact);
 }
 
-QString WalletPlugin::editZone(const QString& id, const QString& name, const QString& url,
-                               const QString& onion, bool tor)
+QString WalletPlugin::editZone(const QString& id, const QString& name,
+                               const QString& endpoint, bool tor)
 {
     if (!isUserZone(id))
         return errorJson(QStringLiteral("only user-added zones can be edited"));
     const QString nm = name.trimmed();
     if (nm.isEmpty()) return errorJson(QStringLiteral("name is required"));
-    QString cleanUrl;
-    if (tor) {
-        if (onion.trimmed().isEmpty() || !onion.contains(QStringLiteral(".onion")))
-            return errorJson(QStringLiteral("a Tor zone needs a valid .onion address"));
-    } else {
-        QString u = url.trimmed();
-        if (u.isEmpty()) return errorJson(QStringLiteral("a clearnet zone needs a sequencer URL"));
-        if (!u.contains(QStringLiteral("://"))) u = QStringLiteral("http://") + u;
-        const QUrl qu(u, QUrl::StrictMode);
-        const QString sch = qu.scheme().toLower();
-        if (!qu.isValid() || qu.host().isEmpty()
-            || (sch != QStringLiteral("http") && sch != QStringLiteral("https")))
-            return errorJson(QStringLiteral("enter a full sequencer URL, e.g. https://host:3072/"));
-        if (qu.host().endsWith(QStringLiteral(".onion")))
-            return errorJson(QStringLiteral("a .onion address requires the Tor transport"));
-        cleanUrl = u;
-    }
+    QString cleanUrl, cleanOnion, epErr;
+    if (!normalizeZoneEndpoint(endpoint, tor, &cleanUrl, &cleanOnion, &epErr))
+        return errorJson(epErr);
     QSettings s;
     QJsonArray arr = userZones(), out;
     for (const auto& v : arr) {
@@ -1626,7 +1954,7 @@ QString WalletPlugin::editZone(const QString& id, const QString& name, const QSt
         if (o.value(QStringLiteral("id")).toString() == id) {
             o[QStringLiteral("name")]  = nm;
             o[QStringLiteral("url")]   = cleanUrl;
-            o[QStringLiteral("onion")] = onion.trimmed();
+            o[QStringLiteral("onion")] = cleanOnion;
             o[QStringLiteral("tor")]   = tor;
         }
         out.append(o);
@@ -2044,9 +2372,26 @@ QString WalletPlugin::addToken(const QString& definitionId)
     });
 }
 
+// The curated tokens of the ACTIVE zone: [{name,def}], empty on a zone with no token faucet.
+//
+// This used to shell out to the wrapper's `whitelist` verb, which read
+// ~/.local/share/medusa-treasury/faucet_tokens-<zone>.json. That file is operator state that
+// lives outside the install: deleting the treasury directory (or resetting the wallet, or
+// installing on a second machine) emptied the list, and with it the Add-token picker, with no
+// error anywhere. The definitions are a fixed property of the zone, so they are read from
+// kFaucetZones now and the file is gone from the path entirely.
 QString WalletPlugin::getWhitelist()
 {
-    return runWalletCommand({ QStringLiteral("whitelist") });
+    QJsonArray out;
+    if (const FaucetZoneRow* row = faucetZoneRow(netId())) {
+        for (const FaucetToken& t : row->tokens) {
+            QJsonObject o;
+            o[QStringLiteral("name")] = QString::fromLatin1(t.ticker);
+            o[QStringLiteral("def")]  = QString::fromLatin1(t.definition);
+            out.append(o);
+        }
+    }
+    return QJsonDocument(out).toJson(QJsonDocument::Compact);
 }
 
 QString WalletPlugin::getBalance(const QString& accountId)
@@ -2320,13 +2665,18 @@ QString WalletPlugin::faucetGuestBin()
     const QString env = qEnvironmentVariable("MEDUSA_FAUCET_BIN").trimmed();
     if (!env.isEmpty())
         return QFileInfo::exists(env) ? QFileInfo(env).absoluteFilePath() : QString();
-    QStringList candidates;
+    // Same shape as resolveBin(): on a PACKAGED install the bundle is the only place looked at,
+    // so a file planted in a uid-writable directory is never even a candidate. The ~/.local paths
+    // are the unpackaged-dev fallback and are reached only when there is no bundle at all. The
+    // ImageID check makes this defence in depth rather than the defence - a planted .bin with a
+    // DIFFERENT id is refused, and one with the SAME id is byte-identical to the real program.
     const QString bdir = moduleBinDir();
-    if (!bdir.isEmpty())
-        candidates << bdir + QStringLiteral("/medusa_faucet.bin");
-    candidates << QDir::homePath() + QStringLiteral("/.local/share/medusa/medusa_faucet.bin")
-               << QDir::homePath() + QStringLiteral("/.local/bin/medusa_faucet.bin");
-    for (const QString& c : std::as_const(candidates))
+    if (!bdir.isEmpty() && QDir(bdir).exists()) {
+        const QString bundled = bdir + QStringLiteral("/medusa_faucet.bin");
+        return QFileInfo::exists(bundled) ? bundled : QString();
+    }
+    for (const QString& c : { QDir::homePath() + QStringLiteral("/.local/share/medusa/medusa_faucet.bin"),
+                              QDir::homePath() + QStringLiteral("/.local/bin/medusa_faucet.bin") })
         if (QFileInfo::exists(c))
             return c;
     return QString();
@@ -2346,6 +2696,26 @@ QString WalletPlugin::faucetGuestBin()
 WalletPlugin::FaucetPreflight WalletPlugin::faucetPreflight()
 {
     FaucetPreflight pf;
+    pf.zone = netId();
+
+    // 0. THE PER-ZONE CAPABILITY, ASKED FIRST. On a zone with no row in kFaucetZones there is
+    //    nothing to install, nothing to verify and nothing to claim, so no probe is spawned and
+    //    no install-side message is produced: telling the owner of a user-added zone that a
+    //    helper is missing implies a token faucet was expected there, and none ever will be.
+    const FaucetZoneRow* row = faucetZoneRow(pf.zone);
+    if (!row) {
+        pf.reason  = QStringLiteral("unsupported-zone");
+        pf.message = QStringLiteral("this zone has no token faucet - the medusa_faucet program "
+                                    "and its funded treasuries are deployed on the built-in "
+                                    "Paradox Computer and Logos public testnet zones only, so "
+                                    "the faucet dispenses native LEZ here");
+        return pf;
+    }
+    for (const FaucetToken& t : row->tokens) {
+        pf.definitions << QString::fromLatin1(t.definition);
+        pf.tickers     << QString::fromLatin1(t.ticker);
+        pf.treasuries  << QString::fromLatin1(t.treasury);
+    }
 
     // 1. The client binary. Absent on every install that does not ship it, which today is all
     //    of them - so this is the message most users would see, and it must not read as a bug.
@@ -2402,34 +2772,22 @@ WalletPlugin::FaucetPreflight WalletPlugin::faucetPreflight()
         }
     }
 
-    // 4. The zone's tokens. The faucet dispenses WHITELIST TOKENS from per-definition treasuries,
-    //    so a zone with no definitions has nothing for it to dispense, however well it is
-    //    deployed. This is the true state of both operator zones as of 2026-07-31.
-    QHash<QString, QString> names;
-    {
-        const QJsonDocument wl = QJsonDocument::fromJson(getWhitelist().toUtf8());
-        const QJsonArray arr = wl.array();
-        for (const QJsonValue& v : arr) {
-            const QJsonObject t = v.toObject();
-            const QString def = t.value(QStringLiteral("def")).toString().trimmed();
-            if (def.isEmpty())
-                continue;
-            pf.definitions << def;
-            names.insert(def, t.value(QStringLiteral("name")).toString());
-        }
-    }
-    if (pf.definitions.isEmpty()) {
-        pf.reason  = QStringLiteral("no-definitions");
-        pf.message = QStringLiteral("this zone has no faucet tokens yet: the faucet program is "
-                                    "deployed, but no token definitions or funded treasuries "
-                                    "exist on it, so there is nothing to claim");
-        return pf;
-    }
-
-    // 5. A recipient holding per definition. The claim signs each recipient, so every one must be
+    // 4. A recipient holding per definition. The claim SIGNS each recipient, so every one must be
     //    an account this wallet owns, and they must be distinct: one account holds exactly one
-    //    token definition. The wrapper's registry already designates one per definition (its
-    //    "vaults"), which is why the user's own account is never used here.
+    //    token definition, so the user's own account is never used here (it would be bound to
+    //    one token forever). The wrapper's registry designates one per definition (its
+    //    "vaults"); a definition with none yet gets an empty slot, NOT a refusal.
+    //
+    //    A MISSING HOLDING IS NOT A DEAD END, and treating it as one was half of the reported
+    //    bug: on a wallet that has just been reset, no vault exists for any definition, so the
+    //    old preflight refused every claim with "use the standard faucet once (it creates one)"
+    //    - advice that had stopped being true the moment the client-side treasury drop was
+    //    removed. The on-chain program accepts an UNINITIALIZED recipient (the guest asserts
+    //    only that it carries the claimant's signature, and the token program claims it on the
+    //    first transfer - wallet/faucet/guest/src/main.rs), so the claim path can simply make
+    //    one. That provisioning is deliberately NOT done here: faucetStatus() calls this on
+    //    every Tokens-tab open and a read-only status call must never create accounts. See
+    //    ensureFaucetRecipients(), which the two claim verbs call and nothing else does.
     QHash<QString, QString> vaults;
     {
         const QJsonObject reg =
@@ -2438,22 +2796,70 @@ WalletPlugin::FaucetPreflight WalletPlugin::faucetPreflight()
         for (auto it = v.constBegin(); it != v.constEnd(); ++it)
             vaults.insert(it.key(), it.value().toString());
     }
-    for (const QString& def : std::as_const(pf.definitions)) {
-        const QString vault = vaults.value(def).trimmed();
-        if (vault.isEmpty()) {
-            pf.reason  = QStringLiteral("no-holding");
-            pf.message = QStringLiteral("this wallet has no holding account for ")
-                       + (names.value(def).isEmpty() ? def.left(8) : names.value(def))
-                       + QStringLiteral(" yet - use the standard faucet once (it creates one), "
-                                        "then the on-chain faucet can deliver into it");
-            return pf;
-        }
-        pf.recipients << vault;
-        pf.tickers    << names.value(def);
-    }
+    for (const QString& def : std::as_const(pf.definitions))
+        pf.recipients << vaults.value(def).trimmed();   // "" = none yet, minted at claim time
 
     pf.ok = true;
     return pf;
+}
+
+// Give every definition a recipient this wallet owns, creating one where the registry has none.
+//
+// CLAIM PATH ONLY (startTokenFaucet), never the status path: it writes - it mints keys and it
+// records them. Returns "" on success, or the sentence to refuse with.
+//
+// Why a fresh account is a correct recipient: the guest requires `recipient.is_authorized`, i.e.
+// the claimant's signature, and nothing else; an account whose on-chain state is still the
+// default is claimed by the token program during the chained transfer. That is the difference
+// between this and the client-side drop it replaces, where a cross-wallet credit to a pristine
+// account IS rejected (the treasury cannot produce the recipient key's co-signature).
+//
+// Each new account is recorded in the wrapper's registry as that definition's vault before it is
+// used. That matters for more than tidiness: the cooldown marker PDA is derived from the FIRST
+// recipient, so a claim that invented a new account every time would derive a new marker every
+// time and the on-chain 6h cooldown would never bind to anything.
+QString WalletPlugin::ensureFaucetRecipients(FaucetPreflight& pf)
+{
+    for (int i = 0; i < pf.definitions.size(); ++i) {
+        if (!pf.recipients.at(i).isEmpty())
+            continue;
+        const QString made = createAccount();
+        const QJsonObject o = QJsonDocument::fromJson(made.toUtf8()).object();
+        if (o.contains(QStringLiteral("error")))
+            return QStringLiteral("could not create a holding account for ")
+                 + pf.tickers.value(i) + QStringLiteral(": ")
+                 + o.value(QStringLiteral("error")).toString();
+        // createAccount returns {"id":"Public/<bare>"} (structured CLI) or folds the CLI's
+        // "account_id Public/<bare>" line into the same key. Either way we want the bare id:
+        // the faucet client accepts both, but the registry stores bare.
+        const QString bare = o.value(QStringLiteral("id")).toString().trimmed()
+                                 .section(QLatin1Char('/'), -1).trimmed();
+        if (bare.isEmpty())
+            return QStringLiteral("could not read back the holding account created for ")
+                 + pf.tickers.value(i);
+        // Record it BEFORE the claim: if the claim then fails, the next attempt reuses this
+        // account instead of minting another, and the cooldown marker stays put.
+        const QString rec = runWalletCommand({ QStringLiteral("token-registry"),
+                                               QStringLiteral("vault"),
+                                               pf.definitions.at(i), bare }, 20000);
+        if (QJsonDocument::fromJson(rec.toUtf8()).object().contains(QStringLiteral("error")))
+            appendLog(QStringLiteral("faucet: could not record the vault for %1 (%2) - the claim "
+                                     "still runs, but the next one will create another account")
+                          .arg(pf.tickers.value(i), bare), QStringLiteral("error"));
+        pf.recipients[i] = bare;
+        pf.provisioned << bare;
+    }
+    // The client refuses duplicates (a holding account holds exactly one definition), and so does
+    // the chain. Catch it here where the message can say which registry entry is wrong.
+    QSet<QString> seen;
+    for (const QString& r : std::as_const(pf.recipients)) {
+        if (seen.contains(r))
+            return QStringLiteral("two faucet tokens are pointed at the same holding account (")
+                 + r.left(8) + QStringLiteral("…) - an account can hold only one token "
+                                              "definition, so the token registry needs fixing");
+        seen.insert(r);
+    }
+    return QString();
 }
 
 QString WalletPlugin::faucetStatus()
@@ -2472,6 +2878,14 @@ QString WalletPlugin::faucetStatus()
     o[QStringLiteral("verified")]    = pf.verified;
     o[QStringLiteral("definitions")] = QJsonArray::fromStringList(pf.definitions);
     o[QStringLiteral("recipients")]  = QJsonArray::fromStringList(pf.recipients);
+    // The treasury PDAs from the zone table: the accounts an operator funds, and the accounts
+    // whose emptiness is the one failure the wallet cannot pre-check (see below). Reported so
+    // "which account is empty" is answerable without re-deriving a PDA anywhere.
+    o[QStringLiteral("treasuries")]  = QJsonArray::fromStringList(pf.treasuries);
+    // The per-zone capability, on the status object as well as on the zone record, so a caller
+    // that already has the status does not have to go and fetch the zone list to interpret it.
+    o[QStringLiteral("zone")]           = pf.zone;
+    o[QStringLiteral("tokenFaucetZone")] = zoneHasTokenFaucet(pf.zone);
     QJsonObject tick;
     for (int i = 0; i < pf.definitions.size() && i < pf.tickers.size(); ++i)
         tick[pf.definitions.at(i)] = pf.tickers.at(i);
@@ -2496,14 +2910,45 @@ QString WalletPlugin::startTokenFaucet(const QString& accountId, const QString& 
     if (accountId.trimmed().isEmpty())
         return errorJson(QStringLiteral("accountId is required"));
 
-    const FaucetPreflight pf = faucetPreflight();
+    FaucetPreflight pf = faucetPreflight();
     if (!pf.ok)
         return errorJson(pf.message, pf.reason);
+
+    // Every definition needs a recipient this wallet owns; mint the missing ones. This is the
+    // one write the status path never performs, which is why it is here and not in the preflight.
+    const QString provErr = ensureFaucetRecipients(pf);
+    if (!provErr.isEmpty())
+        return errorJson(provErr, QStringLiteral("no-holding"));
+    if (!pf.provisioned.isEmpty())
+        appendLog(QStringLiteral("faucet: created %1 token holding(s) for this claim: %2")
+                      .arg(pf.provisioned.size())
+                      .arg(pf.provisioned.join(QStringLiteral(", "))));
 
     QString id = accountId.trimmed();
     const QString attribute =
         (id.startsWith(QStringLiteral("Public/")) || id.startsWith(QStringLiteral("Private/")))
             ? id : QStringLiteral("Public/") + id;
+
+    // ── ORDER: PINATA FIRST, TOKENS SECOND ────────────────────────────────────────────────
+    // The faucet button fires both halves, and they are two independent jobs (the UI composes
+    // them; see the header). They must not run at the same time. `pinata claim` may run
+    // `auth-transfer init` for the recipient first - the pinata program credits WITHOUT
+    // claiming, so the chain rejects a credit to an account it has no record of - and both
+    // halves drive the same wallet store from separate processes. Interleaving them means two
+    // writers on one storage.json and a claim racing a registration.
+    //
+    // So a token claim started while a native claim is in flight is QUEUED behind it rather
+    // than run beside it, and started (whatever the first one answered: the two cooldowns are
+    // independent, and a LEZ refusal must never suppress the tokens) when it finishes.
+    QString waitFor;
+    int waitSeq = -1;
+    for (auto it = m_jobs.constBegin(); it != m_jobs.constEnd(); ++it) {
+        const Job* other = it.value();
+        if (other->op != QStringLiteral("faucet") || other->state != QStringLiteral("running"))
+            continue;
+        const int seq = other->id.mid(4).toInt();   // "job-<n>"; hash order is not insert order
+        if (seq > waitSeq) { waitSeq = seq; waitFor = other->id; }
+    }
 
     // No amount: the program dispenses a pseudorandom 10-500 PER DEFINITION, decided on-chain
     // from the block clock, and the client's reply does not carry the figures either. Reporting a
@@ -2513,7 +2958,7 @@ QString WalletPlugin::startTokenFaucet(const QString& accountId, const QString& 
                              QStringLiteral("--bin"),         pf.bin,
                              QStringLiteral("--account"),     pf.recipients.join(QLatin1Char(',')),
                              QStringLiteral("--definitions"), pf.definitions.join(QLatin1Char(',')) },
-                           attribute, QString(), QString(), pf.client);
+                           attribute, QString(), QString(), pf.client, waitFor);
 }
 
 // ── Transaction history (local store) ─────────────────────────────────────────
@@ -2552,7 +2997,7 @@ QString WalletPlugin::getTransactions(const QString& accountId)
 
 QString WalletPlugin::sendTransfer(const QString& from,
                                     const QString& to,
-                                    const QString& amount,
+                                    const QString& value,
                                     const QString& password)
 {
     // The gate goes ahead of argument validation on every spend verb, so an unauthorised caller
@@ -2563,8 +3008,12 @@ QString WalletPlugin::sendTransfer(const QString& from,
         return errorJson(QStringLiteral("from account is required"));
     if (to.trimmed().isEmpty())
         return errorJson(QStringLiteral("to account is required"));
-    if (amount.trimmed().isEmpty())
-        return errorJson(QStringLiteral("amount is required"));
+    QString asset, definitionId, amount, specErr;
+    if (!parseValueSpec(value, &asset, &definitionId, &amount, &specErr))
+        return errorJson(specErr);
+    if (asset != QStringLiteral("native"))
+        return errorJson(QStringLiteral("this verb sends native LEZ - use startSendToken "
+                                        "for a token"));
 
     appendLog(QStringLiteral("transfer: %1 → %2 (%3 tok)").arg(from, to, amount));
 
@@ -2598,29 +3047,38 @@ QString WalletPlugin::sendTransfer(const QString& from,
 }
 
 QString WalletPlugin::startSendToken(const QString& from, const QString& to,
-                                     const QString& definitionId, const QString& amount,
-                                     const QString& password)
+                                     const QString& value, const QString& password)
 {
-    if (!authorize(password))             return authRefusal();
-    if (from.trimmed().isEmpty())         return errorJson(QStringLiteral("from account is required"));
-    if (to.trimmed().isEmpty())           return errorJson(QStringLiteral("to account is required"));
-    if (definitionId.trimmed().isEmpty()) return errorJson(QStringLiteral("token is required"));
-    if (amount.trimmed().isEmpty())       return errorJson(QStringLiteral("amount is required"));
+    if (!authorize(password))     return authRefusal();
+    if (from.trimmed().isEmpty()) return errorJson(QStringLiteral("from account is required"));
+    if (to.trimmed().isEmpty())   return errorJson(QStringLiteral("to account is required"));
+    QString asset, definitionId, amount, specErr;
+    if (!parseValueSpec(value, &asset, &definitionId, &amount, &specErr))
+        return errorJson(specErr);
+    if (asset != QStringLiteral("token"))
+        return errorJson(QStringLiteral("this verb sends a token - pass "
+                                        "{\"asset\":\"token\",\"definitionId\":…,\"amount\":…}, "
+                                        "or use startSendTransfer for native LEZ"));
     // The wrapper's token-transfer derives/creates ATAs + token-sends + waits for landing
     // (~30-40s), so run it as a background job like the privacy ops.
     return startPrivacyJob(QStringLiteral("tokensend"), QStringLiteral("token"),
                            { QStringLiteral("token-transfer"), from.trimmed(), to.trimmed(),
-                             definitionId.trimmed(), amount.trimmed() },
-                           from.trimmed(), to.trimmed(), amount.trimmed());
+                             definitionId, amount },
+                           from.trimmed(), to.trimmed(), amount);
 }
 
 QString WalletPlugin::startSendTransfer(const QString& from, const QString& to,
-                                        const QString& amount, const QString& password)
+                                        const QString& value, const QString& password)
 {
-    if (!authorize(password))       return authRefusal();
-    if (from.trimmed().isEmpty())   return errorJson(QStringLiteral("from account is required"));
-    if (to.trimmed().isEmpty())     return errorJson(QStringLiteral("to account is required"));
-    if (amount.trimmed().isEmpty()) return errorJson(QStringLiteral("amount is required"));
+    if (!authorize(password))     return authRefusal();
+    if (from.trimmed().isEmpty()) return errorJson(QStringLiteral("from account is required"));
+    if (to.trimmed().isEmpty())   return errorJson(QStringLiteral("to account is required"));
+    QString asset, definitionId, amount, specErr;
+    if (!parseValueSpec(value, &asset, &definitionId, &amount, &specErr))
+        return errorJson(specErr);
+    if (asset != QStringLiteral("native"))
+        return errorJson(QStringLiteral("this verb sends native LEZ - use startSendToken "
+                                        "for a token"));
     // Background job: the destination can be a Private account (private→private from the main
     // Send screen), which is a multi-minute real proof. The wrapper auto-syncs + uses the proof
     // budget when --from is Private; a plain public send just submits + lands. Never blocks.
@@ -2628,8 +3086,8 @@ QString WalletPlugin::startSendTransfer(const QString& from, const QString& to,
                            { QStringLiteral("auth-transfer"), QStringLiteral("send"),
                              QStringLiteral("--from"), from.trimmed(),
                              QStringLiteral("--to"),   to.trimmed(),
-                             QStringLiteral("--amount"), amount.trimmed() },
-                           from.trimmed(), to.trimmed(), amount.trimmed());
+                             QStringLiteral("--amount"), amount },
+                           from.trimmed(), to.trimmed(), amount);
 }
 
 // ── Privacy transfers (asynchronous) ───────────────────────────────────────────
@@ -2659,14 +3117,15 @@ WalletPlugin::~WalletPlugin()
     m_requests.clear();
 }
 
-QString WalletPlugin::startShield(const QString& asset, const QString& from,
-                                  const QString& to, const QString& amount,
-                                  const QString& definitionId, const QString& password)
+QString WalletPlugin::startShield(const QString& from, const QString& to,
+                                  const QString& value, const QString& password)
 {
-    if (!authorize(password))       return authRefusal();
-    if (from.trimmed().isEmpty())   return errorJson(QStringLiteral("from account is required"));
-    if (to.trimmed().isEmpty())     return errorJson(QStringLiteral("to account is required"));
-    if (amount.trimmed().isEmpty()) return errorJson(QStringLiteral("amount is required"));
+    if (!authorize(password))     return authRefusal();
+    if (from.trimmed().isEmpty()) return errorJson(QStringLiteral("from account is required"));
+    if (to.trimmed().isEmpty())   return errorJson(QStringLiteral("to account is required"));
+    QString asset, definitionId, amount, specErr;
+    if (!parseValueSpec(value, &asset, &definitionId, &amount, &specErr))
+        return errorJson(specErr);
 
     bool conflict = false;
     QString fromP = withPrivacyPrefix(from, QStringLiteral("Public"), &conflict);
@@ -2678,29 +3137,28 @@ QString WalletPlugin::startShield(const QString& asset, const QString& from,
     // Token shield can't use `token send --from <owner>` (guest-panics: the owner account
     // is not a token holding) - route through the wrapper's token-shield verb, which
     // resolves a direct-owned holding of the definition or fails with a clear error.
+    // (parseValueSpec has already refused a token value with no definitionId.)
     if (assetProgram(asset) == QStringLiteral("token")) {
-        if (definitionId.trimmed().isEmpty())
-            return errorJson(QStringLiteral("definitionId is required for a token shield"));
-        QStringList args{ QStringLiteral("token-shield"), fromP, toP,
-                          definitionId.trimmed(), amount.trimmed() };
-        return startPrivacyJob(QStringLiteral("shield"), asset, args, fromP, toP, amount.trimmed());
+        QStringList args{ QStringLiteral("token-shield"), fromP, toP, definitionId, amount };
+        return startPrivacyJob(QStringLiteral("shield"), asset, args, fromP, toP, amount);
     }
 
     QStringList args{ assetProgram(asset), QStringLiteral("send"),
                       QStringLiteral("--from"), fromP,
                       QStringLiteral("--to"),   toP,
-                      QStringLiteral("--amount"), amount.trimmed() };
-    return startPrivacyJob(QStringLiteral("shield"), asset, args, fromP, toP, amount.trimmed());
+                      QStringLiteral("--amount"), amount };
+    return startPrivacyJob(QStringLiteral("shield"), asset, args, fromP, toP, amount);
 }
 
-QString WalletPlugin::startDeshield(const QString& asset, const QString& from,
-                                    const QString& to, const QString& amount,
-                                    const QString& definitionId, const QString& password)
+QString WalletPlugin::startDeshield(const QString& from, const QString& to,
+                                    const QString& value, const QString& password)
 {
-    if (!authorize(password))       return authRefusal();
-    if (from.trimmed().isEmpty())   return errorJson(QStringLiteral("from account is required"));
-    if (to.trimmed().isEmpty())     return errorJson(QStringLiteral("to account is required"));
-    if (amount.trimmed().isEmpty()) return errorJson(QStringLiteral("amount is required"));
+    if (!authorize(password))     return authRefusal();
+    if (from.trimmed().isEmpty()) return errorJson(QStringLiteral("from account is required"));
+    if (to.trimmed().isEmpty())   return errorJson(QStringLiteral("to account is required"));
+    QString asset, definitionId, amount, specErr;
+    if (!parseValueSpec(value, &asset, &definitionId, &amount, &specErr))
+        return errorJson(specErr);
 
     bool conflict = false;
     QString fromP = withPrivacyPrefix(from, QStringLiteral("Private"), &conflict);
@@ -2710,71 +3168,60 @@ QString WalletPlugin::startDeshield(const QString& asset, const QString& from,
 
     // Token deshield must land in a token HOLDING, not the owner's auth-transfer account -
     // the wrapper's token-deshield verb derives + creates the recipient owner's ATA.
+    // (parseValueSpec has already refused a token value with no definitionId.)
     if (assetProgram(asset) == QStringLiteral("token")) {
-        if (definitionId.trimmed().isEmpty())
-            return errorJson(QStringLiteral("definitionId is required for a token deshield"));
-        QStringList args{ QStringLiteral("token-deshield"), fromP, toP,
-                          definitionId.trimmed(), amount.trimmed() };
-        return startPrivacyJob(QStringLiteral("deshield"), asset, args, fromP, toP, amount.trimmed());
+        QStringList args{ QStringLiteral("token-deshield"), fromP, toP, definitionId, amount };
+        return startPrivacyJob(QStringLiteral("deshield"), asset, args, fromP, toP, amount);
     }
 
     QStringList args{ assetProgram(asset), QStringLiteral("send"),
                       QStringLiteral("--from"), fromP,
                       QStringLiteral("--to"),   toP,
-                      QStringLiteral("--amount"), amount.trimmed() };
-    return startPrivacyJob(QStringLiteral("deshield"), asset, args, fromP, toP, amount.trimmed());
+                      QStringLiteral("--amount"), amount };
+    return startPrivacyJob(QStringLiteral("deshield"), asset, args, fromP, toP, amount);
 }
 
-QString WalletPlugin::startPrivateTransfer(const QString& asset, const QString& from,
-                                           const QString& to, const QString& amount,
-                                           const QString& password)
+QString WalletPlugin::startPrivateTransfer(const QString& from, const QString& to,
+                                           const QString& value, const QString& password)
 {
-    if (!authorize(password))       return authRefusal();
-    if (from.trimmed().isEmpty())   return errorJson(QStringLiteral("from account is required"));
-    if (to.trimmed().isEmpty())     return errorJson(QStringLiteral("to account is required"));
-    if (amount.trimmed().isEmpty()) return errorJson(QStringLiteral("amount is required"));
+    // Ungated, the foreign-recipient form below was the cleanest exfiltration primitive in the
+    // module: a real STARK proof paying an attacker-supplied npk/vpk, private and
+    // unattributable. Folding it in here did not soften that - the gate is the same one, in
+    // the same position, ahead of every argument check.
+    if (!authorize(password))     return authRefusal();
+    if (from.trimmed().isEmpty()) return errorJson(QStringLiteral("from account is required"));
+    QString asset, definitionId, amount, specErr;
+    if (!parseValueSpec(value, &asset, &definitionId, &amount, &specErr))
+        return errorJson(specErr);
+
+    QString toAccount, toNpk, toVpk, toIdentifier, toErr;
+    if (!parseRecipientSpec(to, &toAccount, &toNpk, &toVpk, &toIdentifier, &toErr))
+        return errorJson(toErr);
 
     bool conflict = false;
     QString fromP = withPrivacyPrefix(from, QStringLiteral("Private"), &conflict);
     if (conflict) return errorJson(QStringLiteral("private-transfer source must be a Private account"));
-    QString toP = withPrivacyPrefix(to, QStringLiteral("Private"), &conflict);
+
+    if (toAccount.isEmpty()) {   // foreign recipient: --to-npk/--to-vpk/--to-identifier
+        QStringList args{ assetProgram(asset), QStringLiteral("send"),
+                          QStringLiteral("--from"),          fromP,
+                          QStringLiteral("--to-npk"),        toNpk,
+                          QStringLiteral("--to-vpk"),        toVpk,
+                          QStringLiteral("--to-identifier"), toIdentifier,
+                          QStringLiteral("--amount"),        amount };
+        // Recipient is foreign - no owned "to" account to credit in local history.
+        return startPrivacyJob(QStringLiteral("private"), asset, args, fromP, QString(), amount);
+    }
+
+    QString toP = withPrivacyPrefix(toAccount, QStringLiteral("Private"), &conflict);
     if (conflict) return errorJson(QStringLiteral("private-transfer destination must be a Private account"));
     if (const QString busy = privateDestInFlight(toP); !busy.isEmpty()) return errorJson(busy);
 
     QStringList args{ assetProgram(asset), QStringLiteral("send"),
                       QStringLiteral("--from"), fromP,
                       QStringLiteral("--to"),   toP,
-                      QStringLiteral("--amount"), amount.trimmed() };
-    return startPrivacyJob(QStringLiteral("private"), asset, args, fromP, toP, amount.trimmed());
-}
-
-QString WalletPlugin::startPrivateTransferForeign(const QString& asset, const QString& from,
-                                                  const QString& toNpk, const QString& toVpk,
-                                                  const QString& toIdentifier,
-                                                  const QString& amount,
-                                                  const QString& password)
-{
-    // Ungated this was the cleanest exfiltration primitive in the module: a real STARK proof
-    // paying an attacker-supplied foreign npk/vpk, private and unattributable.
-    if (!authorize(password))             return authRefusal();
-    if (from.trimmed().isEmpty())         return errorJson(QStringLiteral("from account is required"));
-    if (toNpk.trimmed().isEmpty())        return errorJson(QStringLiteral("recipient npk is required"));
-    if (toVpk.trimmed().isEmpty())        return errorJson(QStringLiteral("recipient vpk is required"));
-    if (toIdentifier.trimmed().isEmpty()) return errorJson(QStringLiteral("recipient identifier is required"));
-    if (amount.trimmed().isEmpty())       return errorJson(QStringLiteral("amount is required"));
-
-    bool conflict = false;
-    QString fromP = withPrivacyPrefix(from, QStringLiteral("Private"), &conflict);
-    if (conflict) return errorJson(QStringLiteral("private-transfer source must be a Private account"));
-
-    QStringList args{ assetProgram(asset), QStringLiteral("send"),
-                      QStringLiteral("--from"),          fromP,
-                      QStringLiteral("--to-npk"),        toNpk.trimmed(),
-                      QStringLiteral("--to-vpk"),        toVpk.trimmed(),
-                      QStringLiteral("--to-identifier"), toIdentifier.trimmed(),
-                      QStringLiteral("--amount"),        amount.trimmed() };
-    // Recipient is foreign - no owned "to" account to credit in local history.
-    return startPrivacyJob(QStringLiteral("private"), asset, args, fromP, QString(), amount.trimmed());
+                      QStringLiteral("--amount"), amount };
+    return startPrivacyJob(QStringLiteral("private"), asset, args, fromP, toP, amount);
 }
 
 QString WalletPlugin::privateDestInFlight(const QString& toP) const
@@ -2809,7 +3256,8 @@ QString WalletPlugin::startPrivacyJob(const QString& op, const QString& asset,
                                       const QStringList& sendArgs,
                                       const QString& from, const QString& to,
                                       const QString& amount,
-                                      const QString& binOverride)
+                                      const QString& binOverride,
+                                      const QString& waitForJob)
 {
     // Bound the registry - drop the oldest terminal jobs once we hit the cap.
     if (m_jobs.size() >= kMaxJobs) {
@@ -2843,21 +3291,70 @@ QString WalletPlugin::startPrivacyJob(const QString& op, const QString& asset,
     j->state  = QStringLiteral("running");
     j->phase  = QStringLiteral("processing");
     j->timer.start();
-
-    QProcess* proc = new QProcess(this);
-    proc->setProcessChannelMode(QProcess::SeparateChannels);
-    j->proc = proc;
     m_jobs.insert(jobId, j);
 
     // redactedArgs, not a raw join: this is the same log ring the synchronous runner redacts into,
-    // and it must not be the one place a future --password/--private-key call site leaks.
-    appendLog(QStringLiteral("%1 (%2): wallet %3").arg(op, j->asset, redactedArgs(sendArgs)));
+    // and it must not be the one place a future --password/--private-key call site leaks. The
+    // program is named from `bin` rather than written as "wallet": a job that runs its own binary
+    // would otherwise be logged as a wallet-CLI call that no wallet CLI ever made.
+    appendLog(QStringLiteral("%1 (%2): %3 %4")
+                  .arg(op, j->asset, QFileInfo(bin).fileName(), redactedArgs(sendArgs)));
+
+    // QUEUED BEHIND ANOTHER JOB (only the faucet's token half does this - see startTokenFaucet).
+    // The job exists, is registered and is reported "running" so the caller gets an ordinary
+    // jobId to poll; only the child is held back. It is launched by onJobFinished when the job it
+    // waits for ends, or by the fallback timer below if that never happens.
+    if (!waitForJob.isEmpty()) {
+        const Job* ahead = m_jobs.value(waitForJob, nullptr);
+        if (ahead && ahead->state == QStringLiteral("running")) {
+            j->waitFor     = waitForJob;
+            j->pendingBin  = bin;
+            j->pendingArgs = sendArgs;
+            j->pendingOwnBin = !binOverride.isEmpty();
+            j->phase       = QStringLiteral("queued");
+            // A queued job with no child would never finish if the job ahead of it somehow never
+            // reported, so the wait is capped rather than trusted. Starting late is recoverable;
+            // hanging forever is not.
+            QTimer::singleShot(kQueuedStartMaxMs, this, [this, jobId]() {
+                if (Job* job = m_jobs.value(jobId, nullptr))
+                    if (job->state == QStringLiteral("running") && !job->proc
+                        && !job->pendingBin.isEmpty())
+                        startJobProcess(job, job->pendingBin, job->pendingArgs, job->pendingOwnBin);
+            });
+            QJsonObject q;
+            q[QStringLiteral("jobId")] = jobId;
+            q[QStringLiteral("state")] = QStringLiteral("running");
+            return QJsonDocument(q).toJson(QJsonDocument::Compact);
+        }
+    }
+
+    startJobProcess(j, bin, sendArgs, !binOverride.isEmpty());
+
+    QJsonObject o;
+    o[QStringLiteral("jobId")] = jobId;
+    o[QStringLiteral("state")] = QStringLiteral("running");
+    return QJsonDocument(o).toJson(QJsonDocument::Compact);
+}
+
+// Create, wire and launch the child for ONE job. Split out of startPrivacyJob so a queued job
+// can be started later through the exact same path: a second copy of this wiring is how a
+// follow-on job quietly loses the kill budget, the phase reporting or the password on stdin.
+void WalletPlugin::startJobProcess(Job* j, const QString& bin, const QStringList& args,
+                                   bool ownBin)
+{
+    if (!j || j->proc)
+        return;
+    const QString jobId = j->id;
+
+    QProcess* proc = new QProcess(this);
+    proc->setProcessChannelMode(QProcess::SeparateChannels);
+    j->proc  = proc;
+    j->phase = QStringLiteral("processing");
 
     QObject::connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
                      this, [this, jobId](int code, QProcess::ExitStatus) {
         onJobFinished(jobId, code);
     });
-    const bool ownBin = !binOverride.isEmpty();
     QObject::connect(proc, &QProcess::errorOccurred, this,
                      [this, jobId, bin, ownBin](QProcess::ProcessError e) {
         if (e != QProcess::FailedToStart) return;   // other errors arrive via finished()
@@ -2876,6 +3373,10 @@ QString WalletPlugin::startPrivacyJob(const QString& op, const QString& asset,
                         + QStringLiteral(" - reinstall the medusa_core module, or set "
                                          "MEDUSA_WALLET_CLI before launching"));
         if (job->proc) { job->proc->deleteLater(); job->proc = nullptr; }
+        // This job is terminal and onJobFinished will NEVER run for it: QProcess does not emit
+        // finished() after FailedToStart. Anything sequenced behind it has to be released here
+        // too, or a missing wallet CLI would leave the queued half stuck until the cap expires.
+        startQueuedBehind(jobId);
     });
 
     // Stream stdout so the UI can show a real "sent to L2" phase the moment the CLI
@@ -2923,18 +3424,13 @@ QString WalletPlugin::startPrivacyJob(const QString& op, const QString& asset,
         proc->setProcessEnvironment(penv);
     }
 
-    startChild(*proc, bin, sendArgs);
+    startChild(*proc, bin, args);
     // Feed the session password to the proof process's stdin (empty for plaintext
     // wallets), then close the channel so the CLI proceeds.
     if (proc->waitForStarted(3000)) {
         proc->write((m_password + QStringLiteral("\n")).toUtf8());
         proc->closeWriteChannel();
     }
-
-    QJsonObject o;
-    o[QStringLiteral("jobId")] = jobId;
-    o[QStringLiteral("state")] = QStringLiteral("running");
-    return QJsonDocument(o).toJson(QJsonDocument::Compact);
 }
 
 void WalletPlugin::onJobFinished(const QString& jobId, int exitCode)
@@ -2976,12 +3472,51 @@ void WalletPlugin::onJobFinished(const QString& jobId, int exitCode)
         const QString raw = no.value(QStringLiteral("error")).toString();
         if (raw.contains(QStringLiteral("was not included"))
             || raw.contains(QStringLiteral("rejected it silently"))) {
+            // Name the treasuries, so "fund it" is an instruction rather than a wish. They come
+            // from this zone's row in kFaucetZones, which is the only place they exist.
+            QStringList tre;
+            if (const FaucetZoneRow* row = faucetZoneRow(netId()))
+                for (const FaucetToken& t : row->tokens)
+                    tre << QString::fromLatin1(t.ticker) + QStringLiteral(" ")
+                         + QString::fromLatin1(t.treasury);
             no[QStringLiteral("error")] =
-                QStringLiteral("the faucet treasuries on this zone have no token supply yet - the "
-                               "faucet program is deployed but nobody has funded it, so there is "
-                               "nothing to dispense. Use the standard faucet meanwhile.");
+                QStringLiteral("the faucet treasuries on this zone have no token supply left - the "
+                               "faucet program is deployed and initialized but its treasuries are "
+                               "empty, so there is nothing to dispense")
+                + (tre.isEmpty() ? QString()
+                                 : QStringLiteral(" (") + tre.join(QStringLiteral(", "))
+                                     + QStringLiteral(")"));
             no[QStringLiteral("reason")]    = QStringLiteral("not-funded");
             no[QStringLiteral("rawError")]  = raw;
+            normalized = QJsonDocument(no).toJson(QJsonDocument::Compact);
+        }
+    }
+
+    // ── WHICH HALF DID WHAT, AS A CODE AND NOT A SENTENCE ─────────────────────────────────
+    // The faucet's two halves have INDEPENDENT cooldowns (pinata's is its own; the token
+    // program's is 6h against a marker PDA derived from the first recipient), so they drift
+    // apart the moment anyone claims twice, and "one worked, the other is on cooldown" is the
+    // NORMAL steady state rather than an edge case. A caller has to be able to tell that apart
+    // from a real failure without pattern-matching prose, so every terminal faucet job carries a
+    // machine-readable `reason`. The client's own sentence is left untouched in `error`: it
+    // carries the figure ("N minutes remaining") that a countdown is rendered from.
+    if (!success && (j->op == QStringLiteral("tokenfaucet") || j->op == QStringLiteral("faucet"))
+        && !no.contains(QStringLiteral("reason"))) {
+        const QString raw = no.value(QStringLiteral("error")).toString();
+        const QString low = raw.toLower();
+        QString reason;
+        if (low.contains(QStringLiteral("cooldown")) || low.contains(QStringLiteral("too soon"))
+            || low.contains(QStringLiteral("already claimed")))
+            reason = QStringLiteral("cooldown");
+        else if (low.contains(QStringLiteral("is not initialized")))
+            reason = QStringLiteral("not-initialized");
+        else if (low.contains(QStringLiteral("not owned by this wallet")))
+            reason = QStringLiteral("no-holding");
+        else if (low.contains(QStringLiteral("sequencer unreachable"))
+                 || low.contains(QStringLiteral("timed out")))
+            reason = QStringLiteral("unreachable");
+        if (!reason.isEmpty()) {
+            no[QStringLiteral("reason")] = reason;
             normalized = QJsonDocument(no).toJson(QJsonDocument::Compact);
         }
     }
@@ -3012,6 +3547,31 @@ void WalletPlugin::onJobFinished(const QString& jobId, int exitCode)
 
     proc->deleteLater();
     j->proc = nullptr;
+
+    startQueuedBehind(jobId);
+}
+
+// Launch anything sequenced behind `jobId`, WHATEVER that job answered. The faucet's two halves
+// are sequenced (see startTokenFaucet) so they never drive the wallet store at the same time,
+// but they are not conditional on each other: their cooldowns are independent, so a native claim
+// that was refused - or that never started - must not suppress a token claim that would have
+// worked. Called from both places a job can become terminal.
+//
+// Collected first, then started: startJobProcess does not touch m_jobs, but a launch that fails
+// instantly re-enters through errorOccurred, and iterating a container across that is how a rare
+// crash gets written.
+void WalletPlugin::startQueuedBehind(const QString& jobId)
+{
+    QStringList waiting;
+    for (auto it = m_jobs.constBegin(); it != m_jobs.constEnd(); ++it) {
+        const Job* q = it.value();
+        if (q->waitFor == jobId && q->state == QStringLiteral("running") && !q->proc
+            && !q->pendingBin.isEmpty())
+            waiting << q->id;
+    }
+    for (const QString& qid : std::as_const(waiting))
+        if (Job* q = m_jobs.value(qid, nullptr))
+            startJobProcess(q, q->pendingBin, q->pendingArgs, q->pendingOwnBin);
 }
 
 QString WalletPlugin::getJob(const QString& jobId)
@@ -3372,20 +3932,37 @@ QString WalletPlugin::approveAction(const QString& requestId, const QString& pas
     // already satisfied above, so the dispatch re-presents the established password rather than
     // duplicating each verb into a private ungated twin; if the wallet were locked, authorize()
     // would have refused before reaching here.
+    // The request's (asset, definitionId, amount) is a value spec written out longhand, and its
+    // (to | toNpk+toVpk+toIdentifier) is a recipient spec - assemble both here so the dispatch
+    // still calls the very same verbs the UI calls, in their 4-argument form.
+    QString value = r->amount;
+    if (r->asset == QStringLiteral("token")) {
+        QJsonObject v;
+        v[QStringLiteral("asset")]        = QStringLiteral("token");
+        v[QStringLiteral("definitionId")] = r->definitionId;
+        v[QStringLiteral("amount")]       = r->amount;
+        value = QString::fromUtf8(QJsonDocument(v).toJson(QJsonDocument::Compact));
+    }
+
     QString started;
     if (r->op == QStringLiteral("send")) {
         started = (r->asset == QStringLiteral("token"))
-                ? startSendToken(r->from, r->to, r->definitionId, r->amount, m_password)
-                : startSendTransfer(r->from, r->to, r->amount, m_password);
+                ? startSendToken(r->from, r->to, value, m_password)
+                : startSendTransfer(r->from, r->to, value, m_password);
     } else if (r->op == QStringLiteral("shield")) {
-        started = startShield(r->asset, r->from, r->to, r->amount, r->definitionId, m_password);
+        started = startShield(r->from, r->to, value, m_password);
     } else if (r->op == QStringLiteral("deshield")) {
-        started = startDeshield(r->asset, r->from, r->to, r->amount, r->definitionId, m_password);
+        started = startDeshield(r->from, r->to, value, m_password);
     } else { // private
-        started = r->to.isEmpty()
-                ? startPrivateTransferForeign(r->asset, r->from, r->toNpk, r->toVpk,
-                                              r->toIdentifier, r->amount, m_password)
-                : startPrivateTransfer(r->asset, r->from, r->to, r->amount, m_password);
+        QString recipient = r->to;
+        if (recipient.isEmpty()) {   // foreign: the three shared keys as one recipient spec
+            QJsonObject rc;
+            rc[QStringLiteral("npk")]        = r->toNpk;
+            rc[QStringLiteral("vpk")]        = r->toVpk;
+            rc[QStringLiteral("identifier")] = r->toIdentifier;
+            recipient = QString::fromUtf8(QJsonDocument(rc).toJson(QJsonDocument::Compact));
+        }
+        started = startPrivateTransfer(r->from, recipient, value, m_password);
     }
 
     const QJsonObject so = QJsonDocument::fromJson(started.toUtf8()).object();
@@ -3532,11 +4109,9 @@ QString WalletPlugin::approveZone(const QString& requestId, const QString& passw
     }
 
     if (zoneId.isEmpty()) {
-        // addZone(name, url, onion, tor): clearnet goes in url; a Tor zone goes in onion.
+        // addZone(name, endpoint, tor): one endpoint, whichever transport it is reached over.
         const QString name = r->zoneLabel.isEmpty() ? r->zoneSeq : r->zoneLabel;
-        const QString added = r->zoneTor
-            ? addZone(name, QString(), r->zoneSeq, true)
-            : addZone(name, r->zoneSeq, QString(), false);
+        const QString added = addZone(name, r->zoneSeq, r->zoneTor);
         const QJsonObject ao = QJsonDocument::fromJson(added.toUtf8()).object();
         if (ao.contains(QStringLiteral("error"))) {
             const QString msg = ao.value(QStringLiteral("error")).toString();

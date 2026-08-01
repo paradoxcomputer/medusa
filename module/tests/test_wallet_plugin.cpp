@@ -11,6 +11,7 @@
 #include <QTemporaryDir>
 #include <QFileInfo>
 #include <QProcess>
+#include <QElapsedTimer>
 
 #include <functional>
 
@@ -69,6 +70,43 @@ static QString g_fakeCli;
 
 // The session password every gated test uses.
 static const QString kPw = QStringLiteral("correct horse");
+
+// ── The two spec strings, written out here rather than built ───────────────────────────────
+// Every value-moving verb takes ONE value argument and (on the privacy side) ONE recipient
+// argument, because the Logos bridge marshals at most 5 (qt_provider_object.cpp:20-34) and the
+// session password has to stay last. Spelling the encodings out literally in the suite means a
+// silent change to either parser fails a test instead of quietly re-encoding a spend.
+static const QString kTokenValue =
+    QStringLiteral(R"({"asset":"token","definitionId":"def1","amount":"1"})");
+static const QString kForeignRecipient =
+    QStringLiteral(R"({"npk":"npk","vpk":"vpk","identifier":"ident"})");
+
+// The deployed `medusa_faucet` program id, written out HERE independently of the module so a
+// silent edit to the module's constant fails a test instead of quietly repointing every claim.
+// It is the risc0 ImageID of the audited 437 884-byte guest, and therefore the same on every
+// zone: a LEZ program id is computed from the ELF alone, with no channel, deployer or endpoint
+// mixed in. It was deployed under exactly this id to seq-testnet.paradox.computer (block 975)
+// and testnet.lez.logos.co (block 44810) on 2026-07-31.
+static const QString kFaucetId =
+    QStringLiteral("523320bdfff97cdbec1f01fdb5de9c37b4555abb7585cd123d77e9d09756e571");
+
+// ── The per-zone faucet token table, transcribed independently of the module ───────────────
+// Same reasoning as kFaucetId: these are chain facts (definitions minted and treasuries funded
+// and verified on 2026-07-31), so a silent edit to kFaucetZones has to fail a test rather than
+// quietly repoint every claim at accounts that do not exist. The wallet's DEFAULT zone is
+// "paradox-clearnet", which is why these are the ids the untouched tests below see.
+static const QStringList kParadoxDefs{
+    QStringLiteral("5YEhWdY2edtRFkCruXjtnFH5F62VkCiCxXmNAvHuVkEY"),   // GOLD
+    QStringLiteral("HUDERmRqyX6swMnuk9FT5vmqNbcdLNbVxDRtLEdzsMXk"),   // SILV
+    QStringLiteral("3zS3bGdToZcqPU9jBZC8c1aK9MQvpekse9EJ52nD1wiM") }; // BRNZ
+static const QStringList kParadoxTreasuries{
+    QStringLiteral("A9NwZksDYPzZzpdnbHmJkcEwgHvbGmmYNsYV9rHGoxAF"),
+    QStringLiteral("5iG2BTUhWCmgviBw54ZMtr3qjSMyLfPz7pMNAwvk6kiQ"),
+    QStringLiteral("89MWMvGchyEVq4FZFQPsXS747LQjLe4L9ev4hXMBY8PK") };
+static const QStringList kLogosDefs{
+    QStringLiteral("7ZZGE941fzSGCAfxxdkPWQszSspBhZEcjHUkLqWrrnz6"),   // GOLD
+    QStringLiteral("CfuvpaUhbxEzWd6ZtLDiKWVg5DZLiYj14Q8HgtDUwuS6"),   // SILV
+    QStringLiteral("EEMUsdWL1WxrQBi1SmNFUKVcMUjgVcky12NRv2BjBuxp") }; // BRNZ
 
 // ── Test class ────────────────────────────────────────────────────────────────
 class TestWalletPlugin : public QObject
@@ -185,6 +223,123 @@ private:
         return f.open(QIODevice::ReadOnly) ? QString::fromUtf8(f.readAll()) : QString();
     }
 
+    // ── On-chain faucet stand-ins ───────────────────────────────────────────────
+    // A fake medusa-faucet-client. `programId` is what its OFFLINE `info` subcommand reports,
+    // which is the whole point: a test can hand the wallet a guest binary that is not the
+    // deployed program and watch it refuse. Records argv and the wallet home it was given, so a
+    // test can prove what was claimed, for whom, and out of which wallet.
+    QString makeFaucetClient(const QString& programId,
+                             const QString& claimOut = QStringLiteral("{\"ok\":true}"),
+                             int claimCode = 0)
+    {
+        const QString path = m_tmp.path() + QStringLiteral("/fake_faucet_client.sh");
+        // The temp dir outlives one test, so a previous test's transcript has to go: "the
+        // client never ran" is asserted by the ABSENCE of these files, and a stale one would
+        // make that assertion fail (or, worse, pass for the wrong reason).
+        QFile::remove(path + QStringLiteral(".argv"));
+        QFile::remove(path + QStringLiteral(".home"));
+        QString body = QStringLiteral("#!/bin/sh\n");
+        body += QStringLiteral(": > '%1.argv'\nfor a in \"$@\"; do echo \"$a\" >> '%1.argv'; done\n")
+                    .arg(path);
+        body += QStringLiteral("printf '%s' \"$LEE_WALLET_HOME_DIR\" > '%1.home'\n").arg(path);
+        body += QStringLiteral("if [ \"$1\" = info ]; then\n"
+                               "  echo '{\"ok\":true,\"binSizeBytes\":1,\"programId\":\"%1\"}'\n"
+                               "  exit 0\n"
+                               "fi\n").arg(programId);
+        body += QStringLiteral("echo '%1'\nexit %2\n").arg(claimOut).arg(claimCode);
+        return writeExec(path, body);
+    }
+    // Something for faucetGuestBin() to find. Its CONTENT is deliberately not risc0 bytecode:
+    // the wallet never parses it, it proves the id through the client's `info` instead.
+    QString makeFaucetGuestBin()
+    {
+        const QString path = m_tmp.path() + QStringLiteral("/medusa_faucet.bin");
+        QFile f(path);
+        f.open(QIODevice::WriteOnly);
+        f.write("stand-in for the risc0 guest ELF");
+        f.close();
+        return path;
+    }
+    // A wallet CLI for the faucet path. The preflight reads this wallet's holdings registry;
+    // the CLAIM path may also mint a holding account ("account new public") and record it
+    // ("token-registry vault <def> <bare>"). Every invocation is appended to <path>.argv so a
+    // test can prove what the module asked the wallet to do, and each minted account gets a
+    // distinct id so the recipients are distinct the way the chain requires.
+    // NOTE there is no `whitelist` case: the zone's definitions come from the module's own zone
+    // table now, and a test that could feed them in through the CLI would be testing a path
+    // that no longer exists.
+    QString makeTokenCli(const QString& registryJson)
+    {
+        const QString path = m_tmp.path() + QStringLiteral("/tokens_wallet.sh");
+        QString body = QStringLiteral("#!/bin/sh\n");
+        body += QStringLiteral("for a in \"$@\"; do echo \"$a\" >> '%1.argv'; done\n"
+                               "echo '--' >> '%1.argv'\n").arg(path);
+        body += QStringLiteral(
+            "case \"$1\" in\n"
+            "  token-registry)\n"
+            "    if [ \"$2\" = vault ]; then echo '{\"ok\":true}'\n"
+            "    else echo '%1'; fi ;;\n"
+            "  account)\n"
+            "    if [ \"$2\" = new ]; then\n"
+            "      n=$(cat '%2.n' 2>/dev/null || echo 0); n=$((n+1)); echo \"$n\" > '%2.n'\n"
+            "      echo \"{\\\"ok\\\":true,\\\"output\\\":\\\"Generated new account with \"\\\n"
+            "\"account_id Public/minted$n at path 0\\\"}\"\n"
+            "    else echo '{\"ok\":true}'; fi ;;\n"
+            "  *) echo '{\"ok\":true}' ;;\n"
+            "esac\n").arg(registryJson, path);
+        return writeExec(path, body);
+    }
+    // Install a working on-chain faucet: the real program id, a guest binary, and a wallet that
+    // already holds a vault for each of the ACTIVE zone's three faucet tokens. The default from
+    // which each test below removes exactly one precondition.
+    void useWorkingFaucet(const QString& programId = kFaucetId)
+    {
+        qputenv("MEDUSA_FAUCET_CLIENT", makeFaucetClient(programId).toUtf8());
+        qputenv("MEDUSA_FAUCET_BIN",    makeFaucetGuestBin().toUtf8());
+        useCli(makeTokenCli(registryWithVaults(kParadoxDefs)));
+    }
+    // A token-registry reply designating "vault-<n>" as the holding for each definition.
+    static QString registryWithVaults(const QStringList& defs)
+    {
+        QStringList quoted, pairs;
+        for (int i = 0; i < defs.size(); ++i) {
+            quoted << QStringLiteral("\"%1\"").arg(defs.at(i));
+            pairs  << QStringLiteral("\"%1\":\"vault-%2\"").arg(defs.at(i)).arg(i + 1);
+        }
+        return QStringLiteral("{\"definitions\":[%1],\"names\":{},\"vaults\":{%2}}")
+                   .arg(quoted.join(QLatin1Char(',')), pairs.join(QLatin1Char(',')));
+    }
+    // The vault ids registryWithVaults() hands out, in the same order.
+    static QStringList vaultIds(int n)
+    {
+        QStringList v;
+        for (int i = 1; i <= n; ++i) v << QStringLiteral("vault-%1").arg(i);
+        return v;
+    }
+    // Add a user zone and make it active. Returns its id.
+    QString useUserZone(WalletPlugin& p, const QString& name = QStringLiteral("My node"))
+    {
+        const auto add = parseObj(p.addZone(name, QStringLiteral("https://example.invalid:3072/"),
+                                            false));
+        const QString id = add[QStringLiteral("id")].toString();
+        p.setActiveZone(id);
+        return id;
+    }
+    // Wait for a job to leave "running" (the fake client exits at once, but through the event
+    // loop). Returns the terminal job object.
+    QJsonObject awaitJob(WalletPlugin& p, const QString& jobId, int budgetMs = 4000)
+    {
+        QJsonObject j;
+        QElapsedTimer t;
+        t.start();
+        do {
+            QTest::qWait(25);
+            j = parseObj(p.getJob(jobId));
+        } while (j[QStringLiteral("state")].toString() == QStringLiteral("running")
+                 && t.elapsed() < budgetMs);
+        return j;
+    }
+
     // Establish a session the way a user does: unlock(), which VERIFIES the candidate against the
     // store by running the CLI, and refuses a wrong one.
     //
@@ -240,23 +395,23 @@ private:
                                            QStringLiteral("1"), pw); } },
             { QStringLiteral("startSendToken"), [](WalletPlugin& p, const QString& pw) {
                 return p.startSendToken(QStringLiteral("Public/a"), QStringLiteral("Public/d"),
-                                        QStringLiteral("def1"), QStringLiteral("1"), pw); } },
+                                        kTokenValue, pw); } },
             { QStringLiteral("startShield"), [](WalletPlugin& p, const QString& pw) {
-                return p.startShield(QStringLiteral("native"), QStringLiteral("Public/a"),
-                                     QStringLiteral("Private/s1"), QStringLiteral("1"),
-                                     QString(), pw); } },
+                return p.startShield(QStringLiteral("Public/a"), QStringLiteral("Private/s1"),
+                                     QStringLiteral("1"), pw); } },
             { QStringLiteral("startDeshield"), [](WalletPlugin& p, const QString& pw) {
-                return p.startDeshield(QStringLiteral("native"), QStringLiteral("Private/a"),
-                                       QStringLiteral("Public/e"), QStringLiteral("1"),
-                                       QString(), pw); } },
+                return p.startDeshield(QStringLiteral("Private/a"), QStringLiteral("Public/e"),
+                                       QStringLiteral("1"), pw); } },
             { QStringLiteral("startPrivateTransfer"), [](WalletPlugin& p, const QString& pw) {
-                return p.startPrivateTransfer(QStringLiteral("native"), QStringLiteral("Private/a"),
-                                              QStringLiteral("Private/s2"), QStringLiteral("1"), pw); } },
-            { QStringLiteral("startPrivateTransferForeign"), [](WalletPlugin& p, const QString& pw) {
-                return p.startPrivateTransferForeign(QStringLiteral("native"),
-                                                     QStringLiteral("Private/a"),
-                                                     QStringLiteral("npk"), QStringLiteral("vpk"),
-                                                     QStringLiteral("ident"), QStringLiteral("1"), pw); } },
+                return p.startPrivateTransfer(QStringLiteral("Private/a"),
+                                              QStringLiteral("Private/s2"),
+                                              QStringLiteral("1"), pw); } },
+            // The foreign-recipient form is the SAME gated verb with a recipient spec in `to`.
+            // It kept its own row here because it used to be its own verb (at an arity the
+            // bridge could not dispatch), and losing the row would lose the gate coverage.
+            { QStringLiteral("startPrivateTransfer(foreign)"), [](WalletPlugin& p, const QString& pw) {
+                return p.startPrivateTransfer(QStringLiteral("Private/a"), kForeignRecipient,
+                                              QStringLiteral("1"), pw); } },
             { QStringLiteral("consolidateToken"), [](WalletPlugin& p, const QString& pw) {
                 return p.consolidateToken(QStringLiteral("Public/a"), QStringLiteral("def1"), pw); } },
             { QStringLiteral("approveAction"), [](WalletPlugin& p, const QString& pw) {
@@ -266,6 +421,11 @@ private:
             // round of gating.
             { QStringLiteral("approveZone"), [](WalletPlugin& p, const QString& pw) {
                 return p.approveZone(QStringLiteral("req-1"), pw); } },
+            // The on-chain faucet claim signs and broadcasts with the wallet's keys, so it is a
+            // spend verb and belongs on this list rather than beside the ungated startFaucet.
+            // Listing it here is what subjects it to all six gate tests at once.
+            { QStringLiteral("startTokenFaucet"), [](WalletPlugin& p, const QString& pw) {
+                return p.startTokenFaucet(QStringLiteral("Public/a"), pw); } },
         };
     }
 
@@ -291,6 +451,11 @@ private slots:
         qunsetenv("MEDUSA_WALLET_CLI");
         qunsetenv("MEDUSA_SEQ_PATH");
         qunsetenv("MEDUSA_IDLE_LOCK_MS");
+        // The on-chain faucet's two overrides. Cleared per test for the same reason as the CLI:
+        // a leftover stand-in from one test must not decide another's verdict, and no test may
+        // fall through to a faucet client the developer happens to have installed.
+        qunsetenv("MEDUSA_FAUCET_CLIENT");
+        qunsetenv("MEDUSA_FAUCET_BIN");
         // The gate now reads the store on disk (a plaintext one cannot be protected by a
         // password, so it refuses), which makes leftover storage.json state from a previous test
         // able to change another test's verdict. Start every test with an empty wallet home.
@@ -330,12 +495,19 @@ private slots:
     {
         const QString dir = QCoreApplication::applicationDirPath() + QStringLiteral("/bin");
         QDir().mkpath(dir);
-        const QString path = dir + QStringLiteral("/wallet");
-        QFile f(path);
-        f.open(QIODevice::WriteOnly | QIODevice::Text);
-        f.write("#!/bin/sh\necho '{\"ok\":true}'\n");
-        f.close();
-        QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+        QString path;
+        // BOTH names. cliPath() resolves "medusa-wallet" and only falls back to the legacy
+        // "wallet" for installs made before the rename, so the safety net that keeps a test
+        // which forgot MEDUSA_WALLET_CLI off the developer's real binary has to cover the name
+        // that is actually resolved first.
+        for (const QString& name : { QStringLiteral("/medusa-wallet"), QStringLiteral("/wallet") }) {
+            path = dir + name;
+            QFile f(path);
+            f.open(QIODevice::WriteOnly | QIODevice::Text);
+            f.write("#!/bin/sh\necho '{\"ok\":true}'\n");
+            f.close();
+            QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+        }
         return path;
     }
 
@@ -541,6 +713,490 @@ private slots:
         QCOMPARE(r[QStringLiteral("ok")].toBool(), true);
     }
 
+    // ── The on-chain faucet (the deployed medusa_faucet program) ──────────────
+    //
+    // The program is deployed on both operator zones, but neither has token definitions or
+    // funded treasuries on it yet. So every test here is about the wallet behaving well while
+    // the on-chain faucet CANNOT PAY OUT, which is the only state it has ever been in - and
+    // about it never quietly replacing the client-side faucet that can.
+
+    // The constant is a fact about the ELF, not about a zone. If someone ever "fixes" this by
+    // introducing a per-zone id, the wallet would claim from a program that does not exist on
+    // the other zone, and this fails.
+    void testFaucetProgramIdIsTheSameConstantOnEveryZone()
+    {
+        WalletPlugin p;
+        const auto a = parseObj(p.faucetStatus());
+        QCOMPARE(a[QStringLiteral("programId")].toString(), kFaucetId);
+        // Switching zones may not switch programs. Both zones the program was deployed to, by
+        // their real ids, plus the local sandbox.
+        for (const QString& zone : { QStringLiteral("paradox-clearnet"),
+                                     QStringLiteral("logos-testnet"),
+                                     QStringLiteral("devnet") }) {
+            QVERIFY2(!parseObj(p.setActiveZone(zone)).contains(QStringLiteral("error")),
+                     qPrintable(QStringLiteral("no such built-in zone: ") + zone));
+            QCOMPARE(parseObj(p.faucetStatus())[QStringLiteral("programId")].toString(), kFaucetId);
+        }
+    }
+
+    // Nothing is installed: the honest answer is "this wallet cannot do that", named precisely
+    // enough to act on, and NOT a crash, a silent no-op, or a claim that looks available.
+    void testFaucetStatusSaysWhyItIsUnavailableRatherThanFailingOpaquely()
+    {
+        WalletPlugin p;
+        const auto r = parseObj(p.faucetStatus());
+        QCOMPARE(r[QStringLiteral("available")].toBool(), false);
+        QCOMPARE(r[QStringLiteral("reason")].toString(),  QString("client-missing"));
+        QCOMPARE(r[QStringLiteral("clientFound")].toBool(), false);
+        QVERIFY2(r[QStringLiteral("message")].toString().length() > 20,
+                 "an unavailable faucet must explain itself, not just refuse");
+        // Availability is not a guess about funding: the wallet cannot read a treasury balance,
+        // and says so rather than implying it checked.
+        QCOMPARE(r[QStringLiteral("funded")].toString(), QString("unknown"));
+    }
+
+    // THE CONSTANT DOING WORK. medusa-faucet-client recomputes the program id from whatever .bin
+    // it is handed, so a swapped guest binary would silently point a signed claim at a different
+    // program. The wallet proves the id offline first and refuses.
+    void testAGuestBinaryThatIsNotTheDeployedProgramIsRefused()
+    {
+        useWorkingFaucet(QStringLiteral(
+            "dead00000000000000000000000000000000000000000000000000000000beef"));
+        WalletPlugin p;
+        arm(p);
+
+        const auto st = parseObj(p.faucetStatus());
+        QCOMPARE(st[QStringLiteral("available")].toBool(), false);
+        QCOMPARE(st[QStringLiteral("reason")].toString(), QString("program-mismatch"));
+        QCOMPARE(st[QStringLiteral("verified")].toBool(), false);
+
+        // …and the claim refuses too, WITH THE CORRECT PASSWORD: the gate is not what stops this.
+        const auto r = parseObj(p.startTokenFaucet(QStringLiteral("Public/a"), kPw));
+        QCOMPARE(r[QStringLiteral("reason")].toString(), QString("program-mismatch"));
+        QVERIFY2(!r.contains(QStringLiteral("jobId")), "a mismatched program was claimed from");
+        // Nothing was ever claimed: the client only ever ran its offline `info`.
+        const QString argv = slurp(qEnvironmentVariable("MEDUSA_FAUCET_CLIENT") + QStringLiteral(".argv"));
+        QVERIFY2(!argv.contains(QStringLiteral("claim")),
+                 qPrintable(QStringLiteral("a claim was sent to a mismatched program: ") + argv));
+    }
+
+    // ══ THE PER-ZONE CAPABILITY ═══════════════════════════════════════════════════════════
+    // The token faucet exists on the two built-in operator zones and NOWHERE else. It is a
+    // property of the zone, published on the zone record, so the list the UI renders and the
+    // claim that runs cannot disagree.
+    void testTheTokenFaucetIsAPropertyOfTheZoneRecord()
+    {
+        WalletPlugin p;
+        const QString userZone = useUserZone(p);
+
+        QHash<QString, bool> flag;
+        const QJsonArray zones = parseObj(p.getZones())[QStringLiteral("zones")].toArray();
+        for (const QJsonValue& v : zones)
+            flag.insert(v.toObject()[QStringLiteral("id")].toString(),
+                        v.toObject()[QStringLiteral("tokenFaucet")].toBool());
+
+        // The two zones the program and its funded treasuries are deployed on.
+        QCOMPARE(flag.value(QStringLiteral("paradox-clearnet")), true);
+        QCOMPARE(flag.value(QStringLiteral("logos-testnet")),    true);
+        // The local sandbox is a chain this wallet starts itself: nothing is deployed on it.
+        QCOMPARE(flag.value(QStringLiteral("devnet")),   false);
+        QCOMPARE(flag.value(QStringLiteral("diaphani")), false);
+        // …and a zone the user added is somebody else's sequencer.
+        QVERIFY2(flag.contains(userZone), "the user zone was not listed at all");
+        QCOMPARE(flag.value(userZone), false);
+    }
+
+    // THE RULE THE OWNER STATED, AS BEHAVIOUR: on a user-added zone the wallet must not even
+    // TRY the token half. Not "try and fail politely" - the faucet client must never run, since
+    // running it there would spawn a helper, probe a program id and produce an install-side
+    // complaint about a faucet that zone was never going to have.
+    void testAUserAddedZoneNeverAttemptsTheTokenFaucet()
+    {
+        useWorkingFaucet();                 // a perfectly good install…
+        WalletPlugin p;
+        arm(p);
+        useUserZone(p);                     // …on a zone that has no token faucet
+
+        const auto st = parseObj(p.faucetStatus());
+        QCOMPARE(st[QStringLiteral("available")].toBool(), false);
+        QCOMPARE(st[QStringLiteral("reason")].toString(), QString("unsupported-zone"));
+        QCOMPARE(st[QStringLiteral("tokenFaucetZone")].toBool(), false);
+        QVERIFY2(st[QStringLiteral("definitions")].toArray().isEmpty(),
+                 "a zone with no token faucet was given token definitions");
+
+        const auto r = parseObj(p.startTokenFaucet(QStringLiteral("Public/a"), kPw));
+        QCOMPARE(r[QStringLiteral("reason")].toString(), QString("unsupported-zone"));
+        QVERIFY2(!r.contains(QStringLiteral("jobId")), "a claim was started on a LEZ-only zone");
+        // Nothing was launched: not the claim, and not even the offline program-id probe.
+        QVERIFY2(!QFile::exists(qEnvironmentVariable("MEDUSA_FAUCET_CLIENT")
+                                + QStringLiteral(".argv")),
+                 "the faucet client ran on a zone with no token faucet");
+    }
+
+    // The capability is derived from the module's own zone table and never read back off the
+    // stored zone record. That record is an ordinary user-writable QSettings value (see
+    // cliPath()), so a co-resident module can write one - and if the flag were trusted, it
+    // would point a signed claim at a sequencer of the attacker's choosing.
+    void testAPlantedZoneRecordCannotGrantItselfTheTokenFaucet()
+    {
+        QSettings s;
+        s.setValue(QStringLiteral("medusa-wallet/zones"),
+                   QStringLiteral("[{\"id\":\"z-evil\",\"name\":\"Evil\","
+                                  "\"url\":\"https://evil.invalid/\",\"tor\":false,"
+                                  "\"tokenFaucet\":true,\"faucetTokens\":true}]"));
+        s.sync();
+
+        useWorkingFaucet();
+        WalletPlugin p;
+        arm(p);
+        QVERIFY(!parseObj(p.setActiveZone(QStringLiteral("z-evil"))).contains(QStringLiteral("error")));
+
+        const QJsonArray zones = parseObj(p.getZones())[QStringLiteral("zones")].toArray();
+        for (const QJsonValue& v : zones)
+            if (v.toObject()[QStringLiteral("id")].toString() == QStringLiteral("z-evil"))
+                QVERIFY2(!v.toObject()[QStringLiteral("tokenFaucet")].toBool(),
+                         "a planted zone record granted itself the token faucet");
+
+        const auto r = parseObj(p.startTokenFaucet(QStringLiteral("Public/a"), kPw));
+        QCOMPARE(r[QStringLiteral("reason")].toString(), QString("unsupported-zone"));
+        QVERIFY(!r.contains(QStringLiteral("jobId")));
+    }
+
+    // The definitions are a fact about the ZONE, held in the module's table. They used to be
+    // read from faucet_tokens-<zone>.json in the treasury directory, which is operator state
+    // outside the install: deleting it emptied the list with no error anywhere, and that is
+    // half of the reported bug (LEZ kept arriving, tokens silently stopped).
+    void testTheZonesTokensComeFromTheZoneTableAndNotFromLocalFiles()
+    {
+        // A wallet CLI that answers EVERYTHING with {"ok":true}: it has no whitelist to give.
+        useCli(makeFakeCli(R"({"ok":true})"));
+        WalletPlugin p;
+
+        auto defsOf = [&]() {
+            QStringList out;
+            const QJsonArray a = QJsonDocument::fromJson(p.getWhitelist().toUtf8()).array();
+            for (const QJsonValue& v : a) out << v.toObject()[QStringLiteral("def")].toString();
+            return out;
+        };
+        p.setActiveZone(QStringLiteral("paradox-clearnet"));
+        QCOMPARE(defsOf(), kParadoxDefs);
+        // Per-zone, and NOT the same list twice: the definitions are accounts on one chain.
+        p.setActiveZone(QStringLiteral("logos-testnet"));
+        QCOMPARE(defsOf(), kLogosDefs);
+        // A zone with no token faucet offers no curated tokens at all.
+        p.setActiveZone(QStringLiteral("devnet"));
+        QCOMPARE(defsOf(), QStringList());
+    }
+
+    // A wallet that has never held a faucet token is the NORMAL state after a reset, and it
+    // used to be a dead end: the preflight refused with "use the standard faucet once (it
+    // creates one)", advice that stopped being true the moment the client-side token drop was
+    // removed. The on-chain program accepts an uninitialized recipient, so the claim path mints
+    // one per definition and records it, and the claim goes ahead.
+    void testAWalletWithNoHoldingHasOneCreatedForItRatherThanBeingRefused()
+    {
+        qputenv("MEDUSA_FAUCET_CLIENT", makeFaucetClient(kFaucetId).toUtf8());
+        qputenv("MEDUSA_FAUCET_BIN",    makeFaucetGuestBin().toUtf8());
+        useCli(makeTokenCli(QStringLiteral("{\"definitions\":[],\"names\":{},\"vaults\":{}}")));
+
+        WalletPlugin p;
+        arm(p);
+        // Status stays honest AND stays read-only: it reports the faucet as available (it is),
+        // and it must not mint anything, because the UI calls it on every Tokens-tab open.
+        const auto st = parseObj(p.faucetStatus());
+        QCOMPARE(st[QStringLiteral("available")].toBool(), true);
+        const QString cliArgv = qEnvironmentVariable("MEDUSA_WALLET_CLI") + QStringLiteral(".argv");
+        QVERIFY2(!slurp(cliArgv).contains(QStringLiteral("new")),
+                 "faucetStatus created an account - a read-only status call must not write");
+
+        const auto r = parseObj(p.startTokenFaucet(QStringLiteral("Public/a"), kPw));
+        QVERIFY2(r.contains(QStringLiteral("jobId")), qPrintable(QJsonDocument(r).toJson()));
+        awaitJob(p, r[QStringLiteral("jobId")].toString());
+
+        // One account per definition, each recorded as that definition's vault BEFORE the
+        // claim: the cooldown marker PDA is derived from the first recipient, so a claim that
+        // minted fresh accounts every time would never bind to a marker at all.
+        const QString argv = slurp(cliArgv);
+        QCOMPARE(argv.count(QStringLiteral("\nnew\n")), kParadoxDefs.size());
+        for (const QString& def : kParadoxDefs)
+            QVERIFY2(argv.contains(QStringLiteral("\nvault\n") + def),
+                     qPrintable(QStringLiteral("no vault was recorded for ") + def));
+
+        const QStringList cargv = slurp(qEnvironmentVariable("MEDUSA_FAUCET_CLIENT")
+                                        + QStringLiteral(".argv"))
+                                      .split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+        const int acct = cargv.indexOf(QStringLiteral("--account"));
+        QVERIFY(acct >= 0);
+        QCOMPARE(cargv.at(acct + 1), QString("minted1,minted2,minted3"));
+    }
+
+    // A claim never uses the user's own account as a recipient. On rc5 an account holds exactly
+    // ONE token definition, so spending the main account here would bind it to one token
+    // permanently - the wallet's per-definition holdings are the only correct targets.
+    void testAClaimTargetsThePerTokenHoldingsAndNeverTheUsersAccount()
+    {
+        useWorkingFaucet();
+        WalletPlugin p;
+        arm(p);
+
+        const auto r = parseObj(p.startTokenFaucet(QStringLiteral("Public/my-main-account"), kPw));
+        QVERIFY2(r.contains(QStringLiteral("jobId")), qPrintable(QJsonDocument(r).toJson()));
+        awaitJob(p, r[QStringLiteral("jobId")].toString());
+
+        const QString client = qEnvironmentVariable("MEDUSA_FAUCET_CLIENT");
+        const QStringList argv = slurp(client + QStringLiteral(".argv"))
+                                     .split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+        QVERIFY2(argv.contains(QStringLiteral("claim")), qPrintable(argv.join(QLatin1Char(' '))));
+        const int acct = argv.indexOf(QStringLiteral("--account"));
+        const int defs = argv.indexOf(QStringLiteral("--definitions"));
+        QVERIFY(acct >= 0 && defs >= 0);
+        QCOMPARE(argv.at(acct + 1), vaultIds(kParadoxDefs.size()).join(QLatin1Char(',')));
+        // …and the definitions are the ACTIVE ZONE's, from the module's table.
+        QCOMPARE(argv.at(defs + 1), kParadoxDefs.join(QLatin1Char(',')));
+        QVERIFY2(!argv.at(acct + 1).contains(QStringLiteral("my-main-account")),
+                 "the claim used the user's own account as a token holding");
+        // One recipient per definition, in the same order: the client pairs them positionally.
+        QCOMPARE(argv.at(acct + 1).split(QLatin1Char(',')).size(),
+                 argv.at(defs + 1).split(QLatin1Char(',')).size());
+    }
+
+    // The client is not the wallet wrapper, so nothing defaults LEE_WALLET_HOME_DIR for it. If
+    // the module does not pass its own home the client silently operates on a DIFFERENT wallet:
+    // wrong keys, wrong sequencer, and a claim that looks like it did nothing.
+    void testTheFaucetClientIsGivenTheSameWalletHomeTheModuleUses()
+    {
+        useWorkingFaucet();
+        WalletPlugin p;
+        arm(p);
+        const auto r = parseObj(p.startTokenFaucet(QStringLiteral("Public/a"), kPw));
+        QVERIFY(r.contains(QStringLiteral("jobId")));
+        awaitJob(p, r[QStringLiteral("jobId")].toString());
+
+        const QString home = slurp(qEnvironmentVariable("MEDUSA_FAUCET_CLIENT")
+                                   + QStringLiteral(".home")).trimmed();
+        QCOMPARE(home, qEnvironmentVariable("LEE_WALLET_HOME_DIR"));
+    }
+
+    // The one failure the wallet cannot pre-check: initialized treasuries with nothing in them.
+    // The chain answers by silently dropping the transaction, and "not included within 4 blocks"
+    // is not something a user can act on. It must be translated, and the raw text kept.
+    void testAnEmptyTreasuryIsReportedAsUnfundedNotAsASilentRejection()
+    {
+        qputenv("MEDUSA_FAUCET_CLIENT", makeFaucetClient(
+            kFaucetId,
+            QStringLiteral("{\"error\":\"transaction 0xabc was not included within 4 blocks - the "
+                           "sequencer rejected it silently (program execution failed on-chain)\"}"),
+            1).toUtf8());
+        qputenv("MEDUSA_FAUCET_BIN", makeFaucetGuestBin().toUtf8());
+        useCli(makeTokenCli(registryWithVaults(kParadoxDefs)));
+
+        WalletPlugin p;
+        arm(p);
+        const auto r = parseObj(p.startTokenFaucet(QStringLiteral("Public/a"), kPw));
+        QVERIFY(r.contains(QStringLiteral("jobId")));
+        const auto job = awaitJob(p, r[QStringLiteral("jobId")].toString());
+
+        QCOMPARE(job[QStringLiteral("state")].toString(), QString("error"));
+        QCOMPARE(job[QStringLiteral("reason")].toString(), QString("not-funded"));
+        const QString msg = job[QStringLiteral("error")].toString();
+        QVERIFY2(!msg.contains(QStringLiteral("not included within")),
+                 qPrintable(QStringLiteral("the raw rejection was shown to the user: ") + msg));
+        // "Fund it" is only an instruction if it says WHICH accounts. They come from this
+        // zone's row in the table, and they are the only place those addresses exist.
+        for (const QString& t : kParadoxTreasuries)
+            QVERIFY2(msg.contains(t), qPrintable(QStringLiteral("treasury not named: ") + msg));
+        // Kept, not discarded: an operator debugging the zone still needs the real text.
+        QVERIFY2(job[QStringLiteral("rawError")].toString().contains(QStringLiteral("not included")),
+                 "the underlying sequencer message was thrown away");
+    }
+
+    // ══ PARTIAL SUCCESS IS THE NORMAL CASE ════════════════════════════════════════════════
+    // pinata's cooldown and the token program's 6h marker cooldown are independent, so the two
+    // halves drift apart the moment anyone claims twice. "150 LEZ arrived, tokens are on
+    // cooldown" has to come back as two terminal jobs whose outcomes are separately readable -
+    // one machine code each - or a caller has to guess from prose which half did what.
+    void testALezClaimSucceedsWhileTheTokenHalfIsOnCooldown()
+    {
+        qputenv("MEDUSA_FAUCET_CLIENT", makeFaucetClient(
+            kFaucetId,
+            QStringLiteral("{\"error\":\"cooldown not elapsed: 214 minutes remaining before the "
+                           "next claim\"}"),
+            1).toUtf8());
+        qputenv("MEDUSA_FAUCET_BIN", makeFaucetGuestBin().toUtf8());
+        useCli(makeTokenCli(registryWithVaults(kParadoxDefs)));
+
+        WalletPlugin p;
+        arm(p);
+        // Half 1: native LEZ, ungated, succeeds.
+        const auto lez = parseObj(p.startFaucet(QStringLiteral("abc123")));
+        QVERIFY2(lez.contains(QStringLiteral("jobId")), qPrintable(QJsonDocument(lez).toJson()));
+        // Half 2: the tokens, gated, refused on-chain by the cooldown.
+        const auto tok = parseObj(p.startTokenFaucet(QStringLiteral("abc123"), kPw));
+        QVERIFY2(tok.contains(QStringLiteral("jobId")), qPrintable(QJsonDocument(tok).toJson()));
+
+        const auto lj = awaitJob(p, lez[QStringLiteral("jobId")].toString());
+        const auto tj = awaitJob(p, tok[QStringLiteral("jobId")].toString());
+
+        // The LEZ half is NOT dragged down with the token half.
+        QCOMPARE(lj[QStringLiteral("state")].toString(), QString("done"));
+        QCOMPARE(lj[QStringLiteral("op")].toString(),    QString("faucet"));
+        // …and the token half says WHY, as a code and not only as a sentence.
+        QCOMPARE(tj[QStringLiteral("state")].toString(),  QString("error"));
+        QCOMPARE(tj[QStringLiteral("op")].toString(),     QString("tokenfaucet"));
+        QCOMPARE(tj[QStringLiteral("reason")].toString(), QString("cooldown"));
+        // The client's own wording survives untouched: it carries the figure a countdown is
+        // rendered from, and inventing a replacement sentence would throw the number away.
+        QVERIFY2(tj[QStringLiteral("error")].toString().contains(QStringLiteral("214 minutes")),
+                 qPrintable(tj[QStringLiteral("error")].toString()));
+    }
+
+    // The mirror image, which is just as normal: LEZ is still on its own cooldown while the
+    // tokens are claimable. A refusal on one half must never suppress or cancel the other.
+    void testTheTokenHalfStillRunsWhenTheLezHalfIsRefused()
+    {
+        qputenv("MEDUSA_FAUCET_CLIENT", makeFaucetClient(kFaucetId).toUtf8());
+        qputenv("MEDUSA_FAUCET_BIN",    makeFaucetGuestBin().toUtf8());
+        // A wallet CLI whose `pinata claim` takes a moment and then FAILS, and which answers
+        // the registry reads normally. The delay is what makes this deterministic: the token
+        // claim really is queued behind a running native claim, so the release path being
+        // tested is "the job ahead ended in error", not "there was nothing to wait for".
+        const QString path = m_tmp.path() + QStringLiteral("/cooldown_wallet.sh");
+        useCli(writeExec(path, QStringLiteral(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = pinata ]; then\n"
+            "  sleep 1\n"
+            "  echo 'faucet cooldown not elapsed: 42 minutes remaining' >&2; exit 1\n"
+            "fi\n"
+            "if [ \"$1\" = token-registry ] && [ \"$2\" != vault ]; then echo '%1'; exit 0; fi\n"
+            "echo '{\"ok\":true}'\n").arg(registryWithVaults(kParadoxDefs))));
+
+        WalletPlugin p;
+        arm(p);
+        const auto lez = parseObj(p.startFaucet(QStringLiteral("abc123")));
+        const auto tok = parseObj(p.startTokenFaucet(QStringLiteral("abc123"), kPw));
+        QVERIFY(lez.contains(QStringLiteral("jobId")) && tok.contains(QStringLiteral("jobId")));
+        QCOMPARE(parseObj(p.getJob(tok[QStringLiteral("jobId")].toString()))
+                     [QStringLiteral("phase")].toString(), QString("queued"));
+
+        const auto lj = awaitJob(p, lez[QStringLiteral("jobId")].toString(), 8000);
+        const auto tj = awaitJob(p, tok[QStringLiteral("jobId")].toString(), 8000);
+
+        QCOMPARE(lj[QStringLiteral("state")].toString(),  QString("error"));
+        QCOMPARE(lj[QStringLiteral("reason")].toString(), QString("cooldown"));
+        QCOMPARE(tj[QStringLiteral("state")].toString(),  QString("done"));
+        QVERIFY2(slurp(qEnvironmentVariable("MEDUSA_FAUCET_CLIENT") + QStringLiteral(".argv"))
+                     .contains(QStringLiteral("claim")),
+                 "a refused LEZ claim suppressed the token claim");
+    }
+
+    // ORDER. The two halves run as separate jobs, and they must not drive the wallet store at
+    // the same time: `pinata claim` may run `auth-transfer init` for the recipient first (the
+    // pinata program credits without claiming, so the chain rejects a credit to an account it
+    // has no record of), and both halves are separate processes on one storage.json. A token
+    // claim started while a native claim is in flight is therefore QUEUED behind it.
+    void testTheTokenClaimIsQueuedBehindAnInFlightNativeClaim()
+    {
+        qputenv("MEDUSA_FAUCET_CLIENT", makeFaucetClient(kFaucetId).toUtf8());
+        qputenv("MEDUSA_FAUCET_BIN",    makeFaucetGuestBin().toUtf8());
+        // A CLI whose `pinata claim` takes a moment, so the token claim really does arrive
+        // while it is running; everything else answers at once.
+        const QString path = m_tmp.path() + QStringLiteral("/slow_wallet.sh");
+        useCli(writeExec(path, QStringLiteral(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = pinata ]; then sleep 1; echo '{\"ok\":true,\"txHash\":\"tx1\"}'; exit 0; fi\n"
+            "if [ \"$1\" = token-registry ] && [ \"$2\" != vault ]; then echo '%1'; exit 0; fi\n"
+            "echo '{\"ok\":true}'\n").arg(registryWithVaults(kParadoxDefs))));
+
+        WalletPlugin p;
+        arm(p);
+        const QString lezJob = parseObj(p.startFaucet(QStringLiteral("abc123")))
+                                   [QStringLiteral("jobId")].toString();
+        const QString tokJob = parseObj(p.startTokenFaucet(QStringLiteral("abc123"), kPw))
+                                   [QStringLiteral("jobId")].toString();
+        QVERIFY(!lezJob.isEmpty() && !tokJob.isEmpty());
+
+        // The token job is live and pollable, but its child has not been launched: the only
+        // thing the client has run is the preflight's offline `info` probe, never the claim.
+        const auto queued = parseObj(p.getJob(tokJob));
+        QCOMPARE(queued[QStringLiteral("state")].toString(), QString("running"));
+        QCOMPARE(queued[QStringLiteral("phase")].toString(), QString("queued"));
+        const QString clientArgv = qEnvironmentVariable("MEDUSA_FAUCET_CLIENT")
+                                 + QStringLiteral(".argv");
+        QVERIFY2(!slurp(clientArgv).contains(QStringLiteral("claim")),
+                 "the token claim ran beside the native claim instead of behind it");
+
+        // Once the native claim ends, the queued one starts and runs to completion by itself.
+        awaitJob(p, lezJob, 8000);
+        const auto tj = awaitJob(p, tokJob, 8000);
+        QCOMPARE(tj[QStringLiteral("state")].toString(), QString("done"));
+        QVERIFY2(slurp(qEnvironmentVariable("MEDUSA_FAUCET_CLIENT") + QStringLiteral(".argv"))
+                     .contains(QStringLiteral("claim")),
+                 "the queued token claim never started");
+    }
+
+
+    // The guest .bin is data, but it still decides WHICH PROGRAM a signed claim addresses, so it
+    // follows the same rule as every binary this module resolves: on a packaged install the
+    // bundle is the only place looked at, and a copy planted in the uid-writable ~/.local is
+    // never selected. (This test binary has a bundle dir; initTestCase creates it.)
+    void testAPlantedGuestBinaryOutsideTheBundleIsNeverSelected()
+    {
+        const QString bundleDir = QCoreApplication::applicationDirPath() + QStringLiteral("/bin");
+        QVERIFY(QDir(bundleDir).exists());
+        QVERIFY(!QFile::exists(bundleDir + QStringLiteral("/medusa_faucet.bin")));
+
+        // A fake home so the plant never touches the developer's real one.
+        const QByteArray prevHome = qgetenv("HOME");
+        const QString fakeHome = m_tmp.path() + QStringLiteral("/planted-home");
+        QDir().mkpath(fakeHome + QStringLiteral("/.local/bin"));
+        QDir().mkpath(fakeHome + QStringLiteral("/.local/share/medusa"));
+        for (const QString& p : { fakeHome + QStringLiteral("/.local/bin/medusa_faucet.bin"),
+                                  fakeHome + QStringLiteral("/.local/share/medusa/medusa_faucet.bin") }) {
+            QFile f(p);
+            f.open(QIODevice::WriteOnly);
+            f.write("planted");
+            f.close();
+        }
+        qputenv("HOME", fakeHome.toUtf8());
+        // A client IS present, so the preflight gets past step 1 and really does resolve the .bin.
+        qputenv("MEDUSA_FAUCET_CLIENT", makeFaucetClient(kFaucetId).toUtf8());
+
+        WalletPlugin p;
+        const auto r = parseObj(p.faucetStatus());
+
+        if (prevHome.isEmpty()) qunsetenv("HOME"); else qputenv("HOME", prevHome);
+
+        QCOMPARE(r[QStringLiteral("binFound")].toBool(), false);
+        QCOMPARE(r[QStringLiteral("reason")].toString(), QString("bin-missing"));
+        QVERIFY2(!r[QStringLiteral("bin")].toString().contains(QStringLiteral("/.local/")),
+                 qPrintable(QStringLiteral("a planted guest binary was selected: ")
+                            + r[QStringLiteral("bin")].toString()));
+    }
+
+    // THE CONSERVATIVE PATH, PINNED. The client-side faucet is the only one that has ever
+    // delivered a token on these zones, so adding the on-chain one must not have disturbed it:
+    // startFaucet is still ungated, still `pinata claim`, and still works when the on-chain
+    // faucet is entirely absent.
+    void testTheClientSideFaucetIsUnchangedAndStillWorksWithNoOnChainFaucet()
+    {
+        useCli(makeRecordingCli(QStringLiteral("{\"ok\":true,\"txHash\":\"tx1\"}")));
+        WalletPlugin p;                       // never unlocked: startFaucet takes no password
+        const auto r = parseObj(p.startFaucet(QStringLiteral("abc123")));
+        QVERIFY2(r.contains(QStringLiteral("jobId")), qPrintable(QJsonDocument(r).toJson()));
+        awaitJob(p, r[QStringLiteral("jobId")].toString());
+
+        const QStringList argv = slurp(qEnvironmentVariable("MEDUSA_WALLET_CLI")
+                                       + QStringLiteral(".argv"))
+                                     .split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+        QCOMPARE(argv.value(0), QString("pinata"));
+        QCOMPARE(argv.value(1), QString("claim"));
+        QCOMPARE(argv.value(2), QString("--to"));
+        QCOMPARE(argv.value(3), QString("Public/abc123"));
+        // And the on-chain faucet was not consulted, let alone substituted for it.
+        QVERIFY2(!argv.contains(QStringLiteral("--definitions")),
+                 "startFaucet was rerouted through the on-chain faucet");
+    }
+
     // ── Private account management ──────────────────────────────────────────────
     void testCreatePrivateAccountParsesTextOutput()
     {
@@ -580,10 +1236,8 @@ private slots:
     {
         WalletPlugin p;
         arm(p);
-        auto r = parseObj(p.startShield(QStringLiteral("native"),
-                                        QStringLiteral("Public/a"),
-                                        QStringLiteral("Private/b"),
-                                        QStringLiteral(""), QString(), kPw));
+        auto r = parseObj(p.startShield(QStringLiteral("Public/a"), QStringLiteral("Private/b"),
+                                        QStringLiteral(""), kPw));
         QVERIFY(r.contains(QStringLiteral("error")));
     }
 
@@ -592,10 +1246,8 @@ private slots:
         // Shield source must be Public - a Private/ source is a prefix conflict.
         WalletPlugin p;
         arm(p);
-        auto r = parseObj(p.startShield(QStringLiteral("native"),
-                                        QStringLiteral("Private/a"),
-                                        QStringLiteral("Private/b"),
-                                        QStringLiteral("10"), QString(), kPw));
+        auto r = parseObj(p.startShield(QStringLiteral("Private/a"), QStringLiteral("Private/b"),
+                                        QStringLiteral("10"), kPw));
         QVERIFY(r.contains(QStringLiteral("error")));
     }
 
@@ -603,10 +1255,8 @@ private slots:
     {
         WalletPlugin p;
         arm(p);
-        auto r = parseObj(p.startDeshield(QStringLiteral("native"),
-                                          QStringLiteral("Public/a"),
-                                          QStringLiteral("Public/b"),
-                                          QStringLiteral("10"), QString(), kPw));
+        auto r = parseObj(p.startDeshield(QStringLiteral("Public/a"), QStringLiteral("Public/b"),
+                                          QStringLiteral("10"), kPw));
         QVERIFY(r.contains(QStringLiteral("error")));
     }
 
@@ -614,13 +1264,12 @@ private slots:
     {
         WalletPlugin p;
         arm(p);
-        auto r = parseObj(p.startPrivateTransferForeign(QStringLiteral("native"),
-                                                        QStringLiteral("Private/a"),
-                                                        QStringLiteral(""),   // npk missing
-                                                        QStringLiteral("vpk"),
-                                                        QStringLiteral("id"),
-                                                        QStringLiteral("10"), kPw));
-        QVERIFY(r.contains(QStringLiteral("error")));
+        // npk missing from the recipient spec: named, and refused before any proof starts.
+        auto r = parseObj(p.startPrivateTransfer(
+            QStringLiteral("Private/a"),
+            QStringLiteral(R"({"vpk":"vpk","identifier":"id"})"),
+            QStringLiteral("10"), kPw));
+        QCOMPARE(r[QStringLiteral("error")].toString(), QString("recipient npk is required"));
     }
 
     void testGetJobUnknownId()
@@ -639,10 +1288,9 @@ private slots:
 
         WalletPlugin p;
         arm(p);
-        auto started = parseObj(p.startShield(QStringLiteral("native"),
-                                              QStringLiteral("Public/a"),
+        auto started = parseObj(p.startShield(QStringLiteral("Public/a"),
                                               QStringLiteral("Private/b"),
-                                              QStringLiteral("10"), QString(), kPw));
+                                              QStringLiteral("10"), kPw));
         QString jobId = started[QStringLiteral("jobId")].toString();
         QVERIFY(!jobId.isEmpty());
         QCOMPARE(started[QStringLiteral("state")].toString(), QString("running"));
@@ -665,10 +1313,9 @@ private slots:
 
         WalletPlugin p;
         arm(p);
-        auto started = parseObj(p.startPrivateTransfer(QStringLiteral("token"),
-                                                       QStringLiteral("Private/a"),
-                                                       QStringLiteral("Private/b"),
-                                                       QStringLiteral("5"), kPw));
+        auto started = parseObj(p.startPrivateTransfer(
+            QStringLiteral("Private/a"), QStringLiteral("Private/b"),
+            QStringLiteral(R"({"asset":"token","definitionId":"def1","amount":"5"})"), kPw));
         QString jobId = started[QStringLiteral("jobId")].toString();
         QVERIFY(!jobId.isEmpty());
 
@@ -689,10 +1336,9 @@ private slots:
 
         WalletPlugin p;
         arm(p);
-        auto started = parseObj(p.startDeshield(QStringLiteral("native"),
-                                                QStringLiteral("Private/a"),
+        auto started = parseObj(p.startDeshield(QStringLiteral("Private/a"),
                                                 QStringLiteral("Public/b"),
-                                                QStringLiteral("10"), QString(), kPw));
+                                                QStringLiteral("10"), kPw));
         QString jobId = started[QStringLiteral("jobId")].toString();
         QVERIFY(!jobId.isEmpty());
 
@@ -1550,6 +2196,7 @@ private slots:
             QStringLiteral("torBin"),     // = resolveBin("medusa-tor") / resolveSystemBin("tor")
             QStringLiteral("py"),         // = resolveSystemBin("python3")
             QStringLiteral("fwd"),        // = resolveBin("diaphani-forward", MEDUSA_FORWARD_BIN)
+            QStringLiteral("client"),     // = resolveBin("medusa-faucet-client", MEDUSA_FAUCET_CLIENT)
         };
         static const QRegularExpression call(
             QStringLiteral("startChild\\(\\s*[^,]+,\\s*"
@@ -1582,6 +2229,17 @@ private slots:
         QVERIFY(src.contains(QStringLiteral("resolveSystemBin(QStringLiteral(\"curl\"), \"MEDUSA_CURL_BIN\")")));
         QVERIFY(src.contains(QStringLiteral("const QString py  = resolveSystemBin(QStringLiteral(\"python3\")")));
         QVERIFY(src.contains(QStringLiteral("const QString fwd = resolveBin(QStringLiteral(\"diaphani-forward\")")));
+        QVERIFY(src.contains(QStringLiteral("const QString client = resolveBin(QStringLiteral(\"medusa-faucet-client\")")));
+        // …and the on-chain faucet's guest .bin is NOT on this list on purpose: it is risc0
+        // bytecode, read as DATA and handed to the client as an argument. It must never appear
+        // as a startChild() program, however tempting the name `bin` makes it.
+        QVERIFY2(!src.contains(QRegularExpression(
+                     QStringLiteral("startChild\\([^,]+,\\s*pf\\.bin\\b"))),
+                 "the faucet guest .bin reached startChild() as a program");
+        // The `bin` local gained a second source when jobs learned to run their own binary.
+        // Pin the whole expression, so it cannot quietly widen to an arbitrary path.
+        QVERIFY(src.contains(QStringLiteral(
+            "const QString bin   = binOverride.isEmpty() ? cliPath() : binOverride;")));
         QCOMPARE(src.count(QStringLiteral("QStringLiteral(\"bash\")")), 0);
         QCOMPARE(src.count(QStringLiteral("QStringLiteral(\"which\")")), 0);
         QCOMPARE(src.count(QStringLiteral("/dev/tcp/")), 0);
@@ -1624,6 +2282,112 @@ private slots:
                                 + banned));
         QVERIFY(body.contains(QStringLiteral("m_password.isEmpty()")));
         QVERIFY(body.contains(QStringLiteral("constantTimeEquals(m_password, password)")));
+    }
+
+    // ONE named constant, spelled out ONCE. A program id is derived from the guest ELF alone, so
+    // a second copy of this literal - or a per-zone table of them - would be a second place that
+    // can drift from the deployed program, and drift here means claims aimed at a program that
+    // is not there. Also pins that the id is never assembled at runtime from the active zone.
+    void testTheFaucetProgramIdIsOneLiteralAndNotAPerZoneTable()
+    {
+        const QString src = pluginCode();
+        QCOMPARE(src.count(kFaucetId), 1);
+        QCOMPARE(src.count(QStringLiteral("kFaucetProgramId =")), 1);   // one definition
+        // Every other 64-hex literal in the file would be a rival program id. The one that is
+        // allowed is the standalone sequencer's bedrock channel_id inside kSeqConfigTemplate,
+        // named here so a THIRD one cannot hide behind a loosened count.
+        static const QRegularExpression hex64(QStringLiteral("\"[0-9a-f]{64}\""));
+        QCOMPARE(src.count(hex64), 2);
+        QCOMPARE(src.count(QStringLiteral(
+            "\"0202020202020202020202020202020202020202020202020202020202020202\"")), 1);
+        // The constant is used, and used to VERIFY rather than merely to display: the preflight
+        // compares the local guest binary's recomputed id against it.
+        QVERIFY(src.contains(QStringLiteral("pf.verified = (got == QString::fromLatin1(kFaucetProgramId));")));
+    }
+
+    // ══ ONE TABLE, NOT A SCATTER ══════════════════════════════════════════════════════════
+    // The program id is one constant for every zone; the TOKENS are per-zone, and they live in
+    // exactly one table. A second copy of a definition or a treasury id anywhere in the module
+    // is the beginning of the drift this table exists to prevent: the whole point is that
+    // adding a zone to the faucet is adding a row, in one place.
+    void testEveryFaucetTokenAndTreasuryAppearsExactlyOnceInOneTable()
+    {
+        const QString src = pluginCode();
+        for (const QString& id : kParadoxDefs + kLogosDefs + kParadoxTreasuries)
+            QCOMPARE(src.count(id), 1);
+        // Both zones are in the table, and nothing else is.
+        QCOMPARE(src.count(QStringLiteral("kFaucetZones[] =")), 1);
+        static const QRegularExpression rows(QStringLiteral("\\{\\s*\"[a-z-]+\", \\{"));
+        QCOMPARE(src.count(rows), 2);
+        // The capability is decided by the table alone. faucetZoneRow() is the only reader, and
+        // no code path answers "does this zone have a token faucet" from a stored record.
+        QCOMPARE(src.count(QStringLiteral("const FaucetZoneRow* faucetZoneRow(")), 1);
+        QVERIFY2(!src.contains(QRegularExpression(
+                     QStringLiteral("value\\(QStringLiteral\\(\"tokenFaucet\"\\)\\)"))),
+                 "the token-faucet capability is read back out of a zone record somewhere");
+    }
+
+    // ══ INVARIANT B, THROUGH THE QUEUED START ═════════════════════════════════════════════
+    // A queued job is launched later, from a path stored on the job, so the enumeration in
+    // testNoProcessIsEverLaunchedByABareName (which sees only `startChild(*proc, bin, args)`)
+    // is now one hop away from the resolver. Pin that hop: `pendingBin` is written in exactly
+    // one place, from the same expression the immediate start uses, and it is only ever read
+    // back into startJobProcess.
+    void testAQueuedJobsProgramComesFromTheSameResolverAsAnImmediateOne()
+    {
+        const QString src = pluginCode();
+        QCOMPARE(src.count(QStringLiteral("j->pendingBin  = bin;")), 1);
+        QVERIFY(src.contains(QStringLiteral(
+            "const QString bin   = binOverride.isEmpty() ? cliPath() : binOverride;")));
+        // Every startJobProcess() call site, and where its program comes from.
+        static const QRegularExpression call(
+            QStringLiteral("startJobProcess\\(\\s*[A-Za-z_>&.-]+,\\s*([A-Za-z_][A-Za-z0-9_>.-]*)"));
+        QStringList seen, bad;
+        QRegularExpressionMatchIterator it = call.globalMatch(src);
+        while (it.hasNext()) {
+            const QString prog = it.next().captured(1);
+            seen << prog;
+            if (prog != QStringLiteral("bin")                     // the resolver's own output
+                && prog != QStringLiteral("job->pendingBin")      // …stored, in the cap timer
+                && prog != QStringLiteral("q->pendingBin"))       // …stored, on release
+                bad << prog;
+        }
+        QVERIFY2(bad.isEmpty(), qPrintable(QStringLiteral("startJobProcess with an unrecognised "
+                                                          "program source: ")
+                                           + bad.join(QStringLiteral(", "))));
+        QVERIFY2(seen.size() == 3, qPrintable(QStringLiteral("expected 3 launch sites, found %1")
+                                                  .arg(seen.size())));
+    }
+
+    // ══ THE CLIENT-SIDE TOKEN FAUCET IS GONE FROM THE WRAPPER ═════════════════════════════
+    // It sent tokens from a treasury wallet whose whitelist lived in a directory outside the
+    // install, so it silently stopped working the moment that directory went away - while the
+    // LEZ half kept succeeding, which is exactly how the bug presented. Deleting it is the
+    // point; leaving a dormant copy behind would let it come back.
+    void testTheWrapperNoLongerDistributesTokensItself()
+    {
+        const QString wrapper = slurp(QStringLiteral(QT_TESTCASE_SOURCEDIR)
+                                      + QStringLiteral("/scripts/wallet-wrapper"));
+        QVERIFY2(!wrapper.isEmpty(), "could not read wallet-wrapper");
+        QStringList code;
+        for (const QString& l : wrapper.split(QLatin1Char('\n')))
+            if (!l.trimmed().startsWith(QLatin1Char('#'))) code << l;
+        const QString src = code.join(QLatin1Char('\n'));
+
+        // The treasury wallet, its whitelist file, and the per-claim distribution.
+        for (const QString& gone : { QStringLiteral("TREASURY_HOME"),
+                                     QStringLiteral("faucet_tokens("),
+                                     QStringLiteral("run_treasury("),
+                                     QStringLiteral("load_whitelist("),
+                                     QStringLiteral("seed_whitelist("),
+                                     QStringLiteral("medusa-treasury") })
+            QVERIFY2(!src.contains(gone),
+                     qPrintable(QStringLiteral("the client-side token faucet is still here: ")
+                                + gone));
+        // The LEZ half is untouched, including the registration that is the REASON the token
+        // half has to run after it.
+        QVERIFY(src.contains(QStringLiteral("\"pinata\" and args[1] == \"claim\"")));
+        QVERIFY(src.contains(QStringLiteral("auth-transfer\", \"init\"")));
     }
 #endif
 
@@ -1690,11 +2454,13 @@ private slots:
         QCOMPARE(eff, bundleDir + QStringLiteral("/sequencer_service"));
         QVERIFY2(!eff.contains(QStringLiteral("/.local/bin/")),
                  "a bundled install still falls back to ~/.local/bin");
-        // The wallet CLI resolves the same way with no env override.
+        // The wallet CLI resolves the same way with no env override. The bundled wrapper is
+        // "medusa-wallet" (namespaced like every other binary we ship); the bare "wallet" name
+        // survives only as a one-release fallback for installs made before the rename.
         qunsetenv("MEDUSA_WALLET_CLI");
         WalletPlugin p2;
         const QString cli = parseObj(p2.getConfig())[QStringLiteral("cliPathEff")].toString();
-        QCOMPARE(cli, bundleDir + QStringLiteral("/wallet"));
+        QCOMPARE(cli, bundleDir + QStringLiteral("/medusa-wallet"));
     }
 
     // ══ REVIEW 3's F1, AS IT WAS RUN ══════════════════════════════════════════════════════════
@@ -2652,6 +3418,427 @@ private slots:
         const QStringList stdinLines = slurp(cli + QStringLiteral(".stdin")).split(QLatin1Char('\n'));
         QCOMPARE(stdinLines.value(0), QString("pw-line-1"));
         QCOMPARE(stdinLines.value(1), key);
+    }
+
+    // ══ THE BRIDGE'S ARGUMENT CEILING ═══════════════════════════════════════════════════════
+    //
+    // These two tests exist because the class of bug they pin SHIPPED, twice, and neither time
+    // did anything fail. The Logos bridge dispatches a remote call through a switch over the
+    // argument count - qt_provider_object.cpp:20-34:
+    //
+    //     switch (args.size()) { case 0: … case 5: return QMetaObject::invokeMethod(…); }
+    //     default: qWarning() << "QtProviderObject: Currently supports 0-5 arguments. Got:"
+    //                         << args.size();
+    //
+    // so a 6-argument verb is never invoked at all, and LogosQmlBridge.cpp:76 hands the caller
+    // {"error":"Invalid response"} - which looks exactly like a wallet error. startShield and
+    // startDeshield went over when the fifth security round appended the session password;
+    // startPrivateTransferForeign was over from the day it was written and nobody noticed for
+    // months, because nothing ever exercised it through the real bridge. Both facts were found
+    // by the owner, live, from a Basecamp log - which is the whole reason this is a test.
+    //
+    // Read off the metaobject, which is the SAME table the bridge dispatches against, so no
+    // future verb can be added below the radar of this check.
+
+    // A verb over the ceiling can never be called. Nothing may exceed 5, ever.
+    void testEveryInvokableFitsTheBridgeCeiling()
+    {
+        const QMetaObject& mo = WalletPlugin::staticMetaObject;
+        QStringList over;
+        for (int i = mo.methodOffset(); i < mo.methodCount(); ++i) {
+            const QMetaMethod m = mo.method(i);
+            if (m.methodType() == QMetaMethod::Signal)
+                continue;
+            if (m.parameterCount() > 5)
+                over << QStringLiteral("%1 takes %2")
+                            .arg(QString::fromUtf8(m.name())).arg(m.parameterCount());
+        }
+        QVERIFY2(over.isEmpty(),
+                 qPrintable(QStringLiteral("the Logos bridge marshals 0-5 arguments and drops "
+                                           "anything wider (qt_provider_object.cpp:20-34), so "
+                                           "these verbs can never be invoked: ")
+                            + over.join(QStringLiteral("; "))));
+    }
+
+    // …and the house rule is 4, not 5. A gated verb sitting exactly on the ceiling is one
+    // security round away from death: that is precisely what happened to shield and deshield
+    // when the password was appended. Anything at 5 has no room for the next argument.
+    void testEveryInvokableKeepsBridgeHeadroom()
+    {
+        const QMetaObject& mo = WalletPlugin::staticMetaObject;
+        QStringList atCeiling;
+        for (int i = mo.methodOffset(); i < mo.methodCount(); ++i) {
+            const QMetaMethod m = mo.method(i);
+            if (m.methodType() == QMetaMethod::Signal)
+                continue;
+            if (m.parameterCount() == 5)
+                atCeiling << QString::fromUtf8(m.name());
+        }
+        QVERIFY2(atCeiling.isEmpty(),
+                 qPrintable(QStringLiteral("these verbs sit exactly on the bridge's 5-argument "
+                                           "ceiling, with no room for the next one; collapse two "
+                                           "arguments that are really one concept (see the value "
+                                           "and recipient specs): ")
+                            + atCeiling.join(QStringLiteral(", "))));
+    }
+
+    // The other half of the same contract: medusa_ui's callGated() appends the session password
+    // POSITIONALLY as the last argument, so a gated verb whose password is not last would be
+    // handed some other value to prove - and would refuse every spend the user makes.
+    void testEveryGatedVerbKeepsThePasswordLast()
+    {
+        // Mirrors Main.qml's gatedVerbs list, which mirrors the authorize() sites.
+        static const QStringList kGated{
+            QStringLiteral("sendTransfer"),      QStringLiteral("startSendTransfer"),
+            QStringLiteral("startSendToken"),    QStringLiteral("startShield"),
+            QStringLiteral("startDeshield"),     QStringLiteral("startPrivateTransfer"),
+            QStringLiteral("consolidateToken"),  QStringLiteral("approveAction"),
+            QStringLiteral("approveZone"),       QStringLiteral("exportMnemonic"),
+            QStringLiteral("exportKey"),         QStringLiteral("startTokenFaucet"),
+            QStringLiteral("resetWallet"),       QStringLiteral("restoreWallet"),
+            QStringLiteral("setCliPath") };
+        // A defaulted parameter makes moc emit ONE metamethod PER ARITY (resetWallet() and
+        // resetWallet(QString) are two entries), so compare the FULL form of each verb - the
+        // one callGated() targets when it appends the password.
+        const QMetaObject& mo = WalletPlugin::staticMetaObject;
+        QHash<QString, QMetaMethod> fullest;
+        for (int i = mo.methodOffset(); i < mo.methodCount(); ++i) {
+            const QMetaMethod m = mo.method(i);
+            const QString name = QString::fromUtf8(m.name());
+            if (m.methodType() == QMetaMethod::Signal || !kGated.contains(name))
+                continue;
+            if (!fullest.contains(name)
+                || fullest.value(name).parameterCount() < m.parameterCount())
+                fullest.insert(name, m);
+        }
+        QStringList seen, wrong;
+        for (auto it = fullest.constBegin(); it != fullest.constEnd(); ++it) {
+            const QString name = it.key();
+            const QMetaMethod m = it.value();
+            QVERIFY2(m.parameterCount() > 0, qPrintable(name));
+            seen << name;
+            const QString last = QString::fromUtf8(m.parameterNames().last());
+            // restoreWallet's credential is the CURRENT session password and is named for it;
+            // everything else calls it `password`.
+            if (last != QStringLiteral("password") && last != QStringLiteral("sessionPassword"))
+                wrong << QStringLiteral("%1's last argument is `%2`").arg(name, last);
+        }
+        QVERIFY2(wrong.isEmpty(), qPrintable(wrong.join(QStringLiteral("; "))));
+        // And every gated verb was actually found - a renamed verb must not silently drop off.
+        for (const QString& g : kGated)
+            QVERIFY2(seen.contains(g), qPrintable(QStringLiteral("gated verb missing from the "
+                                                                 "metaobject: ") + g));
+    }
+
+    // ── The value spec: one argument for "how much of what" ──────────────────────────────
+    void testNativeValueSpecIsABareAmount()
+    {
+        const QString cli = makeRecordingCli(R"({"ok":true,"txId":"t1"})");
+        useCli(cli);
+        WalletPlugin p;
+        arm(p);
+        const auto started = parseObj(p.startShield(QStringLiteral("Public/a"),
+                                                    QStringLiteral("Private/b"),
+                                                    QStringLiteral("10"), kPw));
+        const QString jobId = started[QStringLiteral("jobId")].toString();
+        QVERIFY(!jobId.isEmpty());
+        QCOMPARE(awaitJob(p, jobId)[QStringLiteral("state")].toString(), QString("done"));
+        QCOMPARE(slurp(cli + QStringLiteral(".argv")),
+                 QString("auth-transfer\nsend\n--from\nPublic/a\n--to\nPrivate/b\n"
+                         "--amount\n10\n"));
+    }
+
+    void testTokenValueSpecCarriesItsDefinitionIntoTheJob()
+    {
+        const QString cli = makeRecordingCli(R"({"ok":true,"txId":"t1"})");
+        useCli(cli);
+        WalletPlugin p;
+        arm(p);
+        const auto started = parseObj(p.startShield(
+            QStringLiteral("Public/a"), QStringLiteral("Private/b"),
+            QStringLiteral(R"({"asset":"token","definitionId":"DEF9","amount":"7"})"), kPw));
+        const QString jobId = started[QStringLiteral("jobId")].toString();
+        QVERIFY(!jobId.isEmpty());
+        QCOMPARE(awaitJob(p, jobId)[QStringLiteral("state")].toString(), QString("done"));
+        // The definition reaches the wrapper's token-shield verb, which is the whole reason
+        // definitionId existed as a separate argument - it is not lost by the collapse.
+        QCOMPARE(slurp(cli + QStringLiteral(".argv")),
+                 QString("token-shield\nPublic/a\nPrivate/b\nDEF9\n7\n"));
+        QCOMPARE(parseObj(p.getJob(jobId))[QStringLiteral("asset")].toString(), QString("token"));
+    }
+
+    // A JSON number is a legitimate way to write an amount, and it must arrive unrounded: a
+    // fixed-precision conversion would turn 12.5 into 13 and move value nobody asked to move.
+    void testValueSpecTakesAJsonNumberWithoutRounding()
+    {
+        const QString cli = makeRecordingCli(R"({"ok":true,"txId":"t1"})");
+        useCli(cli);
+        WalletPlugin p;
+        arm(p);
+        const auto whole = parseObj(p.startShield(QStringLiteral("Public/a"),
+                                                  QStringLiteral("Private/b"),
+                                                  QStringLiteral(R"({"amount":12})"), kPw));
+        QVERIFY(!whole[QStringLiteral("jobId")].toString().isEmpty());
+        awaitJob(p, whole[QStringLiteral("jobId")].toString());
+        QVERIFY(slurp(cli + QStringLiteral(".argv")).endsWith(QStringLiteral("--amount\n12\n")));
+
+        const auto frac = parseObj(p.startShield(QStringLiteral("Public/a"),
+                                                 QStringLiteral("Private/c"),
+                                                 QStringLiteral(R"({"amount":12.5})"), kPw));
+        awaitJob(p, frac[QStringLiteral("jobId")].toString());
+        const QString argv = slurp(cli + QStringLiteral(".argv"));
+        QVERIFY2(!argv.contains(QStringLiteral("--amount\n13")), qPrintable(argv));
+    }
+
+    void testValueSpecRefusesATokenWithNoDefinition()
+    {
+        WalletPlugin p;
+        arm(p);
+        const auto r = parseObj(p.startShield(QStringLiteral("Public/a"),
+                                              QStringLiteral("Private/b"),
+                                              QStringLiteral(R"({"asset":"token","amount":"7"})"),
+                                              kPw));
+        QVERIFY(r[QStringLiteral("error")].toString().contains(QStringLiteral("definitionId")));
+    }
+
+    // An unrecognised asset must be an ERROR, never a silent fall-back to native: "toekn"
+    // quietly spending LEZ where the user meant a token is a money bug, not a typo.
+    void testValueSpecRefusesAnUnknownAsset()
+    {
+        WalletPlugin p;
+        arm(p);
+        const auto r = parseObj(p.startShield(QStringLiteral("Public/a"),
+                                              QStringLiteral("Private/b"),
+                                              QStringLiteral(R"({"asset":"toekn","amount":"7"})"),
+                                              kPw));
+        QVERIFY(r[QStringLiteral("error")].toString().contains(QStringLiteral("unknown asset")));
+    }
+
+    // A caller still passing the OLD argument order - (asset, from, to, amount, …) - puts an
+    // account id where the value goes. That has to fail loudly at the door, not reach the CLI.
+    void testValueSpecRefusesTheOldArgumentOrder()
+    {
+        const QString cli = makeRecordingCli(R"({"ok":true})");
+        useCli(cli);
+        QFile::remove(cli + QStringLiteral(".argv"));
+        WalletPlugin p;
+        arm(p);
+        const auto r = parseObj(p.startShield(QStringLiteral("native"),      // was `asset`
+                                              QStringLiteral("Public/a"),    // was `from`
+                                              QStringLiteral("Private/b"),   // was `to`
+                                              kPw));
+        QVERIFY(r.contains(QStringLiteral("error")));
+        QVERIFY(!r.contains(QStringLiteral("jobId")));
+        QVERIFY2(!QFile::exists(cli + QStringLiteral(".argv")), "a job was started anyway");
+    }
+
+    // ── The recipient spec: one argument for "who receives" ──────────────────────────────
+    void testForeignRecipientSpecReachesTheCliAsSharedKeys()
+    {
+        const QString cli = makeRecordingCli(R"({"ok":true,"txId":"t1"})");
+        useCli(cli);
+        WalletPlugin p;
+        arm(p);
+        // This is the path that was DEAD at the bridge (7 arguments) and had never once run
+        // through it. Folded into startPrivateTransfer, it is 4 arguments and reachable.
+        const auto started = parseObj(p.startPrivateTransfer(QStringLiteral("Private/a"),
+                                                             kForeignRecipient,
+                                                             QStringLiteral("3"), kPw));
+        const QString jobId = started[QStringLiteral("jobId")].toString();
+        QVERIFY2(!jobId.isEmpty(), qPrintable(QJsonDocument(started).toJson()));
+        QCOMPARE(awaitJob(p, jobId)[QStringLiteral("state")].toString(), QString("done"));
+        QCOMPARE(slurp(cli + QStringLiteral(".argv")),
+                 QString("auth-transfer\nsend\n--from\nPrivate/a\n--to-npk\nnpk\n"
+                         "--to-vpk\nvpk\n--to-identifier\nident\n--amount\n3\n"));
+        // A foreign recipient is not an account this wallet can credit in local history.
+        QCOMPARE(parseObj(p.getJob(jobId))[QStringLiteral("to")].toString(), QString());
+    }
+
+    void testOwnedRecipientSpecStillTakesThePrivacyPrefix()
+    {
+        const QString cli = makeRecordingCli(R"({"ok":true,"txId":"t1"})");
+        useCli(cli);
+        WalletPlugin p;
+        arm(p);
+        const auto started = parseObj(p.startPrivateTransfer(QStringLiteral("Private/a"),
+                                                             QStringLiteral("bare9"),
+                                                             QStringLiteral("3"), kPw));
+        const QString jobId = started[QStringLiteral("jobId")].toString();
+        QVERIFY(!jobId.isEmpty());
+        QCOMPARE(awaitJob(p, jobId)[QStringLiteral("state")].toString(), QString("done"));
+        QVERIFY(slurp(cli + QStringLiteral(".argv")).contains(QStringLiteral("--to\nPrivate/bare9")));
+    }
+
+    // ── The zone endpoint: one argument for "where the sequencer is" ─────────────────────
+    void testZoneEndpointIsOneArgumentForEitherTransport()
+    {
+        WalletPlugin p;
+        const auto clear = parseObj(p.addZone(QStringLiteral("Clear"),
+                                              QStringLiteral("example.invalid:3072"), false));
+        QCOMPARE(clear[QStringLiteral("ok")].toBool(), true);
+        const auto tor = parseObj(p.addZone(QStringLiteral("Onion"),
+                                            QStringLiteral("abcd1234.onion"), true));
+        QCOMPARE(tor[QStringLiteral("ok")].toBool(), true);
+
+        QHash<QString, QString> endpoints;
+        for (const auto& v : parseObj(p.getZones())[QStringLiteral("zones")].toArray())
+            endpoints.insert(v.toObject()[QStringLiteral("id")].toString(),
+                             v.toObject()[QStringLiteral("endpoint")].toString());
+        // A missing scheme still defaults to http:// exactly as it always has.
+        QCOMPARE(endpoints.value(clear[QStringLiteral("id")].toString()),
+                 QString("http://example.invalid:3072"));
+        QCOMPARE(endpoints.value(tor[QStringLiteral("id")].toString()), QString("abcd1234.onion"));
+
+        // The transport is still explicit, so "Tor" plus a clearnet address is still refused
+        // rather than silently downgraded to an unprotected clearnet zone.
+        QVERIFY(parseObj(p.addZone(QStringLiteral("Bad"), QStringLiteral("https://host:1/"), true))
+                    .contains(QStringLiteral("error")));
+        QVERIFY(parseObj(p.addZone(QStringLiteral("Bad"), QStringLiteral("abcd.onion"), false))
+                    .contains(QStringLiteral("error")));
+    }
+
+    // ══ THE PRISTINE-RECIPIENT AUTO-INIT (wallet-wrapper) ════════════════════════════════════
+    //
+    // On LEZ an auth-transfer to a recipient the chain has never seen is dropped at block-build
+    // time with no error anywhere; the CLI then polls 8 blocks (eight minutes at 60s) and
+    // reports a not-found that reads like a network fault. `auth-transfer init` is free and
+    // needs no proof. These tests drive the REAL wrapper against a stand-in wallet-lez, because
+    // the fix has to hold for every outbound transfer that reaches the CLI, whichever verb
+    // started it.
+
+    // The shipped wrapper, located from the test binary (the documented build layout is
+    // `cmake -B build-tests -S .` inside module/, so scripts/ is one or two levels up).
+    QString wrapperPath()
+    {
+        QDir d(QCoreApplication::applicationDirPath());
+        for (int i = 0; i < 5; ++i) {
+            const QString p = d.absoluteFilePath(QStringLiteral("scripts/wallet-wrapper"));
+            if (QFileInfo(p).isReadable())
+                return p;
+            if (!d.cdUp())
+                break;
+        }
+        return QString();
+    }
+
+    // A stand-in wallet-lez that appends every argv it is given to $RECORD and answers
+    // `account get` according to $PRISTINE. $INIT_FAILS makes the registration itself fail.
+    QString makeChainCli()
+    {
+        return writeExec(m_tmp.path() + QStringLiteral("/chain_wallet.sh"), QStringLiteral(
+            "#!/bin/sh\n"
+            "for a in \"$@\"; do echo \"$a\" >> \"$RECORD\"; done\n"
+            "echo '--' >> \"$RECORD\"\n"
+            "cat > /dev/null\n"
+            "if [ \"$1\" = account ] && [ \"$2\" = get ]; then\n"
+            "  if [ \"$PRISTINE\" = 1 ]; then echo 'Account is Uninitialized'\n"
+            "  else echo 'Account owned by auth-transfer program'; fi\n"
+            "  exit 0\n"
+            "fi\n"
+            "if [ \"$1\" = auth-transfer ] && [ \"$2\" = init ]; then\n"
+            "  if [ \"$INIT_FAILS\" = 1 ]; then echo 'Error: init refused' >&2; exit 1; fi\n"
+            "  echo 'Transaction hash is 0xinit'; exit 0\n"
+            "fi\n"
+            "echo 'Transaction hash is 0xsend'\n"));
+    }
+
+    // Run the real wrapper with that stand-in. Returns its stdout; the transcript lands in
+    // <record>, one argv token per line, "--" between invocations.
+    QString runWrapper(const QStringList& args, bool pristine, const QString& record,
+                       bool initFails = false)
+    {
+        const QString py = trustedPython3();
+        const QString wrapper = wrapperPath();
+        if (py.isEmpty() || wrapper.isEmpty())
+            return QString();
+        QFile::remove(record);
+        const QString wrapHome = m_tmp.path() + QStringLiteral("/wrapper-home");
+        QDir().mkpath(wrapHome);
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        env.insert(QStringLiteral("WALLET_LEZ"),          makeChainCli());
+        env.insert(QStringLiteral("LEE_WALLET_HOME_DIR"), wrapHome);
+        env.insert(QStringLiteral("RECORD"),              record);
+        env.insert(QStringLiteral("PRISTINE"),            pristine ? QStringLiteral("1")
+                                                                   : QStringLiteral("0"));
+        env.insert(QStringLiteral("INIT_FAILS"),          initFails ? QStringLiteral("1")
+                                                                    : QStringLiteral("0"));
+        QProcess proc;
+        proc.setProcessEnvironment(env);
+        proc.start(py, QStringList{ wrapper } + args);
+        if (!proc.waitForStarted(5000))
+            return QString();
+        proc.closeWriteChannel();          // the wrapper reads the session password off stdin
+        proc.waitForFinished(30000);
+        return QString::fromUtf8(proc.readAllStandardOutput());
+    }
+
+    void testWrapperRegistersAPristineRecipientBeforeSending()
+    {
+        if (trustedPython3().isEmpty() || wrapperPath().isEmpty())
+            QSKIP("python3 or scripts/wallet-wrapper not found from the test binary");
+        const QString record = m_tmp.path() + QStringLiteral("/pristine.log");
+        const QString out = runWrapper({ QStringLiteral("auth-transfer"), QStringLiteral("send"),
+                                         QStringLiteral("--from"), QStringLiteral("Public/a"),
+                                         QStringLiteral("--to"),   QStringLiteral("Public/b"),
+                                         QStringLiteral("--amount"), QStringLiteral("5") },
+                                       true, record);
+        QCOMPARE(parseObj(out)[QStringLiteral("ok")].toBool(), true);
+        const QString log = slurp(record);
+        const int init = log.indexOf(QStringLiteral("auth-transfer\ninit\n--account-id\nPublic/b"));
+        const int send = log.indexOf(QStringLiteral("auth-transfer\nsend\n--from"));
+        QVERIFY2(init >= 0, qPrintable(QStringLiteral("the recipient was never registered:\n") + log));
+        QVERIFY2(send > init, "the transfer went out before the recipient was registered");
+    }
+
+    void testWrapperDoesNotRegisterARecipientThatAlreadyExists()
+    {
+        if (trustedPython3().isEmpty() || wrapperPath().isEmpty())
+            QSKIP("python3 or scripts/wallet-wrapper not found from the test binary");
+        const QString record = m_tmp.path() + QStringLiteral("/existing.log");
+        const QString out = runWrapper({ QStringLiteral("auth-transfer"), QStringLiteral("send"),
+                                         QStringLiteral("--from"), QStringLiteral("Public/a"),
+                                         QStringLiteral("--to"),   QStringLiteral("Public/b"),
+                                         QStringLiteral("--amount"), QStringLiteral("5") },
+                                       false, record);
+        QCOMPARE(parseObj(out)[QStringLiteral("ok")].toBool(), true);
+        const QString log = slurp(record);
+        // The common case pays for ONE read and nothing else: no init tx, no extra block wait.
+        QVERIFY2(!log.contains(QStringLiteral("auth-transfer\ninit")),
+                 qPrintable(QStringLiteral("an already-registered recipient was re-initialised:\n")
+                            + log));
+        QVERIFY(log.contains(QStringLiteral("account\nget\n--account-id\nPublic/b")));
+    }
+
+    // A private destination must stay default-owned: registering one is exactly what makes
+    // LEZ v0.2.0 reject the private output, so the auto-init must never touch a shield.
+    void testWrapperNeverRegistersAPrivateDestination()
+    {
+        if (trustedPython3().isEmpty() || wrapperPath().isEmpty())
+            QSKIP("python3 or scripts/wallet-wrapper not found from the test binary");
+        const QString record = m_tmp.path() + QStringLiteral("/shield.log");
+        runWrapper({ QStringLiteral("auth-transfer"), QStringLiteral("send"),
+                     QStringLiteral("--from"), QStringLiteral("Public/a"),
+                     QStringLiteral("--to"),   QStringLiteral("Private/fresh"),
+                     QStringLiteral("--amount"), QStringLiteral("5") }, true, record);
+        const QString log = slurp(record);
+        QVERIFY2(!log.contains(QStringLiteral("auth-transfer\ninit")),
+                 qPrintable(QStringLiteral("a private destination was initialised:\n") + log));
+    }
+
+    // BEST EFFORT, NEVER FATAL: if the registration itself fails, the transfer must still go
+    // out. This fix can only turn a doomed send into a working one, never the reverse.
+    void testWrapperStillSendsWhenTheRegistrationFails()
+    {
+        if (trustedPython3().isEmpty() || wrapperPath().isEmpty())
+            QSKIP("python3 or scripts/wallet-wrapper not found from the test binary");
+        const QString record = m_tmp.path() + QStringLiteral("/initfail.log");
+        const QString out = runWrapper({ QStringLiteral("auth-transfer"), QStringLiteral("send"),
+                                         QStringLiteral("--from"), QStringLiteral("Public/a"),
+                                         QStringLiteral("--to"),   QStringLiteral("Public/b"),
+                                         QStringLiteral("--amount"), QStringLiteral("5") },
+                                       true, record, /*initFails=*/true);
+        QCOMPARE(parseObj(out)[QStringLiteral("ok")].toBool(), true);
+        QVERIFY(slurp(record).contains(QStringLiteral("auth-transfer\nsend\n--from")));
     }
 };
 

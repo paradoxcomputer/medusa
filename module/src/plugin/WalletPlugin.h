@@ -60,6 +60,56 @@ public:
     //    session, which is safe precisely because those keys are already exposed on disk), after
     //    which a normal unlock restores full function with the accounts intact.
 
+    // ══ THE BRIDGE MARSHALS AT MOST 5 ARGUMENTS. NOTHING BELOW MAY EXCEED THAT. ═══════════
+    //
+    // Every remote call from QML reaches this class through the Logos bridge, and the bridge
+    // dispatches with a switch over the argument COUNT - logos-liblogos,
+    // cpp/qt_provider_object.cpp:20-34:
+    //
+    //     switch (args.size()) {
+    //       case 0: … case 5: return QMetaObject::invokeMethod(…);
+    //       default: qWarning() << "QtProviderObject: Currently supports 0-5 arguments. Got:"
+    //                           << args.size();
+    //     }
+    //
+    // A verb with 6 or more parameters is therefore NEVER INVOKED. Nothing throws, nothing the
+    // user can see is logged, and LogosQmlBridge.cpp:76 turns the absent result into
+    // {"error":"Invalid response"} - indistinguishable from a wallet failure. That is exactly
+    // how three verbs shipped dead: startShield(6) and startDeshield(6), which the fifth
+    // security round pushed over the edge by appending the session password, and
+    // startPrivateTransferForeign(7), which had been over it from the day it was written and
+    // was never once exercised through the real bridge.
+    //
+    // HOUSE RULE: FOUR arguments, not five. 5 is the ceiling itself, and a gated verb is one
+    // security round away from needing one more argument - which is the move that killed
+    // shield and deshield. Everything below is at 4 or fewer. If you are about to write a
+    // fifth, collapse two arguments that are really one concept instead (see the spec strings
+    // below). tests/test_wallet_plugin.cpp enforces BOTH numbers off the metaobject
+    // (testEveryInvokableFitsTheBridgeCeiling, testEveryInvokableKeepsBridgeHeadroom), so this
+    // cannot be rediscovered live a third time.
+    //
+    // THE TWO SPEC STRINGS that buy the headroom back. Both take the simple form verbatim and
+    // the compound form as a JSON object, told apart by a leading '{' (an amount never starts
+    // with one, nor does an account id). JSON is already this module's idiom for a compound
+    // argument - connectRequest(appJson), requestAction(actionJson), requestZone(zoneJson) -
+    // and it stays unambiguous whatever a user types into a field. One parser each,
+    // parseValueSpec()/parseRecipientSpec(), so every verb reports the same errors.
+    //
+    //   value      = HOW MUCH OF WHAT, one concept (an amount is meaningless without its
+    //                asset), replacing the old (asset, amount) or (asset, definitionId, amount):
+    //                  "12"                                              → 12 native LEZ
+    //                  {"amount":"12"}                                   → the same
+    //                  {"asset":"token","definitionId":"<id>","amount":"12"}
+    //   recipient  = WHO RECEIVES, one concept, replacing the old
+    //                (to) or (toNpk, toVpk, toIdentifier):
+    //                  "Private/abc…"                                    → an owned account
+    //                  {"npk":"…","vpk":"…","identifier":"…"}            → a foreign private
+    //                                                                      recipient
+    //
+    // AND THE PASSWORD STAYS LAST. medusa_ui's callGated() appends the session password
+    // positionally as the final argument (Main.qml, "INVARIANT 1"), mirroring the authorize()
+    // sites here. Arguments are shed BEFORE it; nothing is ever inserted after it.
+
     Q_INVOKABLE void    initLogos(LogosAPI* api);
 
     // Status - checks if wallet CLI binary is available
@@ -88,11 +138,30 @@ public:
     // Persist mode/url/port; project sequencer_addr into wallet_config.json; in local
     // mode (re)launch the bundled standalone sequencer, in hosted mode stop it. {ok}.
     Q_INVOKABLE QString setSequencerConfig(const QString& mode, const QString& url, int port);
-    // {state,mode,port} - state = "running" | "starting" | "unreachable".
+    // {state,mode,port,endpoint,healthy,compat} - state = "running" | "starting" |
+    // "unreachable". "starting" means a connect is genuinely IN FLIGHT, which on a Tor zone
+    // needs BOTH the bundled Tor and the forward alive (the forward is a separate process that
+    // outlives Tor and dials lazily, so on its own it kept reporting an eternal "Connecting…").
+    // A local zone adds binaryAvailable/running/lastLaunchError/exitCode/logPath, a Tor zone
+    // adds needsTor/torAvailable/torPath/torRunning/forwardRunning, and BOTH add the one
+    // machine-readable `reason` the UI's banner and offline modal render:
+    //   local: "" | binary-missing | launch-failed | exited | unhealthy | mismatch
+    //   Tor:   "" | aborted | tor-missing | tor-failed | tor-exited | mismatch
+    // A Tor zone deliberately has no time-based "unhealthy": a bootstrap legitimately takes
+    // minutes, and calling a slow connect a failure is how the UI learned to lie. After a
+    // cancelConnect() the reply also carries connectAborted/abortedZone, whatever zone the
+    // wallet has landed on, so "it went quiet" and "the user stopped it" are never confused.
     Q_INVOKABLE QString getSequencerStatus();
     // Bundled-Tor bootstrap progress (for the connect progress bar on Tor zones):
     // {percent, stage}. Parsed from the bundled Tor's log.
     Q_INVOKABLE QString getTorProgress() const;
+    // ABORT a connect in flight - the escape hatch from a Tor bootstrap that is taking minutes
+    // or has failed. Stops the bundled Tor + its onion-stage monitor + the diaphani-forward
+    // tunnel, and, when the zone it abandons is Tor-fronted, leaves the wallet on the default
+    // clearnet zone instead of half-switched (see the .cpp for why staying put is not a resting
+    // state). Idempotent, and UNGATED by design - the reasoning is at the definition.
+    // {ok,zone,abortedZone,switched,wasConnecting,torStopped,torForeign,forwardStopped}.
+    Q_INVOKABLE QString cancelConnect();
     // The active zone id (back-compat alias of getZones' active): {network}.
     Q_INVOKABLE QString getNetwork() const;
     // Switch the active zone (alias of setActiveZone). {ok}.
@@ -102,13 +171,17 @@ public:
     // {zones:[{id,name,kind,endpoint,tor,builtin}], active}. kind = local-standalone
     // (devnet) | local-l1-tor (diaphani) | remote (a thin client of someone's sequencer).
     Q_INVOKABLE QString getZones() const;
-    // Add a REMOTE zone (thin client). endpoint is a clearnet URL, or set onion+tor=true
-    // to reach a Tor-fronted sequencer. {ok,id}.
-    Q_INVOKABLE QString addZone(const QString& name, const QString& url,
-                                const QString& onion, bool tor);
+    // Add a REMOTE zone (thin client). ONE endpoint argument: a clearnet URL, or the
+    // sequencer's .onion address with tor=true. {ok,id}.
+    // The old (url, onion, tor) triple was one concept written twice - exactly one of the two
+    // strings was ever non-empty, `tor` said which, getZones() has always published the pair
+    // back as a single "endpoint" field, and the UI has always had a single endpoint box that
+    // it split at the call site. Collapsing it takes editZone off the 5-argument ceiling and
+    // removes the "tor=true with a clearnet url" state that had to be validated away.
+    Q_INVOKABLE QString addZone(const QString& name, const QString& endpoint, bool tor);
     // Edit a user zone's name/endpoint/transport (built-ins can't be edited). {ok}.
-    Q_INVOKABLE QString editZone(const QString& id, const QString& name, const QString& url,
-                                 const QString& onion, bool tor);
+    Q_INVOKABLE QString editZone(const QString& id, const QString& name,
+                                 const QString& endpoint, bool tor);
     // Remove a user zone (built-ins can't be removed). {ok}.
     Q_INVOKABLE QString removeZone(const QString& id);
     // Switch the active zone - repoints the wallet (local sequencer, or thin client over
@@ -135,7 +208,10 @@ public:
     // other verb that spends. Still NOT part of the Connect op surface.
     Q_INVOKABLE QString consolidateToken(const QString& accountId, const QString& definitionId,
                                          const QString& password);
-    // The curated whitelist of tokens the treasury offers: [{name, def}].
+    // The curated tokens of the ACTIVE zone: [{name, def}], empty on a zone with no token
+    // faucet. Read from the zone table (kFaucetZones), NOT from operator state on disk: the
+    // old source was a file under ~/.local/share/medusa-treasury that vanished with the
+    // treasury directory, which silently emptied this list and the Add-token picker with it.
     Q_INVOKABLE QString getWhitelist();
     Q_INVOKABLE QString getBalance(const QString& accountId);
     Q_INVOKABLE QString createAccount();
@@ -158,32 +234,61 @@ public:
     // Reveal an account's keys (pk for public, npk/vpk for private) for sharing. Returns {ok,pk|npk,vpk}.
     Q_INVOKABLE QString getAccountKeys(const QString& accountId);
 
-    // Faucet - asynchronous: returns {jobId,state}, poll getJob(jobId). The claim
-    // submits a tx and waits for a block (~15s), so it must not block the module RPC.
+    // ── THE FAUCET: ONE BUTTON, TWO HALVES, TWO VERBS ───────────────────────────────────────
+    //
+    // The ⛲ button claims native LEZ AND, on a zone that has one, the whitelist tokens. Those
+    // are two different programs with two different trust levels, so they stay two verbs and the
+    // UI composes them; a single verb would have to be gated, and gating the LEZ half would take
+    // the faucet away from exactly the wallets that most need it (locked, or legacy plaintext -
+    // see invariant C).
+    //   • startFaucet      = `pinata claim`. Native LEZ, UNGATED. It spends nothing of the
+    //                        user's: the pinata program credits an account, it does not move
+    //                        value out of one, so there is no signature to authorise. Fully
+    //                        on-chain and needing no local state, which is why it kept working
+    //                        while the token half was broken.
+    //   • startTokenFaucet = the deployed `medusa_faucet` program. Whitelist tokens only, from
+    //                        per-definition treasury PDAs the program owns, with an ON-CHAIN 6h
+    //                        cooldown. GATED: it signs and broadcasts with the wallet's keys.
+    //
+    // ORDER. pinata is started first and the token half is QUEUED BEHIND IT (startTokenFaucet
+    // does this; the caller does not have to know). `pinata claim` may run `auth-transfer init`
+    // for the recipient first, because the pinata program credits WITHOUT claiming and the chain
+    // rejects a credit to an account it has no record of, and the two halves drive the same
+    // wallet store from separate processes. Sequencing them keeps one writer on storage.json.
+    //
+    // PARTIAL SUCCESS IS THE NORMAL CASE, not an edge case: the two cooldowns are independent, so
+    // "150 LEZ arrived, tokens are on cooldown for 214 minutes" is the steady state after any
+    // second press. Each half therefore reports its own terminal job with its own `state`,
+    // `error` and machine-readable `reason` ("cooldown" | "not-funded" | "not-initialized" |
+    // "no-holding" | "unreachable"), and a failure of one never cancels or suppresses the other.
+    //
+    // Asynchronous: returns {jobId,state}, poll getJob(jobId). The claim submits a tx and waits
+    // for a block, so it must not block the module RPC.
     Q_INVOKABLE QString startFaucet(const QString& accountId);
     // Faucet (synchronous, legacy/unused - superseded by startFaucet).
     Q_INVOKABLE QString claimFaucet(const QString& accountId);
 
     // ── The ON-CHAIN token faucet (the deployed `medusa_faucet` LEZ program) ─────
     //
-    // WHY BOTH FAUCETS EXIST, AND WHY startFaucet ABOVE IS STILL THE DEFAULT. The two
-    // dispense different things and are not interchangeable today:
-    //   • startFaucet   = `pinata claim`: native LEZ from the zone's built-in pinata program,
-    //                     PLUS whitelist tokens dropped CLIENT-SIDE by the wrapper's separate
-    //                     treasury wallet (a plain `token send` from a supply account).
-    //   • startTokenFaucet = the on-chain program: whitelist tokens only, from per-definition
-    //                     treasury PDAs the program itself owns, with an on-chain 6h cooldown.
-    // The program is deployed on both operator zones (its id is the constant below), but on
-    // neither zone do the token definitions or the funded treasuries it dispenses from exist
-    // yet. An unfunded on-chain faucet gives the user nothing, so it does NOT replace the
-    // client-side path - it sits beside it, and reports precisely which precondition is
-    // missing instead of failing opaquely.
+    // THE TOKEN HALF IS A PER-ZONE CAPABILITY, and it is a property of the ZONE RECORD, not of
+    // the wallet: kFaucetZones in the .cpp lists the zones that have the program plus the
+    // definitions and treasury PDAs it dispenses there, getZones()/zoneObj() publish it as
+    // "tokenFaucet", and zoneHasTokenFaucet() is the one predicate everything asks. A zone with
+    // no row (the local devnet sandbox, the Tor zone, and EVERY user-added zone) is LEZ-only:
+    // the program is not deployed on somebody else's sequencer, and these definitions are
+    // accounts on our chains that do not exist on theirs. The capability is derived from the
+    // table alone, never read back off a stored zone record, so it cannot be planted.
     //
     // Read-only, ungated (it moves nothing and reveals nothing the UI does not already show):
     // {programId, available, reason, message, client, clientFound, bin, binFound, verified,
-    //  definitions[], tickers{}, recipients[], funded}. `reason` is a machine code the UI
-    //  switches on: "" (available) | "client-missing" | "bin-missing" | "program-mismatch" |
-    //  "no-definitions" | "no-holding".
+    //  zone, tokenFaucetZone, definitions[], treasuries[], tickers{}, recipients[], funded}.
+    // `reason` is a machine code the UI switches on: "" (available) | "unsupported-zone" |
+    // "client-missing" | "bin-missing" | "program-mismatch".
+    //
+    // NOTE what is no longer a reason. "no-definitions" is gone: the definitions are in the zone
+    // table, so a zone either has them or has no token faucet at all. "no-holding" is gone as a
+    // STATUS: a wallet with no holding account for a token is not blocked, the claim path mints
+    // one (see ensureFaucetRecipients), which is what a freshly reset wallet needs.
     Q_INVOKABLE QString faucetStatus();
     // Claim from the on-chain faucet. GATED (authorize()): it signs and broadcasts a
     // transaction with the wallet's keys, so it takes the session password as its TRAILING
@@ -194,57 +299,61 @@ public:
     // user's main account as a recipient would bind it to one token forever).
     Q_INVOKABLE QString startTokenFaucet(const QString& accountId, const QString& password);
 
-    // Transfer
+    // ── Transfer ────────────────────────────────────────────────────────────────
     // Every verb below is GATED (authorize()): the trailing `password` is the session password
     // the user typed at unlock, re-presented by the caller on each spend.
+    //
+    // ONE ARGUMENT ORDER for everything that moves value, so no call site can transpose two of
+    // them: (from, to, value, password). `value` is a value spec (see the argument-ceiling
+    // block at the top of the invokable section); on the privacy verbs `to` is a recipient
+    // spec.
     Q_INVOKABLE QString sendTransfer(const QString& from,
                                      const QString& to,
-                                     const QString& amount,
+                                     const QString& value,
                                      const QString& password);
     // Async native send (the main Send screen). Runs as a background job because the dest may
     // be a Private account → a multi-minute real proof that must NOT block the module RPC
     // (blocking sendTransfer timed out / froze the UI). Returns {jobId}; track like a privacy op.
+    // Native only: a token value spec is refused here and named to startSendToken, rather than
+    // being handed to the auth-transfer program which would move LEZ instead of the token.
     Q_INVOKABLE QString startSendTransfer(const QString& from,
                                           const QString& to,
-                                          const QString& amount,
+                                          const QString& value,
                                           const QString& password);
     // Send a token (asynchronous - derives/creates ATAs + token-send + waits, ~30-40s, so
     // it must not block the module RPC). Returns {jobId,state}; poll getJob(jobId).
+    // `value` must be a TOKEN spec: {"asset":"token","definitionId":"<id>","amount":"<n>"}.
     Q_INVOKABLE QString startSendToken(const QString& from, const QString& to,
-                                       const QString& definitionId, const QString& amount,
-                                       const QString& password);
+                                       const QString& value, const QString& password);
 
     // ── Privacy transfers (asynchronous - generate a local STARK, may take minutes) ──
     // Each "start*" returns {jobId,state} immediately; poll getJob(jobId) for progress.
-    // asset is "native" (auth-transfer program) or "token" (token program).
+    // The asset ("native" = auth-transfer program, "token" = token program) rides in the
+    // value spec, because an amount without its asset is not a quantity of anything.
 
     // Public -> Private (shield): from must be Public/…, to must be Private/… (owned).
-    // Token asset REQUIRES definitionId: the wrapper resolves a direct-owned holding of
+    // A token value REQUIRES its definitionId: the wrapper resolves a direct-owned holding of
     // that definition as the signing source (an ATA is a PDA and cannot sign - rc5 limit).
-    // `password` keeps the trailing position it has on every other spend verb, which forces
-    // a default here because definitionId already has one; the default is the empty password,
-    // which authorize() always rejects, so the short-arity form fails closed.
-    Q_INVOKABLE QString startShield(const QString& asset, const QString& from,
-                                    const QString& to, const QString& amount,
-                                    const QString& definitionId = QString(),
-                                    const QString& password = QString());
+    // The defaulted `definitionId`/`password` parameters this verb used to carry are gone with
+    // the argument they were working around: there is no short-arity form to fail closed any
+    // more, because there is no sixth argument to push the password off the end.
+    Q_INVOKABLE QString startShield(const QString& from, const QString& to,
+                                    const QString& value, const QString& password);
     // Private -> Public (deshield): from must be Private/…, to must be Public/…
-    // Token asset REQUIRES definitionId: the wrapper lands the tokens in the recipient
+    // A token value REQUIRES its definitionId: the wrapper lands the tokens in the recipient
     // owner's ATA (created idempotently), the only valid public token destination.
-    Q_INVOKABLE QString startDeshield(const QString& asset, const QString& from,
-                                      const QString& to, const QString& amount,
-                                      const QString& definitionId = QString(),
-                                      const QString& password = QString());
-    // Private -> Private (PrivOwned transfer, owned recipient): both must be Private/…
-    Q_INVOKABLE QString startPrivateTransfer(const QString& asset, const QString& from,
-                                             const QString& to, const QString& amount,
-                                             const QString& password);
-    // Private -> foreign private recipient via shared keys (--to-npk/--to-vpk/--to-identifier).
-    Q_INVOKABLE QString startPrivateTransferForeign(const QString& asset, const QString& from,
-                                                     const QString& toNpk, const QString& toVpk,
-                                                     const QString& toIdentifier,
-                                                     const QString& amount,
-                                                     const QString& password);
+    Q_INVOKABLE QString startDeshield(const QString& from, const QString& to,
+                                      const QString& value, const QString& password);
+    // Private -> Private. `to` is a RECIPIENT SPEC, which is what folded the old
+    // startPrivateTransferForeign(7) back in here rather than leaving it at an arity the
+    // bridge cannot dispatch:
+    //   "Private/…"                              → an owned private account (both ends owned)
+    //   {"npk":…,"vpk":…,"identifier":…}         → a foreign recipient's shared keys, sent as
+    //                                              --to-npk/--to-vpk/--to-identifier
+    // A compatibility stub for the deleted verb would have been unreachable by construction:
+    // at 7 parameters the bridge could never have called it to deliver the explanation.
+    Q_INVOKABLE QString startPrivateTransfer(const QString& from, const QString& to,
+                                             const QString& value, const QString& password);
     // Poll the state of a privacy job. Returns {jobId,op,asset,from,to,amount,state,elapsedMs,result?,txId?,error?}.
     Q_INVOKABLE QString getJob(const QString& jobId);
 
@@ -478,14 +587,26 @@ private:
         bool        ok = false;
         QString     reason;        // machine code, "" when ok
         QString     message;       // the sentence the user reads
+        QString     zone;          // the active zone this preflight is about
         QString     client;        // resolved medusa-faucet-client path ("" = not found)
         QString     bin;           // resolved guest .bin path ("" = not found)
         bool        verified = false;   // the .bin's ImageID == kFaucetProgramId
-        QStringList definitions;   // whitelist token definition ids on the active zone
-        QStringList recipients;    // this wallet's holding per definition, same order
+        QStringList definitions;   // this zone's faucet token definitions (from kFaucetZones)
+        QStringList treasuries;    // their treasury PDAs, same order (from kFaucetZones)
         QStringList tickers;       // display names, same order as definitions
+        QStringList recipients;    // this wallet's holding per definition, same order; an entry
+                                   // is "" when there is none YET, which is not a failure
+        QStringList provisioned;   // holdings ensureFaucetRecipients() had to create
     };
     FaucetPreflight faucetPreflight();
+    // Does this zone have the on-chain token faucet? Decided by kFaucetZones alone (see the
+    // table in the .cpp), so the zone list, the status call and the claim can never disagree,
+    // and a stored zone record can never grant itself the capability.
+    bool zoneHasTokenFaucet(const QString& zoneId) const;
+    // CLAIM PATH ONLY. Give every definition a recipient this wallet owns, creating and
+    // recording one where the registry has none. Returns "" on success, else the refusal.
+    // Never called from faucetStatus(): a read-only status call must not mint accounts.
+    QString ensureFaucetRecipients(FaucetPreflight& pf);
     // Resolve the deployed program's guest .bin (MEDUSA_FAUCET_BIN, then the module bundle,
     // then a dev install). "" when no readable file is there.
     static QString faucetGuestBin();
@@ -499,6 +620,28 @@ private:
     QProcess*      m_torMonProc = nullptr;    // tor-control monitor → real onion-connection stages
     void           ensureTor();               // launch the bundled Tor (idempotent, non-blocking)
     void           stopTor();                 // terminate/kill/wait Tor (+ its monitor)
+    // The loopback ports the bundled Tor listens on. kTorSocksPort/kTorControlPort unless the
+    // LAUNCHER's environment overrides them - see the definitions in the .cpp for why an env
+    // knob here is not a hole in invariant B and what it buys.
+    static int     torSocksPort();
+    static int     torControlPort();
+    // ── Tor bring-up record (drives the Tor half of getSequencerStatus's reason field) ──
+    // The local sequencer has had this since "the zone just sat in a silent, eternal
+    // Connecting…" was a bug; a Tor zone had nothing at all, so a Tor that never launched, a Tor
+    // that died and a Tor that is merely slow were one indistinguishable "starting" forever.
+    bool           m_torAdopted = false;      // we REUSED a Tor already on the SOCKS port - not our child
+    bool           m_torStopping = false;     // deliberate stopTor() in flight - not a crash
+    QString        m_torLaunchError;          // last Tor spawn failure ("" = launched fine / not tried)
+    bool           m_torExited = false;       // the bundled Tor exited on its own
+    int            m_torExitCode = 0;         // its exit code (-1 = killed by a signal)
+    // Is the Tor this wallet's tunnel depends on actually up? An ADOPTED Tor is not our child,
+    // so the only honest test for it is whether its SOCKS port still answers.
+    bool           torRunning();
+    // ── Aborted-connect record (cancelConnect) ──
+    // Cleared by the next applySequencer(), i.e. it means "the most recent connect ended because
+    // the user stopped it, and nothing has been re-applied since".
+    bool           m_connectAborted = false;
+    QString        m_abortedZone;             // the zone id that connect was abandoned on
     // Async health probe (so a slow Tor round-trip never blocks the UI / 1s-times-out the dot).
     QProcess*      m_healthProbe = nullptr;
     bool           m_lastSeqOk = false;       // cached: did the last async checkHealth succeed?
@@ -535,6 +678,14 @@ private:
     QJsonObject    zoneObj(const QString& id) const;  // a remote zone's record (incl. the built-in clearnet zone)
     QString        zoneKind(const QString& id) const; // local-standalone|local-l1-tor|remote
     bool           isUserZone(const QString& id) const; // true only for user-added zones (not built-ins)
+    // Does this zone reach its sequencer over Tor? Read off the zone RECORD (kind + tor), never
+    // off "is it built in" - a user-added zone is a Tor zone whenever addZone was given an
+    // .onion. THE one predicate: the status call, the teardown in applySequencer() and
+    // cancelConnect() must never disagree about which zones need the bundled Tor.
+    bool           zoneUsesTor(const QString& id) const;
+    // The zone a fresh install starts on, and the zone an aborted connect falls back to. One
+    // definition so netId()'s default and cancelConnect()'s landing zone cannot drift apart.
+    static QString defaultZoneId();
     // Resolve the sequencer binary the same way cliPath() resolves the wallet CLI: a
     // launcher-owned env var (MEDUSA_SEQ_PATH) else the module's own bundle. NOT QSettings.
     QString        seqPath() const;
@@ -594,6 +745,31 @@ private:
 
     // Map an asset name ("native"/"token") to its CLI program subcommand.
     static QString assetProgram(const QString& asset);
+
+    // ── The two spec parsers (the encoding is documented at the top of this header) ──────
+    // These exist to keep every value-moving verb at 4 arguments under a bridge that
+    // dispatches at most 5. Both are TOTAL: they either fill every out-parameter or return
+    // false with a sentence in *error, so a verb never half-parses a spend.
+    //
+    // "12" | {"amount":"12"} | {"asset":"token","definitionId":"<id>","amount":"12"}
+    // → *asset is "native" or "token" and nothing else (an unrecognised asset is an ERROR,
+    //   never a silent fall-back to native: "toekn" quietly spending LEZ instead of a token
+    //   is a money bug, and assetProgram()'s permissive mapping is only safe downstream of
+    //   this check). *amount is digits (optionally with a decimal part - the chain rejects
+    //   fractional units, but rejecting them HERE would be a new refusal); that check is also
+    //   what makes a stale caller which still passes (asset, from, to, amount) fail loudly on
+    //   the misplaced argument instead of forwarding it to the CLI.
+    static bool parseValueSpec(const QString& spec, QString* asset, QString* definitionId,
+                               QString* amount, QString* error);
+    // "Private/abc…" (owned) | {"npk":…,"vpk":…,"identifier":…} (foreign private recipient).
+    // Exactly one of *accountId or the (npk,vpk,identifier) triple comes back non-empty.
+    static bool parseRecipientSpec(const QString& spec, QString* accountId, QString* npk,
+                                   QString* vpk, QString* identifier, QString* error);
+    // Validate + split a zone endpoint into the (url, onion) pair the zone record stores.
+    // tor=true → the endpoint must be a .onion; tor=false → a http(s) URL, normalised the way
+    // addZone has always normalised it (a missing scheme defaults to http://).
+    static bool normalizeZoneEndpoint(const QString& endpoint, bool tor, QString* url,
+                                      QString* onion, QString* error);
     // Ensure an account id carries the required privacy prefix ("Public"/"Private").
     // Returns the prefixed id, or an empty string on an explicit prefix conflict.
     static QString withPrivacyPrefix(const QString& id, const QString& kind, bool* conflict);
@@ -621,6 +797,14 @@ private:
         QString        outBuf;    // stdout accumulated incrementally (for phase detection)
         bool           killedByTimeout = false;
         QElapsedTimer  timer;
+        // ── Queued start (only the faucet's token half uses this) ──────────────────────
+        // The job is registered and reported "running" from the moment it is created; the
+        // CHILD is held back until `waitFor` ends, then launched with these. Empty waitFor =
+        // started immediately, which is every other job.
+        QString        waitFor;       // jobId this one is sequenced behind
+        QString        pendingBin;    // the child to launch when that job ends
+        QStringList    pendingArgs;
+        bool           pendingOwnBin = false;   // the child is not the wallet CLI
     };
 
     // Non-empty error message if a running shield/private job already targets this
@@ -629,15 +813,31 @@ private:
     // Build args + spawn a privacy "send" as a background job; returns {jobId,state}.
     // `binOverride` names a DIFFERENT child to run under the same job machinery (the on-chain
     // faucet's medusa-faucet-client); empty = the wallet CLI, which is every other caller.
+    // `waitForJob`, when it names a job that is still running, sequences this one behind it:
+    // the job is created and polled normally, but its child is not launched until that job
+    // finishes (or the queue cap below expires). Used to keep the faucet's two halves off the
+    // wallet store at the same time; see startTokenFaucet.
     QString startPrivacyJob(const QString& op, const QString& asset,
                             const QStringList& sendArgs,
                             const QString& from, const QString& to, const QString& amount,
-                            const QString& binOverride = QString());
+                            const QString& binOverride = QString(),
+                            const QString& waitForJob = QString());
+    // Create, wire and launch one job's child. The single place a job process is built, so a
+    // queued start cannot drift from an immediate one.
+    void    startJobProcess(Job* j, const QString& bin, const QStringList& args, bool ownBin);
+    // Release any job queued behind `jobId`. Called from BOTH places a job becomes terminal:
+    // onJobFinished, and the FailedToStart handler (after which finished() is never emitted).
+    void    startQueuedBehind(const QString& jobId);
     void    onJobFinished(const QString& jobId, int exitCode);
 
     QHash<QString, Job*> m_jobs;
     int  m_jobSeq = 0;
     static constexpr int kMaxJobs        = 24;
+    // How long a queued job waits for the one ahead of it before starting anyway. The wait is
+    // an ordering convenience, not a dependency, so it is capped: the worst realistic `pinata
+    // claim` is the wrapper's own budget (180s recipient init + 240s claim), and starting a
+    // little late is recoverable where never starting is not.
+    static constexpr int kQueuedStartMaxMs = 8 * 60 * 1000;
     // Job safety-kill budget. Real STARK proofs on a busy machine measured 20-40+ min
     // (native ~20-35, token ~40 on a half-loaded 16-core box); 30 min killed genuine
     // proofs mid-flight. The wrapper's own per-step budgets (MEDUSA_PROOF_TIMEOUT_S,
