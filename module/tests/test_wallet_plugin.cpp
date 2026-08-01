@@ -299,15 +299,19 @@ private:
         useCli(makeTokenCli(registryWithVaults(kParadoxDefs)));
     }
     // A token-registry reply designating "vault-<n>" as the holding for each definition.
-    static QString registryWithVaults(const QStringList& defs)
+    static QString registryWithVaults(const QStringList& defs,
+                                      const QString& owner = QStringLiteral("my-main-account"))
     {
         QStringList quoted, pairs;
         for (int i = 0; i < defs.size(); ++i) {
             quoted << QStringLiteral("\"%1\"").arg(defs.at(i));
             pairs  << QStringLiteral("\"%1\":\"vault-%2\"").arg(defs.at(i)).arg(i + 1);
         }
-        return QStringLiteral("{\"definitions\":[%1],\"names\":{},\"vaults\":{%2}}")
-                   .arg(quoted.join(QLatin1Char(',')), pairs.join(QLatin1Char(',')));
+        // Vaults are keyed BY OWNER: vaults[owner][definition] = holding. The fixture files
+        // them all under kOwner, the account these tests claim from, because a holding that
+        // belongs to nobody is exactly what the per-owner change removed.
+        return QStringLiteral("{\"definitions\":[%1],\"names\":{},\"vaults\":{\"%2\":{%3}}}")
+                   .arg(quoted.join(QLatin1Char(',')), owner, pairs.join(QLatin1Char(',')));
     }
     // The vault ids registryWithVaults() hands out, in the same order.
     static QStringList vaultIds(int n)
@@ -930,6 +934,35 @@ private slots:
         QCOMPARE(cargv.at(acct + 1), QString("minted1,minted2,minted3"));
     }
 
+    // Vaults belong to ONE account. A holding recorded for account A must never be handed to a
+    // claim made from account B: the registry used to key vaults by definition alone, so the
+    // faucet always paid the same holding whichever account you claimed from, only that account
+    // could shield, and every other account displayed tokens it could not spend. B has no vault
+    // of its own here, so it must MINT fresh holdings rather than inherit A's.
+    void testAVaultBelongsToOneAccountAndIsNeverReusedByAnother()
+    {
+        useWorkingFaucet();
+        useCli(makeTokenCli(registryWithVaults(kParadoxDefs, QStringLiteral("account-A"))));
+        WalletPlugin p;
+        arm(p);
+
+        const auto r = parseObj(p.startTokenFaucet(QStringLiteral("Public/account-B"), kPw));
+        QVERIFY2(r.contains(QStringLiteral("jobId")), qPrintable(QJsonDocument(r).toJson()));
+        awaitJob(p, r[QStringLiteral("jobId")].toString());
+
+        const QStringList argv = slurp(qEnvironmentVariable("MEDUSA_FAUCET_CLIENT")
+                                       + QStringLiteral(".argv"))
+                                     .split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+        const int acct = argv.indexOf(QStringLiteral("--account"));
+        QVERIFY(acct >= 0);
+        const QString recipients = argv.at(acct + 1);
+        // Not A's vaults, and not B's own account either (an account holds one definition).
+        for (const QString& v : vaultIds(kParadoxDefs.size()))
+            QVERIFY2(!recipients.contains(v),
+                     qPrintable(QStringLiteral("B was handed A's vault %1: %2").arg(v, recipients)));
+        QVERIFY2(!recipients.contains(QStringLiteral("account-B")), qPrintable(recipients));
+    }
+
     // A claim never uses the user's own account as a recipient. On rc5 an account holds exactly
     // ONE token definition, so spending the main account here would bind it to one token
     // permanently - the wallet's per-definition holdings are the only correct targets.
@@ -1068,7 +1101,7 @@ private slots:
             "  echo 'faucet cooldown not elapsed: 42 minutes remaining' >&2; exit 1\n"
             "fi\n"
             "if [ \"$1\" = token-registry ] && [ \"$2\" != vault ]; then echo '%1'; exit 0; fi\n"
-            "echo '{\"ok\":true}'\n").arg(registryWithVaults(kParadoxDefs))));
+            "echo '{\"ok\":true}'\n").arg(registryWithVaults(kParadoxDefs, QStringLiteral("abc123")))));
 
         WalletPlugin p;
         arm(p);
@@ -1105,7 +1138,7 @@ private slots:
             "#!/bin/sh\n"
             "if [ \"$1\" = pinata ]; then sleep 1; echo '{\"ok\":true,\"txHash\":\"tx1\"}'; exit 0; fi\n"
             "if [ \"$1\" = token-registry ] && [ \"$2\" != vault ]; then echo '%1'; exit 0; fi\n"
-            "echo '{\"ok\":true}'\n").arg(registryWithVaults(kParadoxDefs))));
+            "echo '{\"ok\":true}'\n").arg(registryWithVaults(kParadoxDefs, QStringLiteral("abc123")))));
 
         WalletPlugin p;
         arm(p);

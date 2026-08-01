@@ -151,7 +151,17 @@ def load_reg():
             r = json.load(f)
         r.setdefault("definitions", [])
         r.setdefault("names", {})
-        r.setdefault("vaults", {})   # def -> bare id of the wallet's DIRECT holding (shieldable)
+        # vaults[owner][definition] = bare id of THAT ACCOUNT's direct holding (shieldable).
+        # Old registries used vaults[definition] = holding, one holding per token for the whole
+        # wallet, which made the faucet deliver to a single account and made every account show
+        # the same token balance. Normalise on read: a holding stands as its own owner, which is
+        # true (a direct holding IS one of the wallet's accounts) and keeps existing tokens
+        # reachable from the account that actually holds them.
+        v = r.get("vaults") or {}
+        if v and all(isinstance(x, str) for x in v.values()):
+            r["vaults"] = {holding: {defid: holding} for defid, holding in v.items()}
+        else:
+            r.setdefault("vaults", {})
         # Private accounts we have EVER successfully sent a private OUTPUT to. rc5 rejects a
         # fresh output onto any non-default private account - even a same-def token top-up is
         # silently dropped on-chain AFTER the full client proof (verified live) - so these are
@@ -409,15 +419,21 @@ def direct_holdings_list():
     return out
 
 
-def vault_for(defb):
-    """The wallet's designated DIRECT holding for a definition (registry-recorded; the
-    faucet prefers it so tokens arrive SHIELDABLE). Falls back to any existing direct
-    holding. Never mints one: a pristine account can only be claimed by a SAME-WALLET
-    `token send` from a direct holding (cross-wallet credits to pristine accounts are
-    rejected on-chain - the claim needs the recipient key's co-signature), so a wallet
-    without a direct holding cannot bootstrap a vault. Returns the bare id, or None."""
+def vault_for(defb, owner=None):
+    """THIS ACCOUNT's designated DIRECT holding for a definition (registry-recorded; the
+    faucet delivers there so tokens arrive SHIELDABLE). Never mints one: a pristine account
+    can only be claimed by a SAME-WALLET `token send` from a direct holding (cross-wallet
+    credits to pristine accounts are rejected on-chain - the claim needs the recipient key's
+    co-signature), so a wallet without a direct holding cannot bootstrap a vault.
+    Returns the bare id, or None.
+
+    `owner` is the account the tokens belong to. Vaults are per-owner: without this, one
+    holding served the whole wallet, so the faucet always paid the same account and every
+    other account showed a balance it could not spend. With no owner given, fall back to the
+    wallet-wide scan for callers that genuinely have no account in hand."""
     reg = load_reg()
-    bare = (reg.get("vaults") or {}).get(defb)
+    vaults = reg.get("vaults") or {}
+    bare = (vaults.get(owner) or {}).get(defb) if owner else None
     pristine = None
     if bare:
         d, _b = holding_state(bare)
@@ -427,9 +443,18 @@ def vault_for(defb):
             pristine = bare         # recorded but never credited - an INITIALIZED holding
                                     # of this def (scan below) must take precedence, or the
                                     # pristine record shadows real funds forever
+    # An owner IS a direct holding when its own on-chain data is a holding of this definition.
+    if owner:
+        d, _b = holding_state(owner)
+        if d == defb:
+            reg.setdefault("vaults", {}).setdefault(owner, {})[defb] = owner
+            save_reg(reg)
+            return owner
+    if owner:
+        return pristine
     for h in direct_holdings_list():
         if h["definitionId"] == defb:
-            reg.setdefault("vaults", {})[defb] = h["account"]
+            reg.setdefault("vaults", {}).setdefault(h["account"], {})[defb] = h["account"]
             save_reg(reg)
             return h["account"]
     return pristine
@@ -480,18 +505,16 @@ if args and args[0] == "tokens":
         # (direct holding - where the faucet delivers, shieldable) counts toward the
         # balance; the ATA remainder is reported separately so a consolidate can move it.
         #
-        # The vault counts ONLY for the account that IS it. `vaults` is keyed by definition
-        # alone (one designated holding per definition, wallet-wide), and a direct holding is
-        # itself one of the wallet's accounts. Adding it unconditionally therefore showed the
-        # SAME token balance on every account, and implied every account could shield tokens
-        # that in reality live in exactly one holding. A balance shown against an account must
-        # be a balance that account can actually spend.
-        vaults = reg.get("vaults") or {}
+        # Vaults are per-owner (vaults[owner][definition]), so this account's vault balance is
+        # its own and nobody else's. A balance shown against an account must be one that
+        # account can actually spend: the old wallet-wide map made every account display the
+        # same tokens and imply every account could shield them.
+        mine = (reg.get("vaults") or {}).get(owner_bare) or {}
         for defid in reg["definitions"]:
             ata_b = int(balances.get(defid, "0"))
             v_b = 0
-            vb = vaults.get(defid)
-            if vb and vb == owner_bare:
+            vb = mine.get(defid)
+            if vb:
                 d, b = holding_state(vb)
                 if d == defid:
                     v_b = b
@@ -535,7 +558,10 @@ if args and args[0] == "token-transfer" and len(args) >= 5:
                                    "retry in a minute"}))
         sys.exit(1)
     before = ata_balance(to, defb) or 0
-    v = vault_for(defb)
+    # Spend from the SENDER's own vault: with per-owner vaults there is no single wallet vault
+    # to fall back on, and spending someone else's holding is what made every account look
+    # like it owned the same tokens.
+    v = vault_for(defb, frm)
     vd, vb = holding_state(v) if v else (None, None)
     vault_ok = (vd == defb)
     vb = vb or 0
@@ -607,7 +633,7 @@ if args and args[0] == "token-shield" and len(args) >= 5:
         # balance still shields in a single user action. The deficit is measured against
         # the VAULT itself (not the largest holding - they differ on issuer wallets).
         owner = args[1].split("/")[-1]
-        vault = vault_for(defb)
+        vault = vault_for(defb, owner)   # this owner's own holding, not the wallet's
         vd, vb = holding_state(vault) if vault else (None, None)
         if vd == defb:
             need = amt - (vb or 0)
@@ -700,7 +726,10 @@ if args and args[0] == "consolidate" and len(args) >= 3:
     bal = ata_balance(owner, defb) or 0
     if bal <= 0:
         print(json.dumps({"error": "no ATA balance of this token to consolidate"})); sys.exit(1)
-    vault = vault_for(defb)
+    # Consolidate moves THIS owner's ATA remainder into THIS owner's own holding. With
+    # per-owner vaults there is no wallet-wide vault to sweep into, and sweeping into another
+    # account's holding would move the user's tokens somewhere they cannot spend them.
+    vault = vault_for(defb, owner)
     if not vault or holding_state(vault)[0] != defb:
         print(json.dumps({"error": "no initialized vault holding for this token yet - claim "
                           "from the faucet (or receive a direct send) once, then retry"}))
@@ -731,23 +760,35 @@ if args and args[0] == "token-registry":
     # HERE, so the next claim reuses it. That matters beyond tidiness - the faucet's cooldown
     # marker PDA is derived from the first recipient, so a claim that invented a fresh account
     # each time would derive a fresh marker each time and the 6h cooldown would bind to nothing.
+    # `token-registry vault <def-id> <holding> [<owner>]`. Vaults are keyed BY OWNER:
+    #     vaults[owner][definition] = holding
+    # The old shape was vaults[definition] = holding, ONE holding per token for the whole
+    # wallet. That is the bug the owner hit: the faucet always delivered to that single
+    # holding no matter which account you claimed from, only that account could shield, and
+    # every account displayed the same token balance. A balance shown against an account has
+    # to be one that account can actually spend.
+    # <owner> defaults to the holding itself, which is what a bare `token-registry vault`
+    # from an older caller means and is exactly right for a holding that stands alone.
     if len(args) >= 4 and args[1] == "vault":
         defid = args[2].split("/")[-1]
         bare  = args[3].split("/")[-1]
-        for v in (defid, bare):
+        owner = (args[4].split("/")[-1] if len(args) >= 5 else bare)
+        for v in (defid, bare, owner):
             if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,50}", v):
                 print(json.dumps({"error": "not a valid account id (expected base58)"}))
                 sys.exit(1)
-        # It must be an account THIS wallet owns: a vault is signed as the claimant on every
+        # Both must be accounts THIS wallet owns: a vault is signed as the claimant on every
         # claim, so recording somebody else's account would produce a tx the chain rejects.
-        if not any((a.get("id") or "").split("/")[-1] == bare for a in owned_accounts()):
-            print(json.dumps({"error": "that account is not in this wallet"}))
-            sys.exit(1)
-        reg.setdefault("vaults", {})[defid] = bare
+        owned = {(a.get("id") or "").split("/")[-1] for a in owned_accounts()}
+        for v in (bare, owner):
+            if v not in owned:
+                print(json.dumps({"error": "that account is not in this wallet"}))
+                sys.exit(1)
+        reg.setdefault("vaults", {}).setdefault(owner, {})[defid] = bare
         if defid not in reg["definitions"]:
             reg["definitions"].append(defid)
         save_reg(reg)
-        print(json.dumps({"ok": True, "definitionId": defid, "vault": bare}))
+        print(json.dumps({"ok": True, "definitionId": defid, "vault": bare, "owner": owner}))
         sys.exit(0)
     if len(args) >= 3 and args[1] == "add":
         defid = args[2].split("/")[-1]

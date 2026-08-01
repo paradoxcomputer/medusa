@@ -2693,7 +2693,7 @@ QString WalletPlugin::faucetGuestBin()
 // treasury PDA, whose derivation lives in medusa_faucet_shared. Re-deriving a PDA in C++ is
 // exactly the drift the shared crate exists to prevent, so the claim path surfaces the client's
 // answer instead of computing a second opinion that could disagree with the chain.
-WalletPlugin::FaucetPreflight WalletPlugin::faucetPreflight()
+WalletPlugin::FaucetPreflight WalletPlugin::faucetPreflight(const QString& owner)
 {
     FaucetPreflight pf;
     pf.zone = netId();
@@ -2788,12 +2788,18 @@ WalletPlugin::FaucetPreflight WalletPlugin::faucetPreflight()
     //    one. That provisioning is deliberately NOT done here: faucetStatus() calls this on
     //    every Tokens-tab open and a read-only status call must never create accounts. See
     //    ensureFaucetRecipients(), which the two claim verbs call and nothing else does.
+    // Vaults are keyed BY OWNER: vaults[owner][definition] = holding. One holding per token
+    // for the WHOLE wallet was the reported bug - the faucet always paid the same account
+    // whichever one you claimed from, and every other account displayed tokens it could not
+    // spend. With no owner in hand (the status path) there is nothing to look up, so every
+    // slot is empty and the claim path mints what it needs.
     QHash<QString, QString> vaults;
-    {
+    if (!owner.trimmed().isEmpty()) {
         const QJsonObject reg =
             QJsonDocument::fromJson(getTokenRegistry().toUtf8()).object();
-        const QJsonObject v = reg.value(QStringLiteral("vaults")).toObject();
-        for (auto it = v.constBegin(); it != v.constEnd(); ++it)
+        const QJsonObject mine = reg.value(QStringLiteral("vaults")).toObject()
+                                    .value(owner.trimmed().section(QLatin1Char('/'), -1)).toObject();
+        for (auto it = mine.constBegin(); it != mine.constEnd(); ++it)
             vaults.insert(it.key(), it.value().toString());
     }
     for (const QString& def : std::as_const(pf.definitions))
@@ -2818,7 +2824,7 @@ WalletPlugin::FaucetPreflight WalletPlugin::faucetPreflight()
 // used. That matters for more than tidiness: the cooldown marker PDA is derived from the FIRST
 // recipient, so a claim that invented a new account every time would derive a new marker every
 // time and the on-chain 6h cooldown would never bind to anything.
-QString WalletPlugin::ensureFaucetRecipients(FaucetPreflight& pf)
+QString WalletPlugin::ensureFaucetRecipients(FaucetPreflight& pf, const QString& owner)
 {
     for (int i = 0; i < pf.definitions.size(); ++i) {
         if (!pf.recipients.at(i).isEmpty())
@@ -2839,9 +2845,14 @@ QString WalletPlugin::ensureFaucetRecipients(FaucetPreflight& pf)
                  + pf.tickers.value(i);
         // Record it BEFORE the claim: if the claim then fails, the next attempt reuses this
         // account instead of minting another, and the cooldown marker stays put.
-        const QString rec = runWalletCommand({ QStringLiteral("token-registry"),
-                                               QStringLiteral("vault"),
-                                               pf.definitions.at(i), bare }, 20000);
+        // Record it against the CLAIMING account: vaults are per-owner, so a holding minted
+        // for account A must be A's, not a wallet-wide one every other account then displays.
+        const QString ownerBare = owner.trimmed().section(QLatin1Char('/'), -1);
+        QStringList regArgs{ QStringLiteral("token-registry"), QStringLiteral("vault"),
+                             pf.definitions.at(i), bare };
+        if (!ownerBare.isEmpty())
+            regArgs << ownerBare;
+        const QString rec = runWalletCommand(regArgs, 20000);
         if (QJsonDocument::fromJson(rec.toUtf8()).object().contains(QStringLiteral("error")))
             appendLog(QStringLiteral("faucet: could not record the vault for %1 (%2) - the claim "
                                      "still runs, but the next one will create another account")
@@ -2910,13 +2921,13 @@ QString WalletPlugin::startTokenFaucet(const QString& accountId, const QString& 
     if (accountId.trimmed().isEmpty())
         return errorJson(QStringLiteral("accountId is required"));
 
-    FaucetPreflight pf = faucetPreflight();
+    FaucetPreflight pf = faucetPreflight(accountId);
     if (!pf.ok)
         return errorJson(pf.message, pf.reason);
 
     // Every definition needs a recipient this wallet owns; mint the missing ones. This is the
     // one write the status path never performs, which is why it is here and not in the preflight.
-    const QString provErr = ensureFaucetRecipients(pf);
+    const QString provErr = ensureFaucetRecipients(pf, accountId);
     if (!provErr.isEmpty())
         return errorJson(provErr, QStringLiteral("no-holding"));
     if (!pf.provisioned.isEmpty())
