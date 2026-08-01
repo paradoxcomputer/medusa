@@ -1411,11 +1411,20 @@ void WalletPlugin::ensureTor()
         QStringLiteral("--Log"),             QStringLiteral("notice file ") + dataDir + QStringLiteral("/tor.log"),
     });
     QObject::connect(m_torProc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-                     this, [this](int code, QProcess::ExitStatus) {
-        appendLog(QStringLiteral("bundled Tor exited (code %1)").arg(code), QStringLiteral("error"));
+                     this, [this](int code, QProcess::ExitStatus st) {
+        // RECORD it, do not merely log it. Without this m_torExited stayed false forever and
+        // getSequencerStatus could never emit "tor-exited", so a crashed Tor read as an eternal
+        // "Connecting..." - the exact failure this record exists to end. A deliberate stopTor()
+        // sets m_torStopping first, so a shutdown is never reported as a crash.
+        if (!m_torStopping) {
+            m_torExited   = true;
+            m_torExitCode = (st == QProcess::CrashExit) ? -1 : code;
+            appendLog(QStringLiteral("bundled Tor exited (code %1)").arg(code), QStringLiteral("error"));
+        }
     });
     if (!m_torProc->waitForStarted(3000)) {
-        appendLog(QStringLiteral("Tor failed to start: ") + torBin, QStringLiteral("error"));
+        m_torLaunchError = QStringLiteral("Tor failed to start: ") + torBin;
+        appendLog(m_torLaunchError, QStringLiteral("error"));
         m_torProc->deleteLater();
         m_torProc = nullptr;
         return;
@@ -1451,6 +1460,10 @@ void WalletPlugin::ensureTor()
 
 void WalletPlugin::stopTor()
 {
+    // Mark the teardown BEFORE reaping: waitForFinished() delivers finished() synchronously, and
+    // without this flag a deliberate stop would record itself as a crash and the next status call
+    // would report "tor-exited" for a Tor the user asked to stop.
+    m_torStopping = true;
     auto reap = [](QProcess*& p) {
         if (!p) return;
         if (p->state() != QProcess::NotRunning) {
@@ -1462,6 +1475,9 @@ void WalletPlugin::stopTor()
     };
     reap(m_torMonProc);
     reap(m_torProc);
+    m_torStopping = false;
+    m_torExited   = false;   // a stopped Tor is not a crashed one
+    m_torExitCode = 0;
 }
 
 // An ADOPTED Tor (another wallet window's, reused by ensureTor's single-instance guard) is not
@@ -1739,6 +1755,19 @@ QString WalletPlugin::applySequencer()
 {
     const QString id   = netId();
     const QString kind = zoneKind(id);
+
+    // Applying a zone ENDS the "the user stopped the last connect" story: whatever happens from
+    // here is this apply's doing. Clearing it here is what makes the record mean "the most recent
+    // connect ended because the user stopped it, and nothing has been re-applied since", which is
+    // what the header promises. cancelConnect() re-asserts it deliberately after the apply it
+    // performs itself, so its own reply and the next status call still say "aborted".
+    m_connectAborted = false;
+    m_abortedZone.clear();
+    // A fresh apply also retires the previous zone's Tor failure record: a Tor that failed for a
+    // zone we have left must not keep colouring the reason for the zone we are now on.
+    m_torLaunchError.clear();
+    m_torExited   = false;
+    m_torExitCode = 0;
 
     // Effective sequencer address for this zone:
     //  - local zones  -> the local sequencer on the zone's port
@@ -2235,7 +2264,31 @@ QString WalletPlugin::getSequencerStatus()
         o[QStringLiteral("needsTor")]     = true;
         o[QStringLiteral("torAvailable")] = !tb.isEmpty();
         o[QStringLiteral("torPath")]      = tb;
+        // The transport, reported rather than inferred: the forward is a SEPARATE process that
+        // outlives Tor and dials lazily, so "the forward is up" alone kept reading as connected.
+        const bool fwdUp = (m_fwdProc && m_fwdProc->state() != QProcess::NotRunning);
+        o[QStringLiteral("torRunning")]     = torRunning();
+        o[QStringLiteral("forwardRunning")] = fwdUp;
+        // A Tor zone gets the same machine-readable `reason` a local zone does. Without it a
+        // crashed or never-started Tor reported state "starting" with nothing to explain it, and
+        // sat there forever: the eternal silent "Connecting..." this record exists to end.
+        //
+        // Deliberately NO time-based "unhealthy" here: a bootstrap legitimately takes minutes,
+        // and calling a slow connect a failure is how this UI learned to lie.
+        QString treason;
+        if (m_zoneCompat == QStringLiteral("mismatch"))  treason = QStringLiteral("mismatch");
+        else if (m_connectAborted && m_abortedZone == id) treason = QStringLiteral("aborted");
+        else if (tb.isEmpty())                           treason = QStringLiteral("tor-missing");
+        else if (!m_torLaunchError.isEmpty())            treason = QStringLiteral("tor-failed");
+        else if (m_torExited)                            treason = QStringLiteral("tor-exited");
+        o[QStringLiteral("reason")] = treason;
     }
+    // Carried on EVERY reply, not just a Tor one: after a cancel the wallet may have landed on a
+    // clearnet zone, and the caller still has to be able to tell "the user stopped it" from "it
+    // went quiet". Cleared by the next applySequencer().
+    o[QStringLiteral("connectAborted")] = m_connectAborted;
+    if (m_connectAborted)
+        o[QStringLiteral("abortedZone")] = m_abortedZone;
     return QJsonDocument(o).toJson(QJsonDocument::Compact);
 }
 

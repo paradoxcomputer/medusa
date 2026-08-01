@@ -1821,6 +1821,48 @@ private slots:
         QCOMPARE(r[QStringLiteral("compat")].toString(), QString("unknown"));
         QVERIFY(!r.contains(QStringLiteral("reason")));
         QVERIFY(!r.contains(QStringLiteral("running")));
+        // Carried on EVERY reply: after a cancel the wallet may have landed on a clearnet zone,
+        // and a caller still has to tell "the user stopped it" from "it went quiet".
+        QVERIFY(r.contains(QStringLiteral("connectAborted")));
+        QCOMPARE(r[QStringLiteral("connectAborted")].toBool(), false);
+    }
+
+    // A Tor zone must get the same machine-readable `reason` a local zone does. It did not: the
+    // header documented "aborted | tor-missing | tor-failed | tor-exited | mismatch" and the body
+    // emitted none of them, so a Tor that crashed or never started reported state "starting" with
+    // nothing to explain it, forever. That is the eternal silent "Connecting..." this record
+    // exists to end, and the backing members were dead too (m_torExited was cleared but never
+    // set, m_torStopping was never referenced), so the codes were unreachable by construction.
+    void testATorZoneReportsAReasonAndAnAbortRecord()
+    {
+        WalletPlugin p;
+        const QString zone = useUserZone(p, QStringLiteral("Hidden node"));
+        // Make it a Tor zone: editZone with an onion is the same path addZone takes.
+        p.editZone(zone, QStringLiteral("Hidden node"),
+                   QStringLiteral("abcdefghijklmnop.onion:3077"), true);
+
+        const auto r = parseObj(p.getSequencerStatus());
+        QVERIFY2(r.contains(QStringLiteral("reason")), qPrintable(QJsonDocument(r).toJson()));
+        QVERIFY(r.contains(QStringLiteral("torRunning")));
+        QVERIFY(r.contains(QStringLiteral("forwardRunning")));
+        // Whether a system tor exists is a property of the BOX, not of the wallet, so assert the
+        // contract rather than one environment's answer: the reason must be one of the documented
+        // codes. Pinning "tor-missing" here passed or failed depending on whether /usr/bin/tor
+        // happened to be installed.
+        const QStringList kTorReasons{ QString(), QStringLiteral("aborted"),
+                                       QStringLiteral("tor-missing"), QStringLiteral("tor-failed"),
+                                       QStringLiteral("tor-exited"), QStringLiteral("mismatch") };
+        QVERIFY2(kTorReasons.contains(r[QStringLiteral("reason")].toString()),
+                 qPrintable(QStringLiteral("undocumented Tor reason: ")
+                            + r[QStringLiteral("reason")].toString()));
+
+        // Cancelling records WHICH zone was abandoned, and the next status call still says so.
+        const auto c = parseObj(p.cancelConnect());
+        QCOMPARE(c[QStringLiteral("ok")].toBool(), true);
+        QCOMPARE(c[QStringLiteral("abortedZone")].toString(), zone);
+        const auto after = parseObj(p.getSequencerStatus());
+        QCOMPARE(after[QStringLiteral("connectAborted")].toBool(), true);
+        QCOMPARE(after[QStringLiteral("abortedZone")].toString(), zone);
     }
 
     // ── Proof-of-user gate ───────────────────────────────────────────────────────

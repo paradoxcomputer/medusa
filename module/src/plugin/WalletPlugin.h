@@ -135,8 +135,13 @@ public:
     // setting is no longer read on the execution path), kept only so a poisoned install shows
     // what was planted. mode = "local" | "hosted".
     Q_INVOKABLE QString getSequencerConfig() const;
-    // Persist mode/url/port; project sequencer_addr into wallet_config.json; in local
-    // mode (re)launch the bundled standalone sequencer, in hosted mode stop it. {ok}.
+    // Persists mode/url and re-applies the active zone. {ok}.
+    // WHAT IT DOES NOT DO, because the header used to claim it and that was false: mode does not
+    // choose anything. seqMode/seqUrl are stored and reported back for settings round-trip only
+    // (see the .cpp: they "influence nothing"), `port` is unused, and applySequencer() derives
+    // the endpoint and what to launch from the ACTIVE ZONE alone. So setSequencerConfig("hosted",
+    // …) on a local zone re-launches the local sequencer, the opposite of what the old comment
+    // promised. Zone selection is setActiveZone's job; this verb has no caller in the UI today.
     Q_INVOKABLE QString setSequencerConfig(const QString& mode, const QString& url, int port);
     // {state,mode,port,endpoint,healthy,compat} - state = "running" | "starting" |
     // "unreachable". "starting" means a connect is genuinely IN FLIGHT, which on a Tor zone
