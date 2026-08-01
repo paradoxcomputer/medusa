@@ -1216,7 +1216,7 @@ QJsonObject WalletPlugin::zoneObj(const QString& id) const
     if (id == QStringLiteral("paradox-clearnet")) {
         QJsonObject o;
         o[QStringLiteral("id")]    = id;
-        o[QStringLiteral("name")]  = QStringLiteral("Paradox Computer · clearnet");
+        o[QStringLiteral("name")]  = QStringLiteral("Paradox Computer");
         o[QStringLiteral("url")]   = clearnetUrl();
         o[QStringLiteral("onion")] = QString();
         o[QStringLiteral("tor")]   = false;
@@ -1227,7 +1227,7 @@ QJsonObject WalletPlugin::zoneObj(const QString& id) const
     if (id == QStringLiteral("logos-testnet")) {
         QJsonObject o;
         o[QStringLiteral("id")]    = id;
-        o[QStringLiteral("name")]  = QStringLiteral("Logos · public testnet");
+        o[QStringLiteral("name")]  = QStringLiteral("Logos public testnet");
         o[QStringLiteral("url")]   = logosTestnetUrl();
         o[QStringLiteral("onion")] = QString();
         o[QStringLiteral("tor")]   = false;
@@ -1834,11 +1834,11 @@ QString WalletPlugin::getZones() const
         return o;
     };
     out.append(builtin(QStringLiteral("devnet"),   QStringLiteral("Devnet"),                  QStringLiteral("local-standalone")));
-    out.append(builtin(QStringLiteral("diaphani"), QStringLiteral("Paradox Computer · Tor"),  QStringLiteral("local-l1-tor")));
+    out.append(builtin(QStringLiteral("diaphani"), QStringLiteral("Paradox Computer"),  QStringLiteral("local-l1-tor")));
     // Same prod sequencer as the Tor zone, reached over clearnet (TLS) - a thin remote client.
     {
         QJsonObject o = builtin(QStringLiteral("paradox-clearnet"),
-                                QStringLiteral("Paradox Computer · clearnet"),
+                                QStringLiteral("Paradox Computer"),
                                 QStringLiteral("remote"));
         o[QStringLiteral("endpoint")] = clearnetUrl();
         out.append(o);
@@ -1846,7 +1846,7 @@ QString WalletPlugin::getZones() const
     // The official Logos public testnet (logos-co). Same LEZ v0.2.0 engine as this build.
     {
         QJsonObject o = builtin(QStringLiteral("logos-testnet"),
-                                QStringLiteral("Logos · public testnet"),
+                                QStringLiteral("Logos public testnet"),
                                 QStringLiteral("remote"));
         o[QStringLiteral("endpoint")] = logosTestnetUrl();
         out.append(o);
