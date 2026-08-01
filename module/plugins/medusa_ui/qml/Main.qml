@@ -175,6 +175,29 @@ Rectangle {
     property string selectedFromBalance: ""
     property var    selectedTokens:      []      // [{definitionId,ticker,balance}] of the selected account
     property var    whitelistTokens:     []      // [{name,def}] curated tokens to add
+
+    // ── The faucet: ONE press, up to TWO halves ────────────────────────────────
+    // The ⛲ chip claims native LEZ (`pinata claim`, fully on-chain and needing no local state)
+    // AND, where the zone has one, the deployed medusa_faucet program's whitelist tokens. The
+    // token half used to be a client-side drop from a treasury wallet whose whitelist file lived
+    // in ~/.local/share/medusa-treasury; deleting that directory silently removed the tokens from
+    // every claim while LEZ kept arriving, which is the bug this replaces.
+    //
+    // The token half is a PER-ZONE capability (see zoneTokenFaucet): the program and its funded
+    // per-definition treasuries exist only on the built-in operator zones. The local devnet
+    // sandbox is a chain this wallet starts itself and a user-added zone is somebody else's
+    // sequencer, so on those there is no token half at all - and the UI must not imply one was
+    // expected. That is why every token-side control is gated on the capability rather than
+    // shown and then refused, and why the claim summary never mentions tokens there.
+    property bool   faucetOnChainReady:  false   // faucetStatus().available on THIS zone
+    property string faucetOnChainNote:   ""      // …and, when it is not, why - in words
+    property var    faucetOnChainDefs:   []      // definition ids it dispenses on this zone
+    property var    faucetOnChainNames:  []      // their tickers, same order (display only)
+    // The claim in flight: {lez:{…}, tok:{…}}, each half "pending" until it is terminal
+    // ("absent" when the claim never had that half). Held so the two halves are summarised
+    // ONCE, as one outcome: "received 150 LEZ, tokens available again in 4h" is a good result,
+    // and reporting the halves separately rendered it as a success plus an unexplained failure.
+    property var    faucetClaim:         null
     property string sendTokenDef:        ""      // "" = native LEZ, else token definition id
     property string sendTokenName:       "LEZ"
     property string sendStatus:          ""
@@ -273,8 +296,8 @@ Rectangle {
     property string protectionWarning: ""
     // The consequence of the above, named once so no control has to re-derive it. While this is
     // true every gated verb refuses with reason "unencrypted": sendTransfer, startSendTransfer,
-    // startSendToken, startShield, startDeshield, startPrivateTransfer,
-    // startPrivateTransferForeign, consolidateToken, approveAction, approveZone, exportMnemonic
+    // startSendToken, startShield, startDeshield, startPrivateTransfer, startTokenFaucet,
+    // consolidateToken, approveAction, approveZone, exportMnemonic
     // and exportKey. resetWallet and restoreWallet are NOT in that set (they are ungated while no
     // session is live, which on a plaintext store is always), and every ungated verb - accounts,
     // balances, tokens, faucet, receive keys, importKey, zones - keeps working. Controls that call
@@ -376,6 +399,29 @@ Rectangle {
             if (root.zones[i].id === id) return root.zones[i].name
         return id
     }
+    function zoneById(id) {
+        for (var i = 0; i < root.zones.length; i++)
+            if (root.zones[i].id === id) return root.zones[i]
+        return null
+    }
+    // ── Does THIS zone have the on-chain token faucet? ─────────────────────────
+    // A property of the ZONE, not of the wallet. The medusa_faucet program and the funded
+    // per-definition treasuries it dispenses from are deployed on the built-in operator zones
+    // only: the devnet sandbox is a chain this wallet launches itself (nothing is deployed on
+    // it) and a zone the user added is somebody else's sequencer, so on both the ⛲ chip is
+    // LEZ-only and says so, instead of reporting "0 tokens" or appearing to fail.
+    //
+    // Read off the zone RECORD (getZones) so there is never a second list to keep in step with
+    // the core's. A core that does not publish the flag yet is handled by the fallback, which
+    // derives the same fact from the record's own builtin/kind fields rather than from a
+    // hardcoded list of zone ids: builtin = one of ours, and not the local sandbox.
+    function zoneTokenFaucet(id) {
+        var z = root.zoneById(id)
+        if (!z) return false
+        if (typeof z.tokenFaucet  === "boolean") return z.tokenFaucet
+        if (typeof z.faucetTokens === "boolean") return z.faucetTokens
+        return z.builtin === true && z.kind !== "local-standalone"
+    }
     function zoneKindDesc(z) {
         if (z.kind === "local-standalone") return "Local sandbox · for testing"
         if (z.kind === "local-l1-tor")     return "Default network · private over Tor"
@@ -419,7 +465,16 @@ Rectangle {
             root.zoneCompat = "unknown"       // the build-compat verdict is per-zone
             root.zoneOfflineOpen = false      // a stale offline modal refers to the old zone
             root.selectedFromId = ""; root.selectedTokens = []    // re-select on the new zone
+            // The faucet PROGRAM id is the same on every zone, but whether that zone has a
+            // token faucet at all, and what it dispenses, is not - so the verdict and the
+            // definitions, not the id, are per-zone and are re-asked here rather than carried
+            // across. A claim in flight belongs to the OLD zone; drop it so its halves cannot
+            // be summarised as if they had run here.
+            root.faucetOnChainReady = false; root.faucetOnChainNote = ""
+            root.faucetOnChainDefs = []; root.faucetOnChainNames = []
+            root.faucetClaim = null
             root.refreshSeqStatus(); root.refreshZones()
+            root.refreshFaucetStatus()
             netReloadTimer.restart()
             root.screen = "main"
         })
@@ -972,9 +1027,11 @@ Rectangle {
         if (amt > bal) { logActivity("Amount exceeds your " + bal + " " + sym + " balance.", true); return }
         if (root.sendTokenDef === "") executeSend(root.selectedFromId, to, amount)
         else {
-            // token send is a background job (derive/create ATAs + token-send + wait)
+            // token send is a background job (derive/create ATAs + token-send + wait).
+            // (from, to, value) + password: the definitionId and the amount travel together in
+            // the value spec, which is what keeps every spend verb under the bridge's ceiling.
             var r = root.callGated("startSendToken",
-                        [root.selectedFromId, to, root.sendTokenDef, amount])
+                        [root.selectedFromId, to, root.valueSpec("token", root.sendTokenDef, amount)])
             if (!r || r.error) {
                 if (root.handleAuthRefusal("Token send", r)) return
                 surfaceOpError("Token send", r && r.error ? r.error : "unknown"); return
@@ -997,7 +1054,8 @@ Rectangle {
         // any case with a Private endpoint is a multi-minute proof - running it blocking timed
         // out / froze the UI ("Transfer failed: wallet command timed out"). Now it's a tracked
         // background job; the wrapper auto-syncs + uses the proof budget when --from is Private.
-        var r = root.callGated("startSendTransfer", [from, to, amount])
+        // (from, to, value) + password. Native only, so the value spec is the bare amount.
+        var r = root.callGated("startSendTransfer", [from, to, root.valueSpec("native", "", amount)])
         if (!r || r.error) {
             if (root.handleAuthRefusal("Transfer", r)) return
             surfaceOpError("Transfer", r && r.error ? r.error : "unknown")
@@ -1067,27 +1125,282 @@ Rectangle {
         root.refreshTokens()
     }
 
+    // ── The ⛲ Faucet chip: ONE claim, up to two halves ────────────────────────
+    // Native LEZ always (`pinata claim` - fully on-chain, ungated in the core, and needing no
+    // local state, which is why it kept working while the token half was broken), PLUS the
+    // on-chain token faucet on the zones that have one. Both halves run as background jobs and
+    // are summarised together by settleFaucetClaim(), so one press produces one outcome.
     function doClaimFaucet() {
         if (typeof logos === "undefined" || !logos.callModule) return
         if (!root.guardZoneOp("Faucet claim")) return   // sequencer op - never silent offline
         var acctId = root.selectedFromId
         if (!acctId && accountModel.count > 0) acctId = accountModel.get(0).id
         if (!acctId) { root.logActivity("No accounts - create one first", true); return }
+        if (root.faucetClaim !== null) { root.logActivity("A faucet claim is already running", false); return }
+
+        // The per-ZONE question, asked once per claim: does this zone have a token faucet at all?
+        var wantTokens = root.zoneTokenFaucet(root.network)
+        var claim = { account: acctId, tokenZone: wantTokens,
+                      lez: { state: "pending", amount: "150", txId: "", error: "", reason: "" },
+                      tok: { state: wantTokens ? "pending" : "absent", txId: "", error: "", reason: "" } }
+        root.faucetClaim = claim
+
+        // Half 1 - native LEZ. Ungated by construction: `pinata claim` spends nothing of the
+        // user's, so the core takes no password for it and it must never join gatedVerbs.
         var r = callModuleParse(logos.callModule("medusa_core", "startFaucet", [acctId]))
-        if (!r || r.error) { root.surfaceOpError("Faucet claim", r && r.error ? r.error : "unknown"); return }
-        if (!r.jobId) { root.logActivity("No jobId returned from faucet", true); return }
-        root.logActivity("Claiming faucet → " + root.displayId(acctId).substring(0, 16) + "…", false)
-        root.trackJob({ jobId: r.jobId, op: "faucet", asset: "native",
-                        from: acctId, to: "", amount: "150", state: "running", elapsedMs: 0, txId: "", error: "" })
+        if (!r || r.error || !r.jobId) {
+            claim.lez.state = "error"
+            claim.lez.error = (r && r.error) ? String(r.error) : "the faucet returned no job"
+        } else {
+            root.trackJob({ jobId: r.jobId, op: "faucet", asset: "native", claim: "lez",
+                            from: acctId, to: "", amount: "150", state: "running",
+                            elapsedMs: 0, txId: "", error: "", reason: "" })
+        }
+
+        // Half 2 - the zone's whitelist tokens, only where the program and its treasuries are.
+        if (wantTokens) root.startFaucetTokenHalf(claim, acctId)
+
+        root.logActivity((wantTokens ? "Claiming LEZ and tokens → " : "Claiming LEZ → ")
+                         + root.displayId(acctId).substring(0, 16) + "…", false)
+        // Nothing may still be in flight (both halves could refuse up front), in which case this
+        // summarises immediately; otherwise it returns and the job poll drives it.
+        root.settleFaucetClaim()
+    }
+
+    // The token half, kept separate so the LEZ half is never held hostage by it: by the time
+    // this runs the LEZ claim has already been submitted, whatever the token side answers.
+    function startFaucetTokenHalf(claim, acctId) {
+        // A store with no password cannot pass the core's gate at all (signingBlocked), so asking
+        // would buy a refusal and a lock-screen bounce in the middle of a claim. Name the fix.
+        if (root.signingBlocked) {
+            claim.tok.state = "skipped"
+            claim.tok.error = "this wallet has no password on it, so it cannot sign a token "
+                            + "claim - set one in Security & Backup"
+            return
+        }
+        // Ask the core what it can actually do here BEFORE spending a gated call: faucetStatus
+        // runs the same preflight startTokenFaucet does, and its message names the ONE missing
+        // precondition (no helper, no definitions on this zone, no holding to receive into, or a
+        // guest binary that is not the deployed program).
+        root.refreshFaucetStatus()
+        if (!root.faucetOnChainReady) {
+            claim.tok.state = "skipped"
+            claim.tok.error = root.faucetOnChainNote || "the token faucet is unavailable here"
+            return
+        }
+        // callGated appends the session password (invariant 1): startTokenFaucet signs and
+        // broadcasts with the wallet's keys, so it is gated exactly like every other spend, and
+        // there is deliberately no per-transaction prompt.
+        var t = root.callGated("startTokenFaucet", [acctId])
+        if (!t || t.error || !t.jobId) {
+            claim.tok.state  = "skipped"
+            claim.tok.error  = (t && t.error) ? String(t.error) : "the token faucet returned no job"
+            claim.tok.reason = (t && t.reason) ? String(t.reason) : ""
+            // The CORE says this zone has no token faucet, and the core is the authority on that.
+            // Then there is no token half to report at all: mentioning one would be the same
+            // "tokens were expected here" claim a LEZ-only zone must never make.
+            if (claim.tok.reason === "unsupported-zone") {
+                claim.tok.state = "absent"
+                claim.tokenZone = false
+                root.faucetOnChainReady = false; root.faucetOnChainNote = ""
+                return
+            }
+            // An auth refusal owns its own routing (lock screen, or the plaintext-store advice).
+            root.handleAuthRefusal("Token faucet", t)
+            // The core's refusal IS the explanation; keep it on the panel, not just in a toast.
+            root.faucetOnChainReady = false
+            root.faucetOnChainNote  = claim.tok.error
+            return
+        }
+        // No amount: the program picks a pseudorandom 10-500 per token on-chain and reports none
+        // back, so there is no honest figure to show until the balances refresh.
+        root.trackJob({ jobId: t.jobId, op: "tokenfaucet", asset: "token", claim: "tok",
+                        from: acctId, to: "", amount: "", state: "running",
+                        elapsedMs: 0, txId: "", error: "", reason: "" })
+    }
+
+    // ── The on-chain token faucet ─────────────────────────────────────────────
+    // Read-only and ungated in the core (it moves nothing and reveals nothing the Tokens tab
+    // does not already show), so this is safe to call whenever the tab is opened. It does spawn
+    // a short-lived helper to verify the program id offline, so it is NOT put on the 10s poll.
+    function refreshFaucetStatus() {
+        if (typeof logos === "undefined" || !logos.callModule) return
+        // No token faucet on this zone → nothing to ask and nothing to show. Asking anyway would
+        // park an install-side note ("the helper is not installed") on a zone that has no token
+        // faucet to install a helper for, which is exactly the "tokens were expected" impression
+        // a LEZ-only zone must never give.
+        if (!root.zoneTokenFaucet(root.network)) {
+            root.faucetOnChainReady = false; root.faucetOnChainNote = ""
+            root.faucetOnChainDefs  = [];    root.faucetOnChainNames = []
+            return
+        }
+        var r = callModuleParse(logos.callModule("medusa_core", "faucetStatus", []))
+        if (!r) { root.faucetOnChainReady = false; root.faucetOnChainNote = ""; return }
+        root.faucetOnChainReady = (r.available === true)
+        root.faucetOnChainNote  = r.available ? "" : (r.message || "")
+        // What this zone dispenses, so a claim can be summarised by name and the Tokens tab can
+        // be made to KNOW the definitions it just received (see registerFaucetTokens).
+        var defs = Array.isArray(r.definitions) ? r.definitions : []
+        var names = []
+        for (var i = 0; i < defs.length; i++)
+            names.push((r.tickers && r.tickers[defs[i]]) ? String(r.tickers[defs[i]]) : "")
+        root.faucetOnChainDefs  = defs
+        root.faucetOnChainNames = names
+    }
+    // The tickers this zone's faucet hands out, for the summary ("" when unknown).
+    function faucetTokenNames() {
+        var n = []
+        for (var i = 0; i < root.faucetOnChainNames.length; i++)
+            if (root.faucetOnChainNames[i]) n.push(root.faucetOnChainNames[i])
+        return n.join(", ")
+    }
+
+    // The tokens-only control on the Tokens tab, for when LEZ is still on cooldown. Same claim
+    // machinery as the ⛲ chip with the LEZ half ABSENT, so its outcome is worded by the same
+    // rules and a cooldown never reads as a failure.
+    // ── One claim, one outcome ────────────────────────────────────────────────
+    // How a half's result should READ. A cooldown or an empty treasury is NOT a failure: the
+    // faucet worked and there is simply nothing to hand out yet, so it must not be dressed as
+    // an error the user then tries to fix. Anything else is a shortfall with a cause.
+    function faucetHalfClass(h) {
+        if (!h || h.state === "absent") return "absent"
+        if (h.state === "done")         return "done"
+        // The core's machine-readable class first (both faucet ops carry one: "cooldown",
+        // "not-funded", "not-initialized", "no-holding", "unreachable"). The sentence is only
+        // read when there is no code, because prose is the thing that changes under us.
+        var why = String(h.reason || "")
+        if (why === "not-funded") return "empty"
+        if (why === "cooldown")   return "cooldown"
+        var s = String(h.error || "").toLowerCase()
+        if (h.reason === "not-funded" || s.indexOf("no token supply") >= 0
+                || s.indexOf("nothing to dispense") >= 0 || s.indexOf("not funded") >= 0)
+            return "empty"
+        if (s.indexOf("cooldown") >= 0 || s.indexOf("already claimed") >= 0
+                || s.indexOf("too soon") >= 0 || s.indexOf("try again in") >= 0)
+            return "cooldown"
+        return "problem"
+    }
+    // Turn the faucet's own cooldown wording into a phrase the summary can use. The client says
+    // "cooldown not elapsed: N minutes remaining before the next claim"; other wordings exist, so
+    // an unparseable one degrades to the plain fact instead of to an invented number.
+    function faucetAgainIn(msg) {
+        var m = String(msg || "").match(/(\d+)\s*(hours?|hrs?|minutes?|mins?|seconds?|secs?)/i)
+        if (!m) return "available again later"
+        var n = parseInt(m[1], 10)
+        var u = m[2].toLowerCase()
+        if (u.charAt(0) === "h") return "available again in " + n + "h"
+        if (u.charAt(0) === "m") {
+            if (n >= 60) {
+                var hrs = Math.floor(n / 60), rem = n % 60
+                return "available again in " + hrs + "h" + (rem > 0 ? " " + rem + "m" : "")
+            }
+            return "available again in " + n + "m"
+        }
+        return "available again in " + n + "s"
+    }
+    // Record one half's outcome as its job finishes. The core's machine-readable `reason` is
+    // carried through so the summary can tell an empty treasury from a real failure without
+    // pattern-matching a sentence.
+    function faucetHalfDone(j) {
+        var c = root.faucetClaim
+        if (!c) return
+        var h = (j.claim === "tok") ? c.tok : c.lez
+        h.state  = (j.state === "done") ? "done" : "error"
+        h.txId   = j.txId  || ""
+        h.error  = j.error || ""
+        h.reason = j.reason || ""
+        if (j.claim === "tok") {
+            if (h.state === "done") root.registerFaucetTokens()
+            else if (h.reason === "not-funded") {
+                // Keep the explanation on the panel after the toast has scrolled away, so the
+                // next press does not look like a fresh, unexplained failure.
+                root.faucetOnChainReady = false
+                root.faucetOnChainNote  = h.error
+            }
+        }
+        root.settleFaucetClaim()
+    }
+    // The tokens have landed in this wallet's per-definition holdings; make sure the Tokens tab
+    // KNOWS those definitions so the user watches the balance arrive instead of having to add
+    // the token by hand. Usually a no-op - the core's own preflight resolves a holding per
+    // definition, which means they are registered already - so nothing is spent in the normal
+    // case, and the delayed re-read covers the block that has not been applied yet.
+    function registerFaucetTokens() {
+        if (typeof logos === "undefined" || !logos.callModule) return
+        root.refreshTokens()
+        var known = {}
+        for (var i = 0; i < root.selectedTokens.length; i++)
+            known[root.selectedTokens[i].definitionId] = true
+        var added = false
+        for (var d = 0; d < root.faucetOnChainDefs.length; d++) {
+            var def = root.faucetOnChainDefs[d]
+            if (!def || known[def]) continue
+            logos.callModule("medusa_core", "addToken", [def])
+            added = true
+        }
+        if (added) root.refreshTokens()
+        tokenRefreshTimer.restart()
+    }
+    // Both halves terminal → ONE summary line and ONE completion sheet. The rules:
+    //   • a payout beside a cooldown or an empty treasury is a GOOD outcome, not an error;
+    //   • on a zone with no token faucet the tokens are not mentioned at all;
+    //   • only a claim where nothing arrived AND something is actually wrong reads as a failure.
+    function settleFaucetClaim() {
+        var c = root.faucetClaim
+        if (!c) return
+        if (c.lez.state === "pending" || c.tok.state === "pending") return   // still in flight
+        root.faucetClaim = null
+
+        var lc = root.faucetHalfClass(c.lez)
+        var tc = c.tokenZone ? root.faucetHalfClass(c.tok) : "absent"
+        var parts = []
+        if (lc === "done")          parts.push("received " + (c.lez.amount || "150") + " LEZ")
+        else if (lc === "cooldown") parts.push("LEZ " + root.faucetAgainIn(c.lez.error))
+        else if (lc === "empty")    parts.push("the LEZ faucet has nothing left to give out")
+        else if (lc === "problem")  parts.push("LEZ failed: " + (c.lez.error || "unknown"))
+        if (tc === "done") {
+            var names = root.faucetTokenNames()
+            parts.push(names.length > 0 ? "tokens received (" + names + ")" : "tokens received")
+        }
+        else if (tc === "cooldown") parts.push("tokens " + root.faucetAgainIn(c.tok.error))
+        else if (tc === "empty")    parts.push("the token treasuries on this zone are empty right now")
+        else if (tc === "problem")  parts.push("no tokens: " + (c.tok.error || "unknown"))
+
+        var anyDone    = (lc === "done") || (tc === "done")
+        var anyProblem = (lc === "problem") || (tc === "problem")
+        var st = anyDone ? (anyProblem ? "note" : "done") : (anyProblem ? "error" : "note")
+        var what = (lc === "absent") ? "Token faucet" : "Faucet claim"
+        var heading = (st === "done")  ? what + " complete"
+                    : (st === "error") ? what + " failed"
+                    : anyDone          ? what + " partly complete"
+                                       : "Nothing to claim yet"
+        var msg = parts.join("; ")
+        root.logActivity(heading + ": " + msg, st === "error")
+        // A connection-class or build-mismatch failure ALSO raises the blocking zone modal, the
+        // same escalation surfaceOpError performs for every other op: a claim that died because
+        // the zone is down or is running a different build must not read as a faucet problem.
+        // Routed through the classifier rather than through surfaceOpError so the outcome is
+        // still described ONCE, by the summary above.
+        if (anyProblem) {
+            var cls = root.classifyOpError((lc === "problem" ? c.lez.error : "") + " "
+                                           + (tc === "problem" ? c.tok.error : ""))
+            if (cls === "mismatch") { root.zoneCompat = "mismatch"; root.openZoneOffline(what, true) }
+            else if (cls === "offline") root.openZoneOffline(what, false)
+        }
+        root.enqueueJobDone({ op: "faucet", asset: "native", amount: "", state: st,
+                              txId: (lc === "done") ? (c.lez.txId || "") : "",
+                              error: (st === "error") ? msg : "",
+                              note: msg, heading: heading })
     }
 
     function opLabel(op) {
-        if (op === "shield")    return "Shield"
-        if (op === "deshield")  return "Deshield"
-        if (op === "private")   return "Private transfer"
-        if (op === "send")      return "Transfer"
-        if (op === "faucet")    return "Faucet claim"
-        if (op === "tokensend") return "Token send"
+        if (op === "shield")      return "Shield"
+        if (op === "deshield")    return "Deshield"
+        if (op === "private")     return "Private transfer"
+        if (op === "send")        return "Transfer"
+        if (op === "faucet")      return "Faucet claim"
+        if (op === "tokensend")   return "Token send"
+        if (op === "tokenfaucet") return "Token faucet"
         return op
     }
 
@@ -1256,32 +1569,38 @@ Rectangle {
 
         var from = root.selectedFromId
         var method, args
-        // args stops BEFORE the session password - callGated() appends it (invariant 1). On
-        // shield/deshield that still forces definitionId to be passed always (empty for native),
-        // because it had a default and the password sits behind it.
+        // args stops BEFORE the session password - callGated() appends it (invariant 1).
+        //
+        // EVERY spend verb now takes the same three arguments, (from, to, value), plus that
+        // password: `to` is a recipient spec and `value` is a value spec (see valueSpec() /
+        // recipientSpec() above). The old shapes carried asset, definitionId, amount and, for a
+        // foreign recipient, npk/vpk/identifier as separate arguments, which made these calls 6,
+        // 6 and 7 wide - past the bridge's 5-argument ceiling, so they were NEVER INVOKED and
+        // came back as {"error":"Invalid response"}. The asset now rides inside the value,
+        // because an amount without its asset is not a quantity of anything.
+        var value = root.valueSpec(root.privAsset, root.privTokenDef, amt)
         if (root.privMode === "shield") {
             if (root.privToId.length === 0) { root.logActivity("Pick a private destination account", true); return }
             method = "startShield"
-            args   = [root.privAsset, from, root.privToId, amt,
-                      root.privAsset === "token" ? root.privTokenDef : ""]   // token shield needs the def
+            args   = [from, root.recipientSpec(root.privToId), value]
         } else if (root.privMode === "deshield") {
             if (root.privToId.length === 0) { root.logActivity("Pick a public destination account", true); return }
             method = "startDeshield"
-            args   = [root.privAsset, from, root.privToId, amt,
-                      root.privAsset === "token" ? root.privTokenDef : ""]   // def routes to the recipient's ATA
+            args   = [from, root.recipientSpec(root.privToId), value]
         } else { // transfer
+            // ONE verb for both recipients now: the spec says whether `to` is an account this
+            // wallet owns or a foreigner's shared keys, so startPrivateTransferForeign is gone
+            // rather than sitting at an arity the bridge could never dispatch.
+            method = "startPrivateTransfer"
             if (root.privToMode === "foreign") {
                 if (root.privToNpk.trim().length === 0 || root.privToVpk.trim().length === 0
                         || root.privToIdent.trim().length === 0) {
                     root.logActivity("Foreign transfer needs npk, vpk and identifier", true); return
                 }
-                method = "startPrivateTransferForeign"
-                args   = [root.privAsset, from, root.privToNpk.trim(), root.privToVpk.trim(),
-                          root.privToIdent.trim(), amt]
+                args = [from, root.recipientSpec("", root.privToNpk, root.privToVpk, root.privToIdent), value]
             } else {
                 if (root.privToId.length === 0) { root.logActivity("Pick a private destination account", true); return }
-                method = "startPrivateTransfer"
-                args   = [root.privAsset, from, root.privToId, amt]
+                args = [from, root.recipientSpec(root.privToId), value]
             }
         }
 
@@ -1324,7 +1643,10 @@ Rectangle {
             arr[i].phase     = r.phase || arr[i].phase || "processing"
             arr[i].elapsedMs = r.elapsedMs || arr[i].elapsedMs
             if (r.state === "done")  { arr[i].txId  = r.txId || "" }
-            if (r.state === "error") { arr[i].error = r.error || "failed" }
+            // `reason` is the core's machine-readable failure class (today: the on-chain
+            // faucet's "not-funded"). Carried so a handler can act on the class instead of
+            // pattern-matching the sentence.
+            if (r.state === "error") { arr[i].error = r.error || "failed"; arr[i].reason = r.reason || "" }
             if (arr[i].state === "running") anyRunning = true
             else onPrivJobDone(arr[i])
         }
@@ -1339,7 +1661,14 @@ Rectangle {
     }
 
     function onPrivJobDone(j) {
-        if (j.state === "done") {
+        // A half of the ⛲ chip's combined claim is NOT reported on its own: it is recorded, and
+        // both halves are summarised once by settleFaucetClaim. "150 LEZ arrived, tokens are on
+        // cooldown" is one good outcome, and surfacing the halves separately turned it into a
+        // success toast immediately followed by a failure toast.
+        var isClaimHalf = (j.claim === "lez" || j.claim === "tok") && root.faucetClaim !== null
+        if (isClaimHalf) {
+            root.faucetHalfDone(j)
+        } else if (j.state === "done") {
             root.logActivity(opLabel(j.op) + " done"
                              + (j.txId ? " - " + j.txId.substring(0, 14) + "…" : ""), false)
         } else {
@@ -1347,10 +1676,19 @@ Rectangle {
             // (it stacks above the job-done sheet - higher z), so an async op that died
             // because the zone is down is never presented as a mystery failure.
             root.surfaceOpError(opLabel(j.op), j.error || "unknown")
+            // An empty treasury is the ONE on-chain-faucet failure the core cannot pre-check
+            // (the balance sits behind a PDA the module does not re-derive), so it arrives here
+            // instead. Park the explanation on the faucet panel too: a toast scrolls away, and
+            // the next press must not look like a fresh, unexplained failure.
+            if (j.op === "tokenfaucet" && j.reason === "not-funded") {
+                root.faucetOnChainReady = false
+                root.faucetOnChainNote  = j.error || ""
+            }
         }
         // Surface a one-shot completion sheet. Several jobs can finish in one poll, so
-        // entries are queued and shown one after another (see jobDoneSheet).
-        root.enqueueJobDone(j)
+        // entries are queued and shown one after another (see jobDoneSheet). A claim half is
+        // deliberately not queued here - settleFaucetClaim queues the ONE combined summary.
+        if (!isClaimHalf) root.enqueueJobDone(j)
         // Private balances are only visible after a sync; the faucet/public/token side just refreshes.
         // Only private-touching ops (shield/deshield/private) change private state and need a
         // sync-private scan. A public LEZ transfer (op "send"), token send, and faucet have NO
@@ -1366,14 +1704,22 @@ Rectangle {
     // A finished job pushes one summary row here; jobDoneSheet renders the head row
     // and advanceJobDone() pops it (showing the next, or hiding the sheet).
     function enqueueJobDone(j) {
-        var st = (j.state === "error") ? "error" : "done"
+        // "note" is a THIRD outcome beside done/error, and it exists because a faucet claim that
+        // delivered one half and found the other on cooldown is neither. A red ✕ on that is a
+        // lie the user then tries to fix; a plain green ✓ hides the half that did not arrive.
+        var st = (j.state === "error") ? "error" : (j.state === "note") ? "note" : "done"
         jobDoneModel.append({
             op:      j.op    || "",
             asset:   j.asset || "native",
             amount:  j.amount || "",
             state:   st,
             txId:    j.txId  || "",
-            error:   j.error || ""
+            error:   j.error || "",
+            // The sentence the sheet shows instead of its stock "Sent to L2" line, and the
+            // heading that replaces "<op> complete". Both empty for an ordinary job, so every
+            // row still carries the same keys (ListModel role inference).
+            note:    j.note    || "",
+            heading: j.heading || ""
         })
     }
 
@@ -1429,6 +1775,45 @@ Rectangle {
         root.receiveKeys = r
     }
 
+    // ── The two spec strings (the bridge's 5-argument ceiling) ─────────────────
+    //
+    // The Logos bridge dispatches on the argument COUNT and marshals AT MOST 5
+    // (logos-liblogos, cpp/qt_provider_object.cpp:20-34): a verb with 6+ parameters is never
+    // invoked, nothing is logged where a user can see it, and the missing reply comes back
+    // through LogosQmlBridge.cpp:76 as {"error":"Invalid response"} - which reads exactly like
+    // a wallet failure. startShield(6) and startDeshield(6) died that way the moment the fifth
+    // security round appended the session password, and startPrivateTransferForeign(7) had been
+    // dead since the day it was written.
+    //
+    // The core bought the room back by collapsing arguments that were always ONE concept, and
+    // parses each with one function - WalletPlugin.h, "THE TWO SPEC STRINGS", and
+    // parseValueSpec()/parseRecipientSpec() in the .cpp. These are the matching builders, one
+    // each, for the same reason: a spec assembled ad hoc at four call sites is four chances to
+    // send a shape the parser rejects, and the sender never sees the shape it sent.
+    //
+    // Both take the simple form verbatim and the compound form as JSON, told apart by a leading
+    // '{'. NOTE what the core REFUSES: a definitionId on a native value ("a definitionId only
+    // belongs on a token value"). So native is the bare amount and NOTHING else - do not
+    // "helpfully" send {"asset":"native","definitionId":""}.
+    function valueSpec(asset, definitionId, amount) {
+        var amt = String(amount === undefined || amount === null ? "" : amount).trim()
+        if (asset !== "token") return amt                     // bare amount = native LEZ
+        return JSON.stringify({ asset: "token",
+                                definitionId: String(definitionId || "").trim(),
+                                amount: amt })
+    }
+    // An owned account id, or a foreign private recipient's three shared keys. Passing npk/vpk/
+    // identifier is what selects the foreign form, which is how startPrivateTransferForeign
+    // folded back into startPrivateTransfer instead of staying at an arity the bridge cannot
+    // dispatch. The core names each missing key individually, so nothing is validated here that
+    // it would only have to re-check.
+    function recipientSpec(accountId, npk, vpk, identifier) {
+        var n = String(npk || "").trim()
+        if (n.length === 0) return String(accountId || "").trim()   // an owned account id
+        return JSON.stringify({ npk: n, vpk: String(vpk || "").trim(),
+                                identifier: String(identifier || "").trim() })
+    }
+
     // ── Session password & the authorization gate ──────────────────────────────
     //
     // INVARIANT 1 - THE SESSION PASSWORD IS APPENDED IN EXACTLY ONE PLACE.
@@ -1440,16 +1825,26 @@ Rectangle {
     // was gated in the core while its single call site kept passing one argument, so every
     // dApp-initiated zone switch failed with "wallet password required for this operation". A
     // call site cannot forget an argument it does not write. gatedVerbs mirrors the core's
-    // authorize() sites (WalletPlugin.cpp: consolidateToken, sendTransfer, startSendToken,
-    // startSendTransfer, startShield, startDeshield, startPrivateTransfer,
-    // startPrivateTransferForeign, approveAction, approveZone, exportMnemonic, exportKey, and
-    // conditionally resetWallet + restoreWallet); when the core gates one more verb, listing it
-    // here is the only change any call site needs.
+    // authorize() sites (WalletPlugin.cpp: consolidateToken, startTokenFaucet, sendTransfer,
+    // startSendToken, startSendTransfer, startShield, startDeshield, startPrivateTransfer,
+    // approveAction, approveZone, exportMnemonic, exportKey, and conditionally resetWallet +
+    // restoreWallet); when the core gates one more verb, listing it here is the only change any
+    // call site needs. 14 names here, 14 authorize() sites there.
+    //
+    // startPrivateTransferForeign is DELETED, not merely unused: it folded into
+    // startPrivateTransfer when the recipient became a spec string. Leaving the name here would
+    // be worse than useless - callGated() would hand the session password to a verb the core no
+    // longer has, and the reply would be the same {"error":"Invalid response"} the arity bug
+    // produced, pointing at nothing.
     readonly property var gatedVerbs: [
         "sendTransfer", "startSendTransfer", "startSendToken",
-        "startShield", "startDeshield", "startPrivateTransfer", "startPrivateTransferForeign",
+        "startShield", "startDeshield", "startPrivateTransfer",
         "consolidateToken", "approveAction", "approveZone",
         "exportMnemonic", "exportKey",
+        // The on-chain faucet claim signs and broadcasts with the wallet's keys, so it is a
+        // spend verb. Note its sibling startFaucet is NOT here and must not be: that one runs
+        // `pinata claim`, takes no password, and is gated in the core by nothing at all.
+        "startTokenFaucet",
         // Conditional in the core: gated only while a session is live, ungated while locked so
         // a forgotten password is still recoverable. Passing the (empty) session password is
         // correct in both cases.
@@ -1978,6 +2373,15 @@ Rectangle {
         interval: 3000; onTriggered: root.refreshAccounts()
     }
 
+    // A claimed token is only visible once the block that delivered it has been applied, so the
+    // immediate refresh when the job finishes can still read the old holding. One delayed
+    // re-read - the same trick balanceRefreshTimer plays for LEZ - is what lets the user WATCH
+    // the tokens arrive on the Tokens tab instead of having to switch views to find them.
+    Timer {
+        id: tokenRefreshTimer
+        interval: 4000; onTriggered: { root.refreshAccounts(); root.refreshTokens() }
+    }
+
     Timer { id: noticeTimer; interval: 4500; onTriggered: root.notice = "" }
 
     // After a network switch: wait for the new sequencer to come up, then reload balances.
@@ -2019,22 +2423,34 @@ Rectangle {
         }
     }
 
+    // The startup battery. Every call in here is a BLOCKING module RPC and several of them
+    // shell out to the wallet CLI, so running them inline meant the window could not paint
+    // until the whole battery returned - the same shape as the Privacy screen's blocking
+    // onVisibleChanged, one frame earlier. runBusy() lets that first frame land, then loads.
+    // Safe to defer by a frame: walletState starts at "loading" and every screen is gated on a
+    // real state, so what lands first is the chrome and NO half-derived wallet content, and the
+    // veil swallows input for the same window in which the blocked thread ignored it anyway.
     Component.onCompleted: {
         if (typeof logos === "undefined" || !logos.callModule) return
-        root.refreshCliConfig()
-        var scfg = callModuleParse(logos.callModule("medusa_core", "getSequencerConfig", []))
-        if (scfg) {
-            root.seqPort = scfg.port || 3071
-            if (scfg.network) root.network = scfg.network
-        }
-        root.refreshStatus()
-        root.refreshSeqStatus()
-        root.refreshZones()
-        root.refreshAccounts()
-        root.refreshSecurityState()   // after refreshAccounts: it judges the routed walletState
-        root.refreshWhitelist()
-        root.checkForUpdate()
-        if (!root.cliFound) root.screen = "settings"
+        root.runBusy("Loading", function() {
+            root.refreshCliConfig()
+            var scfg = root.callModuleParse(logos.callModule("medusa_core", "getSequencerConfig", []))
+            if (scfg) {
+                root.seqPort = scfg.port || 3071
+                if (scfg.network) root.network = scfg.network
+            }
+            root.refreshStatus()
+            root.refreshSeqStatus()
+            root.refreshZones()
+            root.refreshAccounts()
+            root.refreshSecurityState()   // after refreshAccounts: it judges the routed walletState
+            root.refreshWhitelist()
+            // Decide the on-chain faucet's state ONCE at startup, so the Tokens tab is already
+            // honest the first time it is looked at rather than only after it is re-selected.
+            root.refreshFaucetStatus()
+            root.checkForUpdate()
+            if (!root.cliFound) root.screen = "settings"
+        })
     }
 
     // The disowned-CLI-path notice is only interesting on the Settings screen, and the list of
@@ -3057,7 +3473,12 @@ Rectangle {
                             enabled: !parent.renaming
                             onClicked: {
                                 root.selectedFromId = id; root.selectedFromType = type; root.selectedFromBalance = balance
-                                root.refreshTokens(); root.screen = "main"
+                                // Screen FIRST, blocking load after. refreshTokens() shells out
+                                // to the wallet CLI (`tokens`, 45s ceiling), so loading before
+                                // the assignment held the account list on screen for the whole
+                                // call - the Privacy-tab lag in a different place.
+                                root.screen = "main"
+                                root.runBusy("Loading tokens", function() { root.refreshTokens() })
                             }
                         }
                         RowLayout {
@@ -3244,11 +3665,15 @@ Rectangle {
                             onClicked: {
                                 var tor = zTorTog.checked
                                 var editing = root.editingZoneId !== ""
+                                // ONE endpoint argument. This screen has always had a single
+                                // endpoint box and split it here into (url, onion) with `tor`
+                                // saying which half was real; the core takes the box verbatim
+                                // now, which is what got editZone off the 5-argument ceiling.
                                 var r = editing
                                     ? root.callModuleParse(logos.callModule("medusa_core", "editZone",
-                                        [root.editingZoneId, zNameF.text, tor ? "" : zEndF.text, tor ? zEndF.text : "", tor]))
+                                        [root.editingZoneId, zNameF.text, zEndF.text, tor]))
                                     : root.callModuleParse(logos.callModule("medusa_core", "addZone",
-                                        [zNameF.text, tor ? "" : zEndF.text, tor ? zEndF.text : "", tor]))
+                                        [zNameF.text, zEndF.text, tor]))
                                 if (r && r.error) { root.logActivity((editing ? "Edit" : "Add") + " zone: " + r.error, true); return }
                                 var editedId = root.editingZoneId
                                 zNameF.text = ""; zEndF.text = ""; root.addZoneOpen = false; root.editingZoneId = ""
@@ -3733,7 +4158,14 @@ Rectangle {
                             }
                         }
                         MouseArea { id: actBtnMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-                            onClicked: { if (modelData.k === "receive") root.refreshTokens(); root.screen = modelData.k } }
+                            // Screen FIRST, blocking load after (see the Privacy screen): the
+                            // Receive tab's refreshTokens() shells out to the wallet CLI, and
+                            // doing it before the assignment kept the old view up for the call.
+                            onClicked: {
+                                root.screen = modelData.k
+                                if (modelData.k === "receive")
+                                    root.runBusy("Loading tokens", function() { root.refreshTokens() })
+                            } }
                     }
                     Text { Layout.alignment: Qt.AlignHCenter; font.family: root.faceFont; text: modelData.t
                         color: parent.on ? root.silver : root.textSecondary; font.pixelSize: root.fsXS; font.weight: Font.Medium }
@@ -3759,7 +4191,24 @@ Rectangle {
                     Rectangle { anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
                         height: 2; color: root.activeTab === modelData.k ? root.accentOrange : root.borderColor }
                     MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
-                        onClicked: { root.activeTab = modelData.k; if (modelData.k === "activity") root.refreshTxHistory() } }
+                        onClicked: {
+                            root.activeTab = modelData.k
+                            // In-process (a QSettings read), so it can run in the switching tick.
+                            if (modelData.k === "activity") root.refreshTxHistory()
+                            // The faucet verdict is per-zone and per-install, and asking costs a
+                            // short-lived helper, so it is refreshed when the tab is opened
+                            // rather than on the 10s status poll. That helper is a PROCESS with a
+                            // 15s ceiling, so on the zones that actually have a token faucet it
+                            // goes behind runBusy (screen paints first, then the probe). On a zone
+                            // without one refreshFaucetStatus() returns without asking anything,
+                            // and running that inline avoids flashing the veil for nothing.
+                            if (modelData.k === "tokens") {
+                                if (root.zoneTokenFaucet(root.network))
+                                    root.runBusy("Checking faucet", function() { root.refreshFaucetStatus() })
+                                else
+                                    root.refreshFaucetStatus()
+                            }
+                        } }
                 }
             }
         }
@@ -3842,6 +4291,27 @@ Rectangle {
                         Text { anchors.centerIn: parent; text: "+ Add token"; color: root.accentOrange; font.pixelSize: 11; font.family: root.faceFont }
                         MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                             onClicked: { root.refreshWhitelist(); root.screen = "addtoken" } }
+                    }
+
+                    // ── Token faucet status ─────────────────────────────────────────────
+                    // No separate control: the ⛲ chip on the hero card claims BOTH halves, so a
+                    // second button was one more thing to explain for no capability the chip
+                    // lacks. What survives is the NOTE, because it is the only place a token
+                    // claim can say WHY it gave nothing (cooldown, treasury not funded, zone
+                    // unreachable) - silence there was the original bug. Present only where the
+                    // program and its funded treasuries are: on devnet and on a user-added zone
+                    // this whole block is ABSENT rather than present and refusing.
+                    ColumnLayout {
+                        visible: root.zoneTokenFaucet(root.network) && root.faucetOnChainNote !== ""
+                        Layout.fillWidth: true
+                        Layout.topMargin: 2
+                        spacing: 3
+                        Text {
+                            Layout.fillWidth: true
+                            text: root.faucetOnChainNote
+                            color: root.textDisabled; font.pixelSize: 9; font.family: root.faceFont
+                            wrapMode: Text.WordWrap
+                        }
                     }
                 }
 
@@ -4020,7 +4490,14 @@ Rectangle {
                     height: visible ? privCol.implicitHeight + 20 : 0
                     color: root.panelColor; border.color: root.borderColor; border.width: 1; radius: 12
                     // Token choices are chain state - refresh them each time the screen opens.
-                    onVisibleChanged: if (visible) root.refreshPrivAssets()
+                    // refreshPrivAssets() BLOCKS: direct-holdings does one on-chain account-get
+                    // per owned public account (120s ceiling) and token-registry shells out
+                    // again. Running it in the tick that makes this screen visible meant the UI
+                    // thread could not paint the new screen until it returned, so clicking
+                    // Privacy left the PREVIOUS view up for seconds while Send and Receive
+                    // switched instantly. runBusy() lets a frame land first (the 0.2.1 loading-
+                    // veil fix), so the screen is there and the veil says what it is doing.
+                    onVisibleChanged: if (visible) root.runBusy("Loading assets", function() { root.refreshPrivAssets() })
 
                     ColumnLayout {
                         id: privCol
@@ -4445,9 +4922,11 @@ Rectangle {
                                 color: "transparent"
                                 radius: 8
 
-                                property bool isSent: type !== "faucet" && sender === root.selectedFromId
+                                property bool isSent: type !== "faucet" && type !== "tokenfaucet"
+                                                      && sender === root.selectedFromId
                                 property string direction:
-                                      type === "faucet"   ? "Faucet"
+                                      type === "faucet"      ? "Faucet"
+                                    : type === "tokenfaucet" ? "Token faucet"
                                     : type === "shield"   ? "Shield"
                                     : type === "deshield" ? "Deshield"
                                     : type === "private"  ? (isSent ? "Sent (private)" : "Received (private)")
@@ -4468,7 +4947,12 @@ Rectangle {
                                             font.pixelSize: 11; font.bold: true
                                         }
                                         Text { font.family: root.faceFont;
-                                            text: amount + " LEZ"
+                                            // An on-chain faucet claim carries no figure: the
+                                            // program picks a pseudorandom amount PER TOKEN
+                                            // on-chain and reports none back, so " LEZ" here
+                                            // would be wrong twice over (wrong asset, invented
+                                            // number). The balances below are the answer.
+                                            text: type === "tokenfaucet" ? "tokens" : amount + " LEZ"
                                             color: root.textPrimary; font.pixelSize: 11; font.bold: true
                                             Layout.fillWidth: true
                                         }
@@ -4481,7 +4965,7 @@ Rectangle {
                                     }
 
                                     Text { font.family: root.faceFont;
-                                        visible: type !== "faucet"
+                                        visible: type !== "faucet" && type !== "tokenfaucet"
                                         text: (isSent ? "→ " : "← ") + root.displayId(counterparty)
                                         color: root.textDisabled; font.pixelSize: 10;                                        Layout.fillWidth: true; elide: Text.ElideMiddle
                                     }
@@ -4545,7 +5029,12 @@ Rectangle {
                         }
                         Text { font.family: root.faceFont; text: root.opLabel(op); color: root.textPrimary; font.pixelSize: 10; font.bold: true }
                         Text { font.family: root.faceFont;
-                            text: amount + " " + (asset === "token" ? "tok" : "LEZ")
+                            // Only when there IS a figure. A token-faucet claim has none - the
+                            // program picks the amount per token on-chain - and a bare " tok"
+                            // reads as a zero payout that never happened.
+                            visible: text.length > 0
+                            text: amount.length > 0
+                                  ? (amount + " " + (asset === "token" ? "tok" : "LEZ")) : ""
                             color: root.textSecondary; font.pixelSize: 10
                         }
                         Item { Layout.fillWidth: true }
@@ -4560,9 +5049,14 @@ Rectangle {
                             Text {
                                 Layout.alignment: Qt.AlignRight
                                 font.family: root.faceFont; font.pixelSize: 10; font.bold: true
-                                text: state === "error" ? "failed"
-                                    : state === "done"  ? "waiting L1 confirmation"
-                                    : phase === "sent"  ? "sent to L2"
+                                // "queued" is a real state, not a stall: the faucet's token half
+                                // is held behind its native half so the two never drive the
+                                // wallet store at once, and a row that said "processing" for a
+                                // job with no child yet would be the UI inventing progress.
+                                text: state === "error"  ? "failed"
+                                    : state === "done"   ? "waiting L1 confirmation"
+                                    : phase === "queued" ? "queued"
+                                    : phase === "sent"   ? "sent to L2"
                                     : "processing"
                                 color: state === "error" ? root.errorRed
                                      : state === "done"  ? root.accentOrange
@@ -5769,18 +6263,27 @@ Rectangle {
 
                 RowLayout {
                     Layout.fillWidth: true; spacing: 10
-                    // Outcome glyph - green tick on success, red cross on failure.
+                    // Outcome glyph - green tick on success, red cross on failure, and a neutral
+                    // silver "!" for the third case: a claim that worked but handed out less than
+                    // it was asked for (a cooldown, an empty treasury). That is not a failure.
                     Rectangle {
                         Layout.preferredWidth: 38; Layout.preferredHeight: 38; radius: 19
                         color: "transparent"
                         border.width: 1
-                        border.color: jobDoneSheet.head && jobDoneSheet.head.state === "error"
-                                      ? root.errorRed : root.successGreen
+                        border.color: !jobDoneSheet.head ? root.successGreen
+                                    : jobDoneSheet.head.state === "error" ? root.errorRed
+                                    : jobDoneSheet.head.state === "note"  ? root.silver
+                                    : root.successGreen
                         Text {
                             anchors.centerIn: parent
-                            text: jobDoneSheet.head && jobDoneSheet.head.state === "error" ? "✕" : "✓"
-                            color: jobDoneSheet.head && jobDoneSheet.head.state === "error"
-                                   ? root.errorRed : root.greenBright
+                            text: !jobDoneSheet.head ? "✓"
+                                : jobDoneSheet.head.state === "error" ? "✕"
+                                : jobDoneSheet.head.state === "note"  ? "!"
+                                : "✓"
+                            color: !jobDoneSheet.head ? root.greenBright
+                                 : jobDoneSheet.head.state === "error" ? root.errorRed
+                                 : jobDoneSheet.head.state === "note"  ? root.silver
+                                 : root.greenBright
                             font.pixelSize: 18; font.bold: true
                         }
                     }
@@ -5788,16 +6291,23 @@ Rectangle {
                         Layout.fillWidth: true; spacing: 1
                         Text {
                             Layout.fillWidth: true
-                            text: jobDoneSheet.head
-                                  ? (root.opLabel(jobDoneSheet.head.op)
-                                     + (jobDoneSheet.head.state === "error" ? " failed" : " complete"))
-                                  : ""
+                            // A summary that spans several halves supplies its own heading -
+                            // "<op> complete" cannot describe two outcomes at once.
+                            text: !jobDoneSheet.head ? ""
+                                : (jobDoneSheet.head.heading.length > 0)
+                                    ? jobDoneSheet.head.heading
+                                    : (root.opLabel(jobDoneSheet.head.op)
+                                       + (jobDoneSheet.head.state === "error" ? " failed" : " complete"))
                             color: root.textPrimary; font.family: root.faceFont
-                            font.pixelSize: 15; font.bold: true; elide: Text.ElideRight
+                            font.pixelSize: 15; font.bold: true; wrapMode: Text.WordWrap
                         }
                         Text {
                             Layout.fillWidth: true
-                            text: jobDoneSheet.head
+                            // Only when there IS a figure: an on-chain faucet claim has none
+                            // (the program picks the amount per token), and " LEZ" on its own
+                            // reads as a zero that never happened.
+                            visible: text.length > 0
+                            text: (jobDoneSheet.head && jobDoneSheet.head.amount.length > 0)
                                   ? (jobDoneSheet.head.amount + " "
                                      + (jobDoneSheet.head.asset === "token" ? "tok" : "LEZ"))
                                   : ""
@@ -5821,7 +6331,12 @@ Rectangle {
                             font.family: root.faceFont; font.pixelSize: 12
                             color: jobDoneSheet.head && jobDoneSheet.head.state === "error"
                                    ? root.errorRed : root.textPrimary
+                            // `note` is what actually happened, in words, and it WINS over the
+                            // stock line: a faucet claim's outcome ("received 150 LEZ, tokens
+                            // available again in 4h") is the whole point of the sheet.
                             text: !jobDoneSheet.head ? ""
+                                : jobDoneSheet.head.note.length > 0
+                                    ? jobDoneSheet.head.note
                                 : jobDoneSheet.head.state === "error"
                                     ? (jobDoneSheet.head.error.length > 0 ? jobDoneSheet.head.error : "Failed")
                                     : "Sent to L2 - awaiting L1 confirmation"
