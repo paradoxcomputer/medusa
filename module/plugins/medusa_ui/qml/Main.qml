@@ -422,10 +422,85 @@ Rectangle {
         if (typeof z.faucetTokens === "boolean") return z.faucetTokens
         return z.builtin === true && z.kind !== "local-standalone"
     }
+    // Second line of a zone row. The TRANSPORT used to be spelled out here ("Custom · over
+    // Tor" / "Custom · direct"); it is the tag's job now, so saying it twice would only give
+    // the two statements a chance to disagree. "Custom" is also no longer claimed of a
+    // built-in zone: paradox-clearnet and logos-testnet are shipped by the wallet.
     function zoneKindDesc(z) {
         if (z.kind === "local-standalone") return "Local sandbox · for testing"
         if (z.kind === "local-l1-tor")     return "Default network · private over Tor"
-        return (z.tor ? "Custom · over Tor" : "Custom · direct") + (z.endpoint ? " · " + z.endpoint : "")
+        return (z.builtin === true ? "Built-in" : "Custom") + (z.endpoint ? " · " + z.endpoint : "")
+    }
+
+    // ── Zone transport tag ────────────────────────────────────────────────────
+    // The built-in zone NAMES no longer carry their transport, so "Paradox Computer" is the
+    // name of TWO different zones (one over Tor, one over clearnet) and this tag is the only
+    // thing that tells them apart. It is therefore shown everywhere a zone is named.
+    //
+    // Derived from the zone RECORD, never from `builtin`: a zone the user added is labelled
+    // by exactly the same rule as one the wallet ships.
+    //     tor === true              → "Tor"
+    //     kind === local-standalone → "Local"
+    //     otherwise                 → "Clearnet"
+    //
+    // local-l1-tor (the Paradox zone) is both local AND Tor, and is tagged "Tor". The tag
+    // answers "how does this wallet's traffic get there, and what has to be up for it to
+    // work"; on that question a local L1 reached through a hidden service is a Tor zone. It
+    // needs the bundled Tor, it can sit in bootstrap for minutes, and it is precisely the
+    // zone the Cancel-connect control exists for. Tagging it "Local" would say the opposite.
+    // It also keeps this in lockstep with the core's zoneUsesTor(), which is THE predicate
+    // deciding whether Tor is started and which returns true for that kind: a tag that
+    // disagreed with it would be the UI contradicting what the wallet actually does.
+    function zoneTransportTag(z) {
+        if (!z) return ""
+        if (z.tor === true || z.kind === "local-l1-tor") return "Tor"
+        if (z.kind === "local-standalone") return "Local"
+        return "Clearnet"
+    }
+    // Same rule, starting from an id. No record yet (getZones has not landed) means NO tag:
+    // the wallet must never paint a transport it has not read. That degrades safely, because
+    // zoneName() falls back to the zone id in the same situation and the ids are unique.
+    function zoneTagOf(id) {
+        var z = root.zoneById(id)
+        return z !== null ? root.zoneTransportTag(z) : ""
+    }
+    // Palette only, one colour per tag, none of them the CTA accent (so a tag cannot read as
+    // a button): successGreen is already this file's "Routed over Tor" colour on the zone
+    // sheet, connectGray is the connect-state neutral (a sandbox is not on a network at all),
+    // infoBlue is the palette's own INFO/network token.
+    function zoneTagColor(tag) {
+        if (tag === "Tor")   return root.successGreen
+        if (tag === "Local") return root.connectGray
+        return root.infoBlue
+    }
+    function zoneTagColorOf(id) { return root.zoneTagColor(root.zoneTagOf(id)) }
+
+    // The chip itself, as an inline component so the nine sites that show it cannot drift.
+    // Deliberately NOT interactive: no MouseArea, no hover, no cursor change, a tinted fill
+    // instead of the accent, and 4px corners where every clickable pill in this file is 10-14
+    // or fully round. Everything it needs is passed IN - an inline component does not share
+    // the enclosing file's scope, so it must never reach for `root`.
+    component ZoneTag: Rectangle {
+        id: zoneTagChip
+        property string tag: ""
+        property color  tagColor: "transparent"
+        property string face: ""
+        visible: zoneTagChip.tag.length > 0
+        implicitWidth: zoneTagText.implicitWidth + 12
+        implicitHeight: 15
+        radius: 4
+        // Tints derived from the tag colour itself - no new hex values enter the palette.
+        color: Qt.rgba(zoneTagChip.tagColor.r, zoneTagChip.tagColor.g, zoneTagChip.tagColor.b, 0.14)
+        border.width: 1
+        border.color: Qt.rgba(zoneTagChip.tagColor.r, zoneTagChip.tagColor.g, zoneTagChip.tagColor.b, 0.45)
+        Text {
+            id: zoneTagText
+            anchors.centerIn: parent
+            text: zoneTagChip.tag
+            color: zoneTagChip.tagColor
+            font.family: zoneTagChip.face
+            font.pixelSize: 9
+        }
     }
     // Connectivity colour for a zone's dot: only the ACTIVE zone has a live status; the
     // rest are simply "not connected" (neutral gray).
@@ -457,6 +532,40 @@ Rectangle {
         zTorTog.checked = !!z.tor
         zEndF.text = z.endpoint || ""
     }
+    // Abort a connect in flight. UNGATED in the core (it only stops things and spends nothing),
+    // so no session password is appended here: a locked wallet has to be able to escape a hung
+    // bootstrap, which is exactly when a user most needs to.
+    //
+    // The core lands on the default clearnet zone when it abandons a Tor one, so the reply's
+    // `zone` is authoritative and is adopted rather than assumed: assuming would leave the UI
+    // pointing at a zone the wallet is no longer on. torForeign means another wallet window's
+    // Tor was reused and deliberately left alone; saying "stopped Tor" there would be a lie.
+    function doCancelConnect() {
+        if (typeof logos === "undefined" || !logos.callModule) return
+        runBusy("Stopping", function() {
+            var r = root.callModuleParse(logos.callModule("medusa_core", "cancelConnect", []))
+            if (!r || r.error) {
+                root.logActivity("Could not stop the connect: " + ((r && r.error) || "no reply"), true)
+                return
+            }
+            root.network = r.zone || root.network
+            root.zoneCompat = "unknown"
+            root.zoneOfflineOpen = false
+            root.selectedFromId = ""; root.selectedTokens = []
+            root.faucetOnChainReady = false; root.faucetOnChainNote = ""
+            root.faucetOnChainDefs = []; root.faucetOnChainNames = []
+            root.faucetClaim = null
+            root.refreshSeqStatus(); root.refreshZones(); root.refreshFaucetStatus()
+            netReloadTimer.restart()
+            root.screen = "main"
+            root.logActivity(r.switched === true
+                ? "Stopped connecting - switched to " + root.zoneName(r.zone)
+                : "Stopped connecting", false)
+            if (r.torForeign === true)
+                root.logActivity("Tor is shared with another Basecamp window and was left running", false)
+        })
+    }
+
     function switchZone(id) {
         runBusy("Switching zone", function() {
             var r = callModuleParse(logos.callModule("medusa_core", "setActiveZone", [id]))
@@ -2514,6 +2623,8 @@ Rectangle {
                     }
                     Text { font.family: root.faceFont; font.pixelSize: 11; color: root.textPrimary
                         text: root.zoneName(root.network) }
+                    ZoneTag { tag: root.zoneTagOf(root.network); tagColor: root.zoneTagColorOf(root.network)
+                              face: root.faceFont; Layout.alignment: Qt.AlignVCenter }
                     Text { font.family: root.faceFont; font.pixelSize: 10; color: root.connectGray
                         visible: root.seqStatus === "starting"; text: "· Connecting…" }
                     Text { font.family: root.faceFont; font.pixelSize: 9; color: root.textDisabled; text: "▾" }
@@ -3592,7 +3703,14 @@ Rectangle {
                             Rectangle { width: 10; height: 10; radius: 5; Layout.alignment: Qt.AlignVCenter
                                 color: root.zoneDotColor(modelData) }
                             ColumnLayout { spacing: 1; Layout.fillWidth: true
-                                Text { font.family: root.faceFont; text: modelData.name; color: root.textPrimary; font.pixelSize: 12; font.bold: true }
+                                RowLayout { spacing: 6; Layout.fillWidth: true
+                                    Text { font.family: root.faceFont; text: modelData.name; color: root.textPrimary; font.pixelSize: 12; font.bold: true }
+                                    // Two built-in zones are both named "Paradox Computer"; the tag is
+                                    // the only thing that tells them apart.
+                                    ZoneTag { tag: root.zoneTransportTag(modelData)
+                                              tagColor: root.zoneTagColor(root.zoneTransportTag(modelData))
+                                              face: root.faceFont }
+                                    Item { Layout.fillWidth: true } }
                                 Text { font.family: root.faceFont; text: root.zoneKindDesc(modelData); color: root.textDisabled; font.pixelSize: 9
                                     elide: Text.ElideRight; Layout.fillWidth: true } }
                             Text { visible: root.network === modelData.id; font.family: root.faceFont; text: "✓"; color: root.accentOrange; font.pixelSize: 14 }
@@ -4029,8 +4147,11 @@ Rectangle {
                         SequentialAnimation on opacity { running: true; loops: Animation.Infinite
                             NumberAnimation { to: 0.3; duration: 550 } NumberAnimation { to: 1.0; duration: 550 } } }
                     ColumnLayout { spacing: 0; Layout.fillWidth: true
-                        Text { font.family: root.faceFont; text: "Connecting to " + root.zoneName(root.network)
-                            color: root.textPrimary; font.pixelSize: 12; font.bold: true; elide: Text.ElideRight; Layout.fillWidth: true }
+                        RowLayout { spacing: 6; Layout.fillWidth: true
+                            Text { font.family: root.faceFont; text: "Connecting to " + root.zoneName(root.network)
+                                color: root.textPrimary; font.pixelSize: 12; font.bold: true; elide: Text.ElideRight; Layout.fillWidth: true }
+                            ZoneTag { tag: root.zoneTagOf(root.network); tagColor: root.zoneTagColorOf(root.network)
+                                      face: root.faceFont; Layout.alignment: Qt.AlignVCenter } }
                         Text { font.family: root.faceFont
                             text: root.torPercent < 100 ? "Step 1 of 2 · Tor network" : "Step 2 of 2 · Sequencer onion"
                             color: root.silver; font.pixelSize: 9 } }
@@ -4061,6 +4182,25 @@ Rectangle {
                          : (root.torOnionStage.length > 0 ? root.torOnionStage
                                                           : "Reaching the sequencer onion over Tor - this can take ~10-30s")
                     color: root.textSecondary; font.pixelSize: 9 }
+                // A Tor bootstrap can sit here for minutes, or never finish at all. Without this the
+                // wallet was simply stuck: the zone list is reachable, but nothing told the user they
+                // could leave, and nothing tore the half-built tunnel down. cancelConnect() stops the
+                // bundled Tor and the forward and lands on the default clearnet zone, because a Tor
+                // zone with its tunnel torn down is not a state anything can succeed from.
+                RowLayout {
+                    Layout.fillWidth: true; Layout.topMargin: 2; spacing: 8
+                    Item { Layout.fillWidth: true }
+                    Rectangle {
+                        Layout.preferredWidth: 108; height: 26; radius: 8
+                        color: "transparent"; border.color: root.borderColor; border.width: 1
+                        Text { anchors.centerIn: parent; font.family: root.faceFont; font.pixelSize: 10
+                            text: "Stop connecting"; color: root.textSecondary }
+                        MouseArea {
+                            anchors.fill: parent; cursorShape: Qt.PointingHandCursor
+                            onClicked: root.doCancelConnect()
+                        }
+                    }
+                }
             }
         }
 
@@ -5397,6 +5537,13 @@ Rectangle {
                                 font.pixelSize: 12; font.bold: true
                                 maximumLineCount: 1; elide: Text.ElideRight
                             }
+                            // The approval sheets state the network an action will settle on. Two
+                            // built-in zones share the name "Paradox Computer", so without the tag
+                            // this sentence cannot distinguish them - and this sheet is the whole
+                            // mitigation for a hostile program silently repointing the wallet.
+                            ZoneTag { tag: root.zoneTagOf(root.network)
+                                      tagColor: root.zoneTagColorOf(root.network)
+                                      face: root.faceFont; Layout.alignment: Qt.AlignVCenter }
                             Text {
                                 visible: root.activeZoneIsCustom
                                 text: "custom"; color: root.textDisabled
@@ -5784,6 +5931,13 @@ Rectangle {
                                 font.pixelSize: 12; font.bold: true
                                 maximumLineCount: 1; elide: Text.ElideRight
                             }
+                            // The approval sheets state the network an action will settle on. Two
+                            // built-in zones share the name "Paradox Computer", so without the tag
+                            // this sentence cannot distinguish them - and this sheet is the whole
+                            // mitigation for a hostile program silently repointing the wallet.
+                            ZoneTag { tag: root.zoneTagOf(root.network)
+                                      tagColor: root.zoneTagColorOf(root.network)
+                                      face: root.faceFont; Layout.alignment: Qt.AlignVCenter }
                             Text {
                                 visible: root.activeZoneIsCustom
                                 text: "custom"; color: root.textDisabled
@@ -6021,6 +6175,13 @@ Rectangle {
                                 font.pixelSize: 12; font.bold: true
                                 maximumLineCount: 1; elide: Text.ElideRight
                             }
+                            // The approval sheets state the network an action will settle on. Two
+                            // built-in zones share the name "Paradox Computer", so without the tag
+                            // this sentence cannot distinguish them - and this sheet is the whole
+                            // mitigation for a hostile program silently repointing the wallet.
+                            ZoneTag { tag: root.zoneTagOf(root.network)
+                                      tagColor: root.zoneTagColorOf(root.network)
+                                      face: root.faceFont; Layout.alignment: Qt.AlignVCenter }
                             Text {
                                 visible: root.activeZoneIsCustom
                                 text: "custom"; color: root.textDisabled
@@ -6478,6 +6639,9 @@ Rectangle {
                             Text { Layout.fillWidth: true; text: root.zoneName(root.network)
                                 color: root.textPrimary; font.family: root.faceFont; font.pixelSize: 12
                                 font.bold: true; elide: Text.ElideRight }
+                            ZoneTag { tag: root.zoneTagOf(root.network)
+                                      tagColor: root.zoneTagColorOf(root.network)
+                                      face: root.faceFont; Layout.alignment: Qt.AlignVCenter }
                         }
                         Text { Layout.fillWidth: true; visible: text.length > 0
                             text: root.zoneEndpointDesc()
