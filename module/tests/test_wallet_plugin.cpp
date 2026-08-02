@@ -3915,6 +3915,162 @@ private slots:
         QCOMPARE(parseObj(out)[QStringLiteral("ok")].toBool(), true);
         QVERIFY(slurp(record).contains(QStringLiteral("auth-transfer\nsend\n--from")));
     }
+
+    // ── surface that had no test at all ────────────────────────────────────────────────
+    // A built-in zone is part of the shipped table, not the user's list: removing one would
+    // leave the wallet pointing at a zone it cannot describe. Only user-added zones go.
+    void testOnlyAUserAddedZoneCanBeRemovedAndTheActiveOneFallsBack()
+    {
+        useCli(makeFakeCli(QStringLiteral("{\"ok\":true}")));
+        WalletPlugin p;
+        arm(p);
+        for (const QString& builtin : { QStringLiteral("devnet"),
+                                        QStringLiteral("paradox-clearnet"),
+                                        QStringLiteral("logos-testnet") })
+            QVERIFY2(parseObj(p.removeZone(builtin)).contains(QStringLiteral("error")),
+                     qPrintable(QStringLiteral("built-in zone %1 was removable").arg(builtin)));
+
+        const QString id = useUserZone(p);              // added AND active
+        QCOMPARE(parseObj(p.removeZone(id))[QStringLiteral("ok")].toBool(), true);
+        // the active zone just vanished: the wallet must not be left pointing at it
+        QVERIFY2(parseObj(p.getNetwork())[QStringLiteral("id")].toString() != id,
+                 "the removed zone was still active");
+        for (const auto& v : parseArr(p.getZones()))
+            QVERIFY2(v.toObject()[QStringLiteral("id")].toString() != id, "zone still listed");
+    }
+
+    // getTokens is the per-account display path - the one that showed every account the same
+    // balance. The account id must reach the wallet verbatim, and an empty one must not run
+    // anything at all (the UI calls this on every account switch, including before one is set).
+    void testGetTokensAsksTheWalletForExactlyThatAccount()
+    {
+        const QString cli = makeRecordingCli(QStringLiteral("[]"));
+        useCli(cli);
+        WalletPlugin p;
+        arm(p);
+        p.getTokens(QStringLiteral("Public/account-B"));
+        const QString argv = slurp(cli + QStringLiteral(".argv"));
+        QVERIFY2(argv.contains(QStringLiteral("tokens\nPublic/account-B")), qPrintable(argv));
+        QVERIFY2(!argv.contains(QStringLiteral("account-A")), qPrintable(argv));
+
+        QFile::remove(cli + QStringLiteral(".argv"));
+        QCOMPARE(p.getTokens(QString()), QString("[]"));
+        QVERIFY2(!QFile::exists(cli + QStringLiteral(".argv")),
+                 "getTokens(\"\") ran the wallet");
+    }
+
+    // initAccount is what makes a pristine recipient able to receive: it must name the account
+    // and refuse an empty one rather than initialising whatever the CLI defaults to.
+    void testInitAccountInitialisesTheNamedAccountOnly()
+    {
+        const QString cli = makeRecordingCli(QStringLiteral("{\"ok\":true}"));
+        useCli(cli);
+        WalletPlugin p;
+        arm(p);
+        QCOMPARE(parseObj(p.initAccount(QStringLiteral("  Public/fresh  ")))
+                     [QStringLiteral("ok")].toBool(), true);
+        const QString argv = slurp(cli + QStringLiteral(".argv"));
+        QVERIFY2(argv.contains(QStringLiteral("auth-transfer\ninit\n--account-id\nPublic/fresh")),
+                 qPrintable(argv));
+
+        QFile::remove(cli + QStringLiteral(".argv"));
+        QVERIFY(parseObj(p.initAccount(QStringLiteral("   "))).contains(QStringLiteral("error")));
+        QVERIFY2(!QFile::exists(cli + QStringLiteral(".argv")), "an empty id still ran init");
+    }
+
+    // A label is local UI state, so it must survive into listAccounts and be removable.
+    void testAnAccountNameIsAppliedToTheListingAndClearedByAnEmptyName()
+    {
+        useCli(makeFakeCli(QStringLiteral("[{\"id\":\"Public/a\",\"type\":\"public\"}]")));
+        WalletPlugin p;
+        arm(p);
+        QCOMPARE(parseObj(p.setAccountName(QStringLiteral("Public/a"), QStringLiteral("Salary")))
+                     [QStringLiteral("ok")].toBool(), true);
+        // listAccounts surfaces the user's label as "name", falling back to whatever the
+        // wallet itself reports when the user has not named the account.
+        QCOMPARE(parseArr(p.listAccounts()).at(0).toObject()[QStringLiteral("name")].toString(),
+                 QString("Salary"));
+
+        p.setAccountName(QStringLiteral("Public/a"), QString());
+        const QJsonObject cleared = parseArr(p.listAccounts()).at(0).toObject();
+        QVERIFY2(cleared[QStringLiteral("name")].toString().isEmpty(),
+                 "an emptied name still labelled the account");
+        QVERIFY(parseObj(p.setAccountName(QString(), QStringLiteral("x")))
+                    .contains(QStringLiteral("error")));
+    }
+
+    // Transaction history is per account and starts empty - never another account's list.
+    void testTransactionHistoryIsPerAccountAndStartsEmpty()
+    {
+        useCli(makeFakeCli(QStringLiteral("[]")));
+        WalletPlugin p;
+        arm(p);
+        QCOMPARE(parseArr(p.getTransactions(QStringLiteral("Public/a"))).size(), 0);
+        QVERIFY(parseObj(p.getTransactions(QString())).contains(QStringLiteral("error")));
+    }
+
+    // The private-note scan is a background job: a second start must not spawn a second
+    // scanner, and the status verb must say so rather than reporting a fresh run.
+    void testASecondPrivateSyncNeverStartsASecondScanner()
+    {
+        // a CLI that stays alive long enough for the second call to see it running
+        const QString cli = m_tmp.path() + QStringLiteral("/slowsync.sh");
+        writeExec(cli, QStringLiteral("#!/bin/sh\nread pw\nsleep 2\necho '{\"ok\":true}'\n"));
+        WalletPlugin p;
+        arm(p);
+        useCli(cli);
+        QCOMPARE(parseObj(p.syncPrivateStatus())[QStringLiteral("running")].toBool(), false);
+        p.startSyncPrivate();
+        QCOMPARE(parseObj(p.syncPrivateStatus())[QStringLiteral("running")].toBool(), true);
+        QCOMPARE(parseObj(p.startSyncPrivate())[QStringLiteral("alreadyRunning")].toBool(), true);
+    }
+
+    // Rejecting is a state machine, not a free-for-all: only a pending ZONE request can be
+    // rejected, and never twice.
+    void testRejectZoneOnlyHandlesAPendingZoneRequestAndOnlyOnce()
+    {
+        useCli(makeFakeCli(QStringLiteral("{\"ok\":true}")));
+        WalletPlugin p;
+        arm(p);
+        QVERIFY(parseObj(p.rejectZone(QStringLiteral("no-such-request")))
+                    .contains(QStringLiteral("error")));
+
+        // a CONNECT request is not a zone request.
+        // NOTE the escaped string: moc's lexer treats "//" as a comment even INSIDE a raw
+        // string literal, so R"(...https://...)" swallows the closing delimiter, the class
+        // parse collapses, and moc emits "No relevant classes found" - an EMPTY .moc, which
+        // surfaces only as `undefined reference to vtable for TestWalletPlugin` at link time.
+        // Any URL in this file must be written escaped, never as a raw string.
+        const auto conn = parseObj(p.connectRequest(
+            QStringLiteral("{\"appName\":\"App\",\"origin\":\"https://app.invalid\"}"),
+            QStringLiteral("[\"accounts\"]")));
+        const QString cid = conn[QStringLiteral("requestId")].toString();
+        QVERIFY(!cid.isEmpty());
+        const auto wrong = parseObj(p.rejectZone(cid));
+        QVERIFY2(wrong.contains(QStringLiteral("error")), qPrintable(QJsonDocument(wrong).toJson()));
+        QCOMPARE(wrong[QStringLiteral("error")].toString(), QString("not a zone request"));
+
+        // and the connect request itself is still pending, not collaterally damaged: its own
+        // reject verb still works, and only once.
+        QCOMPARE(parseObj(p.rejectConnect(cid))[QStringLiteral("ok")].toBool(), true);
+        QVERIFY(parseObj(p.rejectConnect(cid)).contains(QStringLiteral("error")));
+    }
+
+    // addToken forwards to the registry and refuses an empty definition.
+    void testAddTokenForwardsTheDefinitionAndRefusesAnEmptyOne()
+    {
+        const QString cli = makeRecordingCli(QStringLiteral("{\"ok\":true}"));
+        useCli(cli);
+        WalletPlugin p;
+        arm(p);
+        p.addToken(QStringLiteral("  DefX  "));
+        QVERIFY2(slurp(cli + QStringLiteral(".argv"))
+                     .contains(QStringLiteral("token-registry\nadd\nDefX")),
+                 qPrintable(slurp(cli + QStringLiteral(".argv"))));
+        QFile::remove(cli + QStringLiteral(".argv"));
+        QVERIFY(parseObj(p.addToken(QString())).contains(QStringLiteral("error")));
+        QVERIFY2(!QFile::exists(cli + QStringLiteral(".argv")), "an empty definition still ran");
+    }
 };
 
 QTEST_MAIN(TestWalletPlugin)

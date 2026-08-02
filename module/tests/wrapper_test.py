@@ -93,7 +93,9 @@ class WrapperTest(unittest.TestCase):
             {"id": PRIV, "type": "private", "balance": 0,
              "initialized": False, "label": None},
         ])
-        self.seed_reg(definitions=[DEF], names={DEF: "TOK"}, vaults={DEF: VAULT})
+        # Vaults are per-OWNER: {owner: {definition: holding}}. Keyed by definition alone,
+        # one holding served the whole wallet and every account showed the same balance.
+        self.seed_reg(definitions=[DEF], names={DEF: "TOK"}, vaults={OWNER: {DEF: VAULT}})
 
     # ── tests ──────────────────────────────────────────────────────────────
     def test_tokens_merges_ata_and_vault(self):
@@ -137,15 +139,44 @@ class WrapperTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("no initialized vault", out["error"])
 
-    def test_vault_for_prefers_initialized_over_recorded_pristine(self):
+    def test_a_pristine_record_is_never_healed_with_another_accounts_holding(self):
+        """An owner whose recorded vault is pristine must NOT be silently re-pointed at some
+        other initialized holding that happens to exist in the wallet. That wallet-wide scan
+        is exactly what made one holding serve every account. Refusing is the correct answer:
+        VAULT here is initialized and holds the definition, but nothing says it is OWNER's."""
         self.std_state(vault_bal=40, ata_bal=60)
-        # record a PRISTINE (uninitialized) vault; the real one must win
         self.seed_reg(definitions=[DEF], names={DEF: "TOK"},
-                      vaults={DEF: "PristineRecorded111111111111111111111111"})
+                      vaults={OWNER: {DEF: "PristineRecorded111111111111111111111111"}})
         rc, out = self.wrap("consolidate", "Public/" + OWNER, DEF)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("no initialized vault", out["error"])
+        # and it did not quietly re-designate VAULT as OWNER's
+        self.assertNotEqual(self.reg()["vaults"][OWNER][DEF], VAULT)
+
+    def test_an_owner_that_is_itself_a_holding_designates_itself(self):
+        """The one self-designation that IS sound: the owner account's own on-chain data says
+        it holds this definition, so it is its own vault - no cross-account guessing."""
+        self.std_state(vault_bal=40, ata_bal=60)
+        self.seed_reg(definitions=[DEF], names={DEF: "TOK"}, vaults={})   # nothing recorded
+        rc, out = self.wrap("token-transfer", "Public/" + VAULT, "Public/" + RECIP, DEF, "5")
         self.assertEqual(rc, 0, out)
-        self.assertEqual(out["vault"], VAULT)
-        self.assertEqual(self.reg()["vaults"][DEF], VAULT)  # re-designated
+        self.assertEqual(self.reg()["vaults"][VAULT][DEF], VAULT)
+        with open(self.chain) as f:
+            st = json.load(f)
+        self.assertEqual(st["chain"][VAULT]["balance"], 35)
+        # OWNER, who recorded nothing, gained no claim on it
+        self.assertNotIn(OWNER, self.reg()["vaults"])
+
+    def test_one_account_never_sees_another_accounts_tokens(self):
+        """The reported symptom: switching accounts showed the same token balance, because a
+        vault was keyed by definition alone. OWNER holds 40+60; RECIP holds nothing."""
+        self.std_state(vault_bal=40, ata_bal=60)
+        rc, mine = self.wrap("tokens", "Public/" + OWNER)
+        self.assertEqual(rc, 0, mine)
+        self.assertEqual(mine[0]["balance"], "100")
+        rc, theirs = self.wrap("tokens", "Public/" + RECIP)
+        self.assertEqual(rc, 0, theirs)
+        self.assertEqual([t for t in theirs if t["balance"] != "0"], [])
 
     def test_token_transfer_splits_across_vault_and_ata(self):
         self.std_state(vault_bal=30, ata_bal=50)
@@ -167,8 +198,8 @@ class WrapperTest(unittest.TestCase):
 
     def test_one_shot_guard_blocks_recorded_private_dest(self):
         self.std_state()
-        self.seed_reg(definitions=[DEF], names={DEF: "TOK"}, vaults={DEF: VAULT},
-                      privateDests=[PRIV])
+        self.seed_reg(definitions=[DEF], names={DEF: "TOK"},
+                      vaults={OWNER: {DEF: VAULT}}, privateDests=[PRIV])
         rc, out = self.wrap("token-shield", "Public/" + OWNER, PRIV, DEF, "5")
         self.assertEqual(rc, 1)
         self.assertIn("one-shot", out["error"])
@@ -215,11 +246,29 @@ class WrapperTest(unittest.TestCase):
 
     def test_token_registry_lists_vaults_and_private_dests(self):
         self.std_state()
-        self.seed_reg(definitions=[DEF], names={DEF: "TOK"}, vaults={DEF: VAULT},
-                      privateDests=[PRIV])
+        self.seed_reg(definitions=[DEF], names={DEF: "TOK"},
+                      vaults={OWNER: {DEF: VAULT}}, privateDests=[PRIV])
         rc, out = self.wrap("token-registry")
-        self.assertEqual(out["vaults"][DEF], VAULT)
+        self.assertEqual(out["vaults"][OWNER][DEF], VAULT)
         self.assertEqual(out["privateDests"], [PRIV])
+
+    def test_a_flat_legacy_vault_map_is_migrated_and_owned_by_nobody_else(self):
+        """Registries written before per-owner vaults are {definition: holding} and record no
+        owner at all - the link is simply not on disk. Migration attributes each holding to
+        ITSELF, which is the only honest answer: it never hands the holding to whichever
+        account asks first, so no account inherits tokens that were never shown to be its
+        own. The holding stays visible under direct-holdings, and OWNER sees nothing."""
+        self.std_state(vault_bal=40, ata_bal=60)
+        self.seed_reg(definitions=[DEF], names={DEF: "TOK"}, vaults={DEF: VAULT})
+        rc, out = self.wrap("token-registry")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["vaults"], {VAULT: {DEF: VAULT}})
+        rc, mine = self.wrap("tokens", "Public/" + OWNER)
+        self.assertEqual(rc, 0, mine)
+        self.assertEqual([t["balance"] for t in mine], ["60"])   # its ATA only, not the vault
+        rc, dh = self.wrap("direct-holdings")
+        self.assertEqual(rc, 0, dh)
+        self.assertIn(VAULT, [h["account"] for h in dh])
 
     def test_legacy_registry_migrates_to_devnet(self):
         self.seed_chain({})
