@@ -144,3 +144,99 @@ mod helpers {
 
 #[cfg(feature = "helpers")]
 pub use helpers::*;
+
+#[cfg(all(test, feature = "helpers"))]
+mod tests {
+    use lee_core::{account::AccountId, program::ProgramId};
+
+    use super::*;
+
+    fn id(byte: u8) -> AccountId {
+        AccountId::new([byte; 32])
+    }
+
+    fn program() -> ProgramId {
+        [9_u32; 8]
+    }
+
+    #[test]
+    fn marker_data_roundtrips() {
+        for ms in [0_u64, 1, 21_600_000, u64::MAX] {
+            assert_eq!(decode_marker_data(&encode_marker_data(ms)), Some(ms));
+        }
+    }
+
+    // A marker whose data is any other length is not a marker. Accepting a short or long
+    // record would let a claimant present something the faucet never wrote as a cooldown.
+    #[test]
+    fn marker_data_of_the_wrong_length_is_rejected() {
+        for len in [0_usize, 1, 7, 9, 32] {
+            assert_eq!(decode_marker_data(&vec![0_u8; len]), None, "len {len}");
+        }
+    }
+
+    // The two PDA namespaces MUST NOT collide: with a shared preimage, one account id could
+    // be read as both a treasury and a cooldown marker for the same id.
+    #[test]
+    fn treasury_and_marker_seeds_are_domain_separated() {
+        let a = id(1);
+        assert_ne!(treasury_seed(&a), marker_seed(&a));
+        assert_ne!(
+            treasury_account_id(&program(), &a),
+            marker_account_id(&program(), &a)
+        );
+    }
+
+    #[test]
+    fn seeds_are_deterministic_and_distinct_per_account() {
+        assert_eq!(treasury_seed(&id(1)), treasury_seed(&id(1)));
+        assert_ne!(treasury_seed(&id(1)), treasury_seed(&id(2)));
+        assert_eq!(marker_seed(&id(1)), marker_seed(&id(1)));
+        assert_ne!(marker_seed(&id(1)), marker_seed(&id(2)));
+    }
+
+    // The dispensed amount is what a claimant actually receives, so it must stay inside the
+    // advertised band for every input - a value outside it would either dispense nothing or
+    // drain the treasury.
+    #[test]
+    fn claim_amount_always_lands_inside_the_advertised_band() {
+        let def = id(7);
+        for clock in [0_u64, 1, 1_700_000_000_000, u64::MAX] {
+            for who in 0_u8..32 {
+                let amt = claim_amount(clock, &id(who), &def);
+                assert!(
+                    (MIN_AMOUNT..=MAX_AMOUNT).contains(&amt),
+                    "clock {clock} who {who} gave {amt}"
+                );
+            }
+        }
+    }
+
+    // Deterministic in all three inputs: the guest recomputes it from the same values the
+    // host used, so any drift makes every claim fail verification.
+    #[test]
+    fn claim_amount_is_a_pure_function_of_its_three_inputs() {
+        let (clock, who, def) = (1_700_000_000_000_u64, id(3), id(7));
+        assert_eq!(claim_amount(clock, &who, &def), claim_amount(clock, &who, &def));
+        assert_ne!(claim_amount(clock, &who, &def), claim_amount(clock + 1, &who, &def));
+        assert_ne!(claim_amount(clock, &who, &def), claim_amount(clock, &id(4), &def));
+        assert_ne!(claim_amount(clock, &who, &def), claim_amount(clock, &who, &id(8)));
+    }
+
+    // The wire encoding both sides depend on: the variant index is what the guest matches
+    // on, so a reordering of this enum silently turns InitTreasury into Claim.
+    #[test]
+    fn instruction_encoding_is_stable_across_the_host_guest_boundary() {
+        for (ins, want) in [(Instruction::InitTreasury, 0_u32), (Instruction::Claim, 1)] {
+            let words = risc0_zkvm::serde::to_vec(&ins).expect("encodes");
+            assert_eq!(words.first().copied(), Some(want), "{ins:?}");
+            let back: Instruction = risc0_zkvm::serde::from_slice(&words).expect("decodes");
+            assert_eq!(back, ins);
+        }
+    }
+
+    #[test]
+    fn the_cooldown_is_the_documented_six_hours() {
+        assert_eq!(COOLDOWN_MS, 6 * 60 * 60 * 1_000);
+    }
+}
