@@ -28,6 +28,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 
 def _wallet_lez():
@@ -149,36 +150,82 @@ def load_reg():
     try:
         with open(reg_path()) as f:
             r = json.load(f)
-        r.setdefault("definitions", [])
-        r.setdefault("names", {})
-        # vaults[owner][definition] = bare id of THAT ACCOUNT's direct holding (shieldable).
-        # Old registries used vaults[definition] = holding, one holding per token for the whole
-        # wallet, which made the faucet deliver to a single account and made every account show
-        # the same token balance. Normalise on read: a holding stands as its own owner, which is
-        # true (a direct holding IS one of the wallet's accounts) and keeps existing tokens
-        # reachable from the account that actually holds them.
-        v = r.get("vaults") or {}
-        if v and all(isinstance(x, str) for x in v.values()):
-            r["vaults"] = {holding: {defid: holding} for defid, holding in v.items()}
-        else:
-            r.setdefault("vaults", {})
-        # Private accounts we have EVER successfully sent a private OUTPUT to. rc5 rejects a
-        # fresh output onto any non-default private account - even a same-def token top-up is
-        # silently dropped on-chain AFTER the full client proof (verified live) - so these are
-        # one-shot destinations and must never be offered/used again.
-        r.setdefault("privateDests", [])
-        return r
-    except (OSError, ValueError):
+        if not isinstance(r, dict):
+            raise ValueError("token registry is not a JSON object")
+    except FileNotFoundError:
         return {"definitions": [], "names": {}, "vaults": {}, "privateDests": []}
+    except (OSError, ValueError):
+        # The file EXISTS but does not parse. That is corruption (a torn write, a full disk),
+        # NOT a first run, and the two must never look alike: handing back an empty registry
+        # here drops every definition, the whole per-owner vault map and the privateDests
+        # list, so the faucet would mint a brand-new vault (rebinding its cooldown marker PDA
+        # and losing the 6h cooldown) and the one-shot private-recipient guard would go quiet
+        # for every private account this wallet has ever paid. Keep a copy for recovery, leave
+        # the original in place so the next call fails the same way instead of silently
+        # starting over, and refuse loudly.
+        if not os.path.exists(reg_path()):
+            return {"definitions": [], "names": {}, "vaults": {}, "privateDests": []}
+        backup = reg_path() + ".corrupt"
+        try:
+            with open(reg_path(), "rb") as src, open(backup, "wb") as dst:
+                dst.write(src.read())
+        except OSError:
+            backup = "(copy failed)"
+        print(json.dumps({"error":
+                          "token registry %s is unreadable (a copy is at %s). Token balances "
+                          "and the one-shot private-recipient guard cannot be trusted until it "
+                          "is repaired or removed." % (reg_path(), backup)}))
+        sys.exit(1)
+    r.setdefault("definitions", [])
+    r.setdefault("names", {})
+    # vaults[owner][definition] = bare id of THAT ACCOUNT's direct holding (shieldable).
+    # Old registries used vaults[definition] = holding, one holding per token for the whole
+    # wallet, which made the faucet deliver to a single account and made every account show
+    # the same token balance. Normalise on read: a holding stands as its own owner, which is
+    # true (a direct holding IS one of the wallet's accounts) and keeps existing tokens
+    # reachable from the account that actually holds them.
+    v = r.get("vaults") or {}
+    if v and all(isinstance(x, str) for x in v.values()):
+        r["vaults"] = {holding: {defid: holding} for defid, holding in v.items()}
+    else:
+        r.setdefault("vaults", {})
+    # Private accounts we have EVER successfully sent a private OUTPUT to. rc5 rejects a
+    # fresh output onto any non-default private account - even a same-def token top-up is
+    # silently dropped on-chain AFTER the full client proof (verified live) - so these are
+    # one-shot destinations and must never be offered/used again.
+    r.setdefault("privateDests", [])
+    return r
 
 
 def save_reg(r):
     # Atomic replace - a claim job and a UI poll can both touch the registry; a torn write
-    # would lose the vault map.
-    tmp = reg_path() + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(r, f)
-    os.replace(tmp, reg_path())
+    # would lose the vault map. The scratch name has to be UNIQUE PER WRITER for that to hold:
+    # a fixed "<registry>.tmp" is the SAME path for both live wrappers (a background claim job
+    # and the 10s UI poll), so both open and truncate one inode, their json.dump bytes
+    # interleave in it, and whichever replaces second dies with FileNotFoundError on a tmp that
+    # is already gone - after its buffered tail has landed inside the now-live registry. The
+    # result parses as garbage, and a registry that will not parse costs the vault map, the
+    # faucet cooldown binding and the one-shot privateDests guard. mkstemp hands each writer
+    # its own file in the registry's OWN directory, so os.replace stays a same-filesystem
+    # rename; fsync first so a crash between write and rename cannot publish a half-filled
+    # inode. Two savers can still overwrite each other's last change, but each write is
+    # all-or-nothing and the file on disk is always one complete registry.
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(reg_path()) or ".",
+                               prefix=os.path.basename(reg_path()) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(r, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, reg_path())
+    except BaseException:
+        # Never leave scratch files behind in the wallet home: a failed save that littered
+        # would do it on every 10s poll.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def record_private_dest(dest):

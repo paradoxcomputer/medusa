@@ -270,6 +270,47 @@ class WrapperTest(unittest.TestCase):
         self.assertEqual(rc, 0, dh)
         self.assertIn(VAULT, [h["account"] for h in dh])
 
+    def scratch_litter(self):
+        """Left-over registry scratch files in the wallet home."""
+        return [n for n in os.listdir(self.home)
+                if n.startswith("token_registry-") and n.endswith(".tmp")
+                and os.path.isfile(os.path.join(self.home, n))]
+
+    def test_registry_write_does_not_use_the_shared_fixed_scratch_name(self):
+        """A save must write to a scratch path only THIS process owns. With the old fixed
+        "<registry>.tmp", the background claim job and the 10s UI poll truncated one shared
+        inode, interleaved their JSON into it and the loser died on os.replace of a tmp that
+        was already gone. Occupying that exact fixed name with a directory makes any writer
+        still using it fail loudly (IsADirectoryError), while a per-writer mkstemp name is
+        unaffected."""
+        self.std_state()
+        self.seed_reg(definitions=[], names={}, vaults={})
+        os.mkdir(self.reg_path + ".tmp")
+        rc, out = self.wrap("token-registry", "add", DEF)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.reg()["definitions"], [DEF])
+        self.assertTrue(os.path.isdir(self.reg_path + ".tmp"))   # untouched, not the target
+        self.assertEqual(self.scratch_litter(), [])
+
+    def test_concurrent_registry_writers_never_publish_a_torn_registry(self):
+        """Two wrappers are routinely alive at once (a claim job plus the UI poll). Neither
+        may crash, and the published registry must always be one complete JSON object: a file
+        that will not parse costs the vault map, the faucet's cooldown binding and the
+        one-shot privateDests guard."""
+        self.std_state()
+        for _round in range(6):
+            # An unresolved ticker makes BOTH calls cache the name, so both save the registry.
+            self.seed_reg(definitions=[DEF], names={}, vaults={OWNER: {DEF: VAULT}})
+            procs = [subprocess.Popen([sys.executable, WRAPPER, "tokens", "Public/" + who],
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, text=True, env=self.env)
+                     for who in (OWNER, VAULT)]
+            for p in procs:
+                out, err = p.communicate("\n", timeout=120)
+                self.assertEqual(p.returncode, 0, err or out)
+            self.assertEqual(self.reg()["names"][DEF], "TOK")   # raises if the file is torn
+            self.assertEqual(self.scratch_litter(), [])
+
     def test_legacy_registry_migrates_to_devnet(self):
         self.seed_chain({})
         with open(os.path.join(self.home, "wallet_config.json"), "w") as f:
