@@ -477,8 +477,15 @@ public:
     Q_INVOKABLE QString exportMnemonic(const QString& password);
     // Reveal a public account's private signing key (hex). GATED. {ok,privateKey}.
     Q_INVOKABLE QString exportKey(const QString& accountId, const QString& password);
-    // Import a public account from a raw private signing key. {ok,output}.
-    Q_INVOKABLE QString importKey(const QString& privateKey, const QString& label);
+    // Import a public account from a raw private signing key. GATED. {ok,output}.
+    // Gated for the same reason its two neighbours are, from the other direction: those reveal
+    // a secret, this one PLANTS one. Any co-resident module can reach this verb, and while the
+    // wallet was unlocked an ungated import let it add an account whose signing key the caller
+    // keeps, under a label of its choosing ("Savings"). The account then shows up in the user's
+    // own list as theirs, so anything they receive into it is spendable by whoever planted it.
+    // It was also the one verb in this section touching m_password without presenting one.
+    Q_INVOKABLE QString importKey(const QString& privateKey, const QString& label,
+                                  const QString& password);
 
     // Transaction history (locally stored)
     Q_INVOKABLE QString getTransactions(const QString& accountId);

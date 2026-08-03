@@ -1938,7 +1938,7 @@ Rectangle {
     // startSendToken, startSendTransfer, startShield, startDeshield, startPrivateTransfer,
     // approveAction, approveZone, exportMnemonic, exportKey, and conditionally resetWallet +
     // restoreWallet); when the core gates one more verb, listing it here is the only change any
-    // call site needs. 14 names here, 14 authorize() sites there.
+    // call site needs. 15 names here, 15 authorize() sites there.
     //
     // startPrivateTransferForeign is DELETED, not merely unused: it folded into
     // startPrivateTransfer when the recipient became a spec string. Leaving the name here would
@@ -1950,6 +1950,10 @@ Rectangle {
         "startShield", "startDeshield", "startPrivateTransfer",
         "consolidateToken", "approveAction", "approveZone",
         "exportMnemonic", "exportKey",
+        // importKey is gated from the other direction: it PLANTS a signing key the caller
+        // chooses, so an ungated one let a co-resident module add an account it owns to the
+        // user's list while the wallet was unlocked.
+        "importKey",
         // The on-chain faucet claim signs and broadcasts with the wallet's keys, so it is a
         // spend verb. Note its sibling startFaucet is NOT here and must not be: that one runs
         // `pinata claim`, takes no password, and is gated in the core by nothing at all.
@@ -2441,7 +2445,7 @@ Rectangle {
         if (typeof logos === "undefined" || !logos.callModule) return
         if (!key || key.trim().length === 0) { root.logActivity("Enter a private key", true); return }
         runBusy("Importing", function() {
-            var r = callModuleParse(logos.callModule("medusa_core", "importKey", [key.trim(), label || ""]))
+            var r = callGated("importKey", [key.trim(), label || ""])
             if (!r || r.error) { root.logActivity("Import failed: " + (r && r.error ? r.error : "unknown"), true); return }
             root.logActivity("Imported account" + (r.id ? " " + displayId(r.id) : ""), false)
             balanceRefreshTimer.restart()

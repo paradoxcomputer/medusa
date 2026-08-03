@@ -4939,8 +4939,15 @@ QString WalletPlugin::exportKey(const QString& accountId, const QString& passwor
     return QJsonDocument(out).toJson(QJsonDocument::Compact);
 }
 
-QString WalletPlugin::importKey(const QString& privateKey, const QString& label)
+QString WalletPlugin::importKey(const QString& privateKey, const QString& label,
+                                const QString& password)
 {
+    // Planting a key is as much a capability as revealing one: an ungated import let any
+    // co-resident module add an account it holds the signing key for, labelled however it
+    // liked, and the user's own account list then presented it as theirs.
+    if (!authorize(password))
+        return authRefusal();
+
     if (privateKey.trimmed().isEmpty())
         return errorJson(QStringLiteral("private key is required"));
 

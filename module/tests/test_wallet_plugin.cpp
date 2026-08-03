@@ -1481,7 +1481,7 @@ private slots:
     void testImportKeyMissing()
     {
         WalletPlugin p;
-        QVERIFY(parseObj(p.importKey(QStringLiteral(""), QStringLiteral(""))).contains(QStringLiteral("error")));
+        QVERIFY(parseObj(p.importKey(QStringLiteral(""), QStringLiteral(""), kPw)).contains(QStringLiteral("error")));
     }
 
     void testImportKeySuccess()
@@ -1490,7 +1490,9 @@ private slots:
         useCli(cli);
 
         WalletPlugin p;
-        auto r = parseObj(p.importKey(QStringLiteral("deadbeef"), QStringLiteral("mine")));
+        arm(p);              // importKey is gated now: it needs a live session like its neighbours
+        useCli(cli);         // arm() swaps in its own password-checking CLI, put this one back
+        auto r = parseObj(p.importKey(QStringLiteral("deadbeef"), QStringLiteral("mine"), kPw));
         QCOMPARE(r[QStringLiteral("ok")].toBool(), true);
         QCOMPARE(r[QStringLiteral("id")].toString(), QString("Public/GkeQajoUJ6KUz"));
     }
@@ -3479,7 +3481,8 @@ private slots:
         QVERIFY(!parseObj(p.unlock(QStringLiteral("pw-line-1"))).contains(QStringLiteral("error")));
         const QString key = QStringLiteral("10a26a9aec7d34b82364eeae45c5294d"
                                            "bb0a764b000b94eeb9b58511dc487c4d");
-        auto r = parseObj(p.importKey(key, QString()));   // no label: keeps this the last command
+        // no label: keeps this the last command. The password is this test's own session one.
+        auto r = parseObj(p.importKey(key, QString(), QStringLiteral("pw-line-1")));
         QCOMPARE(r[QStringLiteral("ok")].toBool(), true);
 
         const QString argv = slurp(cli + QStringLiteral(".argv"));
@@ -4054,6 +4057,33 @@ private slots:
         // reject verb still works, and only once.
         QCOMPARE(parseObj(p.rejectConnect(cid))[QStringLiteral("ok")].toBool(), true);
         QVERIFY(parseObj(p.rejectConnect(cid)).contains(QStringLiteral("error")));
+    }
+
+    // Planting a signing key is a capability, not a convenience. An ungated importKey let any
+    // co-resident module add an account it holds the key for, under a label of its choosing,
+    // while the wallet was unlocked: the user's own list would then present it as theirs, and
+    // anything received into it is spendable by whoever planted it. It was also the only verb
+    // in the import/export section that spent m_password without presenting one.
+    void testImportKeyRefusesACallerThatDoesNotKnowThePassword()
+    {
+        const QString cli = makeRecordingCli(QStringLiteral("{\"ok\":true}"));
+        useCli(cli);
+        WalletPlugin p;
+        arm(p);                                   // a LIVE session: the pre-fix hole
+        useCli(cli);
+
+        const QString key = QStringLiteral("deadbeef");
+        const auto bad = parseObj(p.importKey(key, QStringLiteral("Savings"),
+                                              QStringLiteral("not the password")));
+        QVERIFY2(bad.contains(QStringLiteral("error")), qPrintable(QJsonDocument(bad).toJson()));
+        QVERIFY2(!QFile::exists(cli + QStringLiteral(".argv")),
+                 "an unauthorised importKey still ran the wallet");
+
+        // and the real password still works, so the gate did not simply break the verb
+        QCOMPARE(parseObj(p.importKey(key, QStringLiteral("mine"), kPw))
+                     [QStringLiteral("ok")].toBool(), true);
+        QVERIFY(slurp(cli + QStringLiteral(".argv"))
+                    .contains(QStringLiteral("account\nimport\npublic")));
     }
 
     // addToken forwards to the registry and refuses an empty definition.
