@@ -30,6 +30,9 @@ export interface ActionRequestResult {
 
 export interface StatusResult {
   status?: "pending" | "approved" | "rejected";
+  /** Echoed back by the wallet so a poll reply can be correlated to the request that
+   *  produced it. It was missing here, so correlating in TypeScript needed a cast. */
+  requestId?: string;
   /** Present when an APPROVED connect request resolves. */
   sessionId?: string;
   /** Present when an APPROVED action request resolves. */

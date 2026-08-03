@@ -77,6 +77,25 @@ function mockBridge() {
             }
             case "revokeSession":
                 return JSON.stringify({ ok: true });
+            // The settlement half of the contract, and the two reads. These had no arm at all,
+            // so every getJob/getBalance/getTokens call fell through to "invalid response" and
+            // the suite modelled a world where "approved" was the end of the story.
+            case "getJob": {
+                // jobId "job-running" stays running; "job-done" settles; "job-failed" errors.
+                const id = args[0];
+                if (id === "job-running") return JSON.stringify({ jobId: id, state: "running" });
+                if (id === "job-done")
+                    return JSON.stringify({ jobId: id, state: "done", txId: "0xabc" });
+                if (id === "job-failed")
+                    return JSON.stringify({ jobId: id, state: "error", error: "chain rejected it" });
+                return JSON.stringify({ error: "unknown jobId: " + id });
+            }
+            case "getBalance":
+                // The wallet returns the CLI's raw text, NOT a { balance } field.
+                return JSON.stringify({ ok: true, output: '{"balance":250,"nonce":4}' });
+            case "getTokens":
+                return JSON.stringify([{ definitionId: "D1", ticker: "GOLD", balance: "191",
+                                         ataBalance: "0", vaultBalance: "191" }]);
             default:
                 return JSON.stringify({ error: "invalid response" });   // mirrors the bridge's method-not-found
         }
@@ -187,6 +206,39 @@ ok(s1after.zone === "z-paradox-computer" && s1after.zoneAtConnect === "diaphani"
 // 10) disconnect
 ok(medusa.disconnect("sess-1").ok === true, "disconnect() ok");
 
+// 10b) SETTLEMENT. "approved" is not "sent": the job still has to reach a terminal state, and
+// only "done" means the transfer landed. This is the contract the README now spells out and the
+// one a past Tip Jar bug got wrong, so the suite has to model it rather than stop at approval.
+{
+    const running = medusa.getJob("sess-1", "job-running");
+    ok(running.state === "running" && !running.txId,
+        "getJob() running: no txId, nothing has settled yet");
+
+    const done = medusa.getJob("sess-1", "job-done");
+    ok(done.state === "done" && done.txId === "0xabc", "getJob() done carries the tx id");
+
+    const failed = medusa.getJob("sess-1", "job-failed");
+    ok(failed.state === "error" && typeof failed.error === "string" && !failed.txId,
+        "getJob() failure is a terminal state with an error and no txId");
+    ok(failed.state !== "done", "a failed job is never reported as done");
+
+    ok(typeof medusa.getJob("sess-1", "nope").error === "string",
+        "getJob() unknown id returns { error }");
+}
+
+// 10c) The two reads. getBalance deliberately returns the CLI's raw text, so a consumer that
+// expects a { balance } number gets undefined: pinned here because the published 0.2.0 types
+// promised exactly that field.
+{
+    const b = medusa.getBalance("sess-1", "Public/a");
+    ok(b.ok === true && typeof b.output === "string", "getBalance() returns { ok, output }");
+    ok(b.balance === undefined, "getBalance() does NOT return a balance field");
+
+    const t = medusa.getTokens("sess-1", "Public/a");
+    ok(Array.isArray(t) && t[0].ticker === "GOLD" && t[0].balance === "191",
+        "getTokens() returns the holdings array");
+}
+
 // 11) A bridge reply that is valid JSON but NOT an object must still obey the documented
 // contract ("every call returns a plain object, nothing throws"). "null" is the realistic one:
 // a null QVariant from a wallet verb serialises to it, and returning it verbatim made the
@@ -223,6 +275,25 @@ ok(medusa.disconnect("sess-1").ok === true, "disconnect() ok");
     ok(JSON.parse(seen[1][1]).op === undefined,
        "a reused action object still sends as a plain send, not a shield");
     ok(JSON.parse(seen[0][1]).op === "shield", "shield() still submits op=shield");
+}
+
+// 13) VENDORED-COPY DRIFT. examples/tip-jar ships its own copy of this file, because a Basecamp
+// ui_qml module loads its QML from its own directory and cannot import across modules. install.sh
+// cmp's the two and refuses to install on a mismatch, but the nix/.lgx packaging route builds
+// from `src = ./.` inside the tip-jar directory, so it never sees this file and cannot make that
+// comparison. Checking it here means drift fails the moment anyone runs the suite, whichever way
+// the module is later packaged. Skipped when the example is absent (an installed npm package).
+{
+    const fs = require("fs"), path = require("path");
+    const vendored = path.join(__dirname, "..", "examples", "tip-jar", "qml", "medusa-connect.js");
+    if (!fs.existsSync(vendored)) {
+        console.log("  skip  tip-jar vendored copy not present (standalone package)");
+    } else {
+        const a = fs.readFileSync(path.join(__dirname, "medusa-connect.js"), "utf8");
+        const b = fs.readFileSync(vendored, "utf8");
+        ok(a === b, "examples/tip-jar vendored medusa-connect.js is byte-identical to this one");
+        if (a !== b) console.log("        run: cp sdk/medusa-connect.js examples/tip-jar/qml/");
+    }
 }
 
 console.log(fail === 0 ? "\nALL PASS" : "\n" + fail + " FAILED");
