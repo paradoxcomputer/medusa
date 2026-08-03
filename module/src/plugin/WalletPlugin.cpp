@@ -3655,6 +3655,27 @@ QString WalletPlugin::getJob(const QString& jobId)
     if (!j)
         return errorJson(QStringLiteral("unknown jobId: ") + jobId.trimmed());
 
+    // SELF-HEAL A QUEUED JOB. A job held behind another is started by startQueuedBehind() from
+    // the ahead job's onJobFinished, with a timer as a backstop. Both are one-shot pushes, and
+    // if either misses the job sits in "queued" forever with no child: observed live, a token
+    // faucet half still queued 13 minutes after its native half had finished and a later
+    // transfer had come and gone, so the module was demonstrably healthy the whole time.
+    //
+    // The push is not the right shape for this. The UI already polls THIS function once a
+    // second for exactly these jobs, so the condition is re-checked here instead: if whatever
+    // it waits for is no longer running (finished, errored, or gone from m_jobs entirely), the
+    // wait is over and the child starts on the very next poll. A pull cannot be missed the way
+    // a single push can, and it needs no new machinery.
+    if (!j->waitFor.isEmpty() && !j->pendingBin.isEmpty() && !j->proc
+        && j->state == QStringLiteral("running")) {
+        const Job* ahead = m_jobs.value(j->waitFor, nullptr);
+        if (!ahead || ahead->state != QStringLiteral("running")) {
+            appendLog(QStringLiteral("job %1 was queued behind %2, which is no longer running: "
+                                     "starting it now").arg(j->id, j->waitFor));
+            startJobProcess(j, j->pendingBin, j->pendingArgs, j->pendingOwnBin);
+        }
+    }
+
     QJsonObject o;
     o[QStringLiteral("jobId")]     = j->id;
     o[QStringLiteral("op")]        = j->op;

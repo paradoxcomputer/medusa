@@ -2426,13 +2426,18 @@ private slots:
             seen << prog;
             if (prog != QStringLiteral("bin")                     // the resolver's own output
                 && prog != QStringLiteral("job->pendingBin")      // …stored, in the cap timer
-                && prog != QStringLiteral("q->pendingBin"))       // …stored, on release
+                && prog != QStringLiteral("q->pendingBin")        // …stored, on release
+                && prog != QStringLiteral("j->pendingBin"))       // …stored, on the getJob self-heal
                 bad << prog;
         }
         QVERIFY2(bad.isEmpty(), qPrintable(QStringLiteral("startJobProcess with an unrecognised "
                                                           "program source: ")
                                            + bad.join(QStringLiteral(", "))));
-        QVERIFY2(seen.size() == 3, qPrintable(QStringLiteral("expected 3 launch sites, found %1")
+        // FOUR now: immediate, the cap timer, startQueuedBehind's release, and the getJob
+        // self-heal. Every one of them still launches the STORED resolver output, which is the
+        // property this guards: a queued job must never re-resolve its program later, or the
+        // binary it finally runs could differ from the one its arguments were built for.
+        QVERIFY2(seen.size() == 4, qPrintable(QStringLiteral("expected 4 launch sites, found %1")
                                                   .arg(seen.size())));
     }
 
