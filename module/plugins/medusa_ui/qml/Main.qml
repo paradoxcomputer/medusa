@@ -379,6 +379,17 @@ Rectangle {
             : "No wallet store is in place yet - run the copy command above, then check again.",
             !root.storeInPlace)
     }
+    // A dApp supplies this icon, and QML's Image FETCHES an http(s) source over the ordinary
+    // network stack, which is not the wallet's Tor circuit. That turns the approval sheet into a
+    // beacon: merely opening it would hand the app's server the user's real IP at the exact
+    // moment they are deciding whether to trust that app, and on a Tor zone it would defeat the
+    // point of the zone. The SDK has always documented this field as a data: URI, so that is the
+    // only thing accepted here; anything else falls back to the generic link glyph.
+    function safeIcon(u) {
+        var s = String(u || "")
+        return s.indexOf("data:image/") === 0 ? s : ""
+    }
+
     function displayId(id) {
         if (!id) return ""
         var s = id
@@ -493,7 +504,7 @@ Rectangle {
         color: Qt.rgba(zoneTagChip.tagColor.r, zoneTagChip.tagColor.g, zoneTagChip.tagColor.b, 0.14)
         border.width: 1
         border.color: Qt.rgba(zoneTagChip.tagColor.r, zoneTagChip.tagColor.g, zoneTagChip.tagColor.b, 0.45)
-        Text {
+        Text { textFormat: Text.PlainText;
             id: zoneTagText
             anchors.centerIn: parent
             text: zoneTagChip.tag
@@ -2625,13 +2636,13 @@ Rectangle {
                             NumberAnimation { to: 1.0; duration: 500 }
                         }
                     }
-                    Text { font.family: root.faceFont; font.pixelSize: 11; color: root.textPrimary
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; font.pixelSize: 11; color: root.textPrimary
                         text: root.zoneName(root.network) }
                     ZoneTag { tag: root.zoneTagOf(root.network); tagColor: root.zoneTagColorOf(root.network)
                               face: root.faceFont; Layout.alignment: Qt.AlignVCenter }
-                    Text { font.family: root.faceFont; font.pixelSize: 10; color: root.connectGray
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; font.pixelSize: 10; color: root.connectGray
                         visible: root.seqStatus === "starting"; text: "· Connecting…" }
-                    Text { font.family: root.faceFont; font.pixelSize: 9; color: root.textDisabled; text: "▾" }
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; font.pixelSize: 9; color: root.textDisabled; text: "▾" }
                 }
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.screen = (root.screen === "network" ? "main" : "network") }
             }
@@ -2653,9 +2664,9 @@ Rectangle {
                         color: root.avatarColor(root.selectedFromId)
                         border.color: root.selectedFromType === "private" ? root.accentOrange : root.borderColor
                     }
-                    Text { font.family: root.faceFont; font.pixelSize: 11; color: root.textPrimary
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; font.pixelSize: 11; color: root.textPrimary
                         text: root.selectedFromId.length > 0 ? root.selectedAcctName() : "No account" }
-                    Text { font.family: root.faceFont; font.pixelSize: 9; color: root.textDisabled; text: "▾" }
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; font.pixelSize: 9; color: root.textDisabled; text: "▾" }
                 }
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.screen = (root.screen === "accounts" ? "main" : "accounts") }
             }
@@ -2668,7 +2679,7 @@ Rectangle {
                 width: 30; height: 30; radius: 15; color: "transparent"
                 border.color: lockBtnMa.containsMouse ? root.brandRedHover : root.brandRed
                 border.width: 1
-                Text { font.family: root.faceFont; anchors.centerIn: parent; text: "🔒"; font.pixelSize: 13
+                Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent; text: "🔒"; font.pixelSize: 13
                     color: lockBtnMa.containsMouse ? root.brandRedHover : root.brandRed }
                 MouseArea { id: lockBtnMa; anchors.fill: parent; hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor; onClicked: root.lockWallet() }
@@ -2682,7 +2693,7 @@ Rectangle {
                 border.width: 1
                 // Locked: reliable 🔒 emoji (tinted by font colour). Unlocked: a real key SVG,
                 // colourized to the SAME crimson/active expression (exotic key glyphs tofu'd).
-                Text { font.family: root.faceFont;
+                Text { textFormat: Text.PlainText; font.family: root.faceFont;
                     visible: root.walletLocked
                     anchors.centerIn: parent; text: "🔒"; font.pixelSize: 14
                     color: root.screen === "security" ? root.brandRedHover : root.errorRed
@@ -2705,7 +2716,7 @@ Rectangle {
             Rectangle {
                 width: 30; height: 30; radius: 15; color: "transparent"
                 border.color: root.screen === "settings" ? root.brandRedHover : root.brandRed; border.width: 1
-                Text { font.family: root.faceFont; anchors.centerIn: parent; text: "⚙"; font.pixelSize: 14; color: root.screen === "settings" ? root.brandRedHover : root.brandRed }
+                Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent; text: "⚙"; font.pixelSize: 14; color: root.screen === "settings" ? root.brandRedHover : root.brandRed }
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.screen = (root.screen === "settings" ? "main" : "settings") }
             }
         }
@@ -2729,12 +2740,12 @@ Rectangle {
                 id: unprotRow
                 anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter; leftMargin: 12; rightMargin: 12 }
                 spacing: 10
-                Text { text: "⚠"; color: root.warningAmber; font.pixelSize: 14; Layout.alignment: Qt.AlignTop; Layout.topMargin: 1 }
+                Text { textFormat: Text.PlainText; text: "⚠"; color: root.warningAmber; font.pixelSize: 14; Layout.alignment: Qt.AlignTop; Layout.topMargin: 1 }
                 ColumnLayout {
                     Layout.fillWidth: true; spacing: 2
-                    Text { Layout.fillWidth: true; font.family: root.faceFont; font.pixelSize: 11; font.bold: true
+                    Text { textFormat: Text.PlainText; Layout.fillWidth: true; font.family: root.faceFont; font.pixelSize: 11; font.bold: true
                         color: root.textPrimary; elide: Text.ElideRight; text: "This wallet is not encrypted" }
-                    Text { Layout.fillWidth: true; wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                    Text { textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.WrapAtWordBoundaryOrAnywhere
                         font.family: root.faceFont; font.pixelSize: 9; color: root.textSecondary
                         maximumLineCount: 4; elide: Text.ElideRight
                         text: (root.protectionWarning.length > 0 ? root.protectionWarning
@@ -2747,7 +2758,7 @@ Rectangle {
                     Layout.preferredWidth: 104; Layout.preferredHeight: 26; radius: 8
                     color: unprotMa.containsMouse ? root.hoverWash : "transparent"
                     border.color: root.warningAmber; border.width: 1
-                    Text { anchors.centerIn: parent; text: "Set a password"; color: root.textPrimary
+                    Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "Set a password"; color: root.textPrimary
                         font.family: root.faceFont; font.pixelSize: 10 }
                     MouseArea { id: unprotMa; anchors.fill: parent; hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor; onClicked: root.screen = "security" }
@@ -2772,12 +2783,12 @@ Rectangle {
                 id: seqProbRow
                 anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter; leftMargin: 12; rightMargin: 12 }
                 spacing: 10
-                Text { text: "⚠"; color: root.errorRed; font.pixelSize: 14; Layout.alignment: Qt.AlignTop; Layout.topMargin: 1 }
+                Text { textFormat: Text.PlainText; text: "⚠"; color: root.errorRed; font.pixelSize: 14; Layout.alignment: Qt.AlignTop; Layout.topMargin: 1 }
                 ColumnLayout {
                     Layout.fillWidth: true; spacing: 2
-                    Text { Layout.fillWidth: true; font.family: root.faceFont; font.pixelSize: 11; font.bold: true
+                    Text { textFormat: Text.PlainText; Layout.fillWidth: true; font.family: root.faceFont; font.pixelSize: 11; font.bold: true
                         color: root.textPrimary; elide: Text.ElideRight; text: root.seqProblemTitle() }
-                    Text { Layout.fillWidth: true; wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                    Text { textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.WrapAtWordBoundaryOrAnywhere
                         font.family: root.faceFont; font.pixelSize: 9; color: root.textSecondary
                         maximumLineCount: 3; elide: Text.ElideRight; text: root.seqProblemBody() }
                 }
@@ -2785,7 +2796,7 @@ Rectangle {
                     Layout.preferredWidth: 92; Layout.preferredHeight: 26; radius: 8
                     color: seqProbZoneMa.containsMouse ? root.hoverWash : "transparent"
                     border.color: root.borderStrong; border.width: 1
-                    Text { anchors.centerIn: parent; text: "Switch zone"; color: root.textPrimary
+                    Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "Switch zone"; color: root.textPrimary
                         font.family: root.faceFont; font.pixelSize: 10 }
                     MouseArea { id: seqProbZoneMa; anchors.fill: parent; hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor; onClicked: root.screen = "network" }
@@ -2821,9 +2832,9 @@ Rectangle {
                 RowLayout {   // back header
                     Layout.fillWidth: true; spacing: 6
                     Rectangle { width: 26; height: 24; radius: 10; color: "transparent"; border.color: root.borderColor
-                        Text { anchors.centerIn: parent; text: "←"; color: root.textSecondary; font.pixelSize: 13; font.family: root.faceFont }
+                        Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "←"; color: root.textSecondary; font.pixelSize: 13; font.family: root.faceFont }
                         MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.screen = "main" } }
-                    Text { font.family: root.faceFont; text: "Security & Backup"; color: root.textPrimary; font.pixelSize: 13; font.bold: true }
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Security & Backup"; color: root.textPrimary; font.pixelSize: 13; font.bold: true }
                     Item { Layout.fillWidth: true }
                 }
 
@@ -2850,12 +2861,12 @@ Rectangle {
                 ColumnLayout {
                     visible: root.displacedStores.length > 0
                     Layout.fillWidth: true; spacing: 4
-                    Text { font.family: root.faceFont;
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont;
                         text: "Previous wallet storage kept on disk"
                         color: root.textSecondary; font.pixelSize: 10; font.bold: true
                         wrapMode: Text.WordWrap; Layout.fillWidth: true
                     }
-                    Text { font.family: root.faceFont;
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont;
                         text: "Nothing here is ever deleted. If the wallet in front of you is not "
                             + "the one you expect, one of these is probably it."
                         color: root.textDisabled; font.pixelSize: 9; wrapMode: Text.WordWrap; Layout.fillWidth: true
@@ -2870,7 +2881,7 @@ Rectangle {
 
                             RowLayout {
                                 Layout.fillWidth: true; spacing: 6
-                                Text { font.family: root.faceFont;
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                     text: dsRow.modelData; color: root.textDisabled; font.pixelSize: 9
                                     elide: Text.ElideMiddle; Layout.fillWidth: true
                                     MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
@@ -2880,7 +2891,7 @@ Rectangle {
                                 Rectangle {
                                     Layout.preferredWidth: 74; height: 22; radius: 10
                                     color: "transparent"; border.color: root.accentOrange
-                                    Text { font.family: root.faceFont; anchors.centerIn: parent
+                                    Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent
                                         text: dsRow.open ? "Close" : "Put back"
                                         color: root.accentOrange; font.pixelSize: 9 }
                                     MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
@@ -2897,14 +2908,14 @@ Rectangle {
                                 visible: dsRow.open
                                 Layout.fillWidth: true; Layout.leftMargin: 8; spacing: 4
 
-                                Text { font.family: root.faceFont;
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                     text: root.displacedWhat(dsRow.modelData)
                                     color: root.textSecondary; font.pixelSize: 9
                                     wrapMode: Text.WordWrap; Layout.fillWidth: true
                                 }
 
                                 // Step 1 - free the slot, using the core's own non-destructive move.
-                                Text { font.family: root.faceFont;
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                     text: root.storeInPlace
                                         ? "1. A wallet is in place right now. Move it aside first: it is renamed, "
                                           + "never deleted, and it appears in this list too, so this is reversible."
@@ -2916,7 +2927,7 @@ Rectangle {
                                     visible: root.storeInPlace
                                     Layout.preferredWidth: 188; height: 22; radius: 10
                                     color: "transparent"; border.color: root.errorRed
-                                    Text { font.family: root.faceFont; anchors.centerIn: parent
+                                    Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent
                                         text: root.restoreAsideArmed ? "Tap again to move it aside"
                                                                      : "Move the current wallet aside"
                                         color: root.errorRed; font.pixelSize: 9 }
@@ -2926,7 +2937,7 @@ Rectangle {
                                 }
 
                                 // Step 2 - the copy. Handed over verbatim, not faked with a button.
-                                Text { font.family: root.faceFont;
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                     text: "2. Copy the file back. Medusa moves stores aside but has no verb that "
                                         + "puts one back, so this step is yours. `cp -n` refuses rather than "
                                         + "overwrites, so it cannot destroy anything:"
@@ -2937,7 +2948,7 @@ Rectangle {
                                     Layout.fillWidth: true
                                     implicitHeight: dsCmd.implicitHeight + 10
                                     color: root.inputBg; border.color: root.borderColor; radius: 8
-                                    Text { font.family: root.monoFont
+                                    Text { textFormat: Text.PlainText; font.family: root.monoFont
                                         id: dsCmd
                                         anchors { left: parent.left; right: parent.right
                                                   verticalCenter: parent.verticalCenter
@@ -2955,7 +2966,7 @@ Rectangle {
                                 // Step 3 - re-ask the core instead of assuming it worked.
                                 RowLayout {
                                     Layout.fillWidth: true; spacing: 6
-                                    Text { font.family: root.faceFont;
+                                    Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                         text: "3. Then check again. This re-reads the wallet from disk and drops "
                                             + "any session, so an encrypted store will ask for its password; an "
                                             + "unencrypted one warns and offers to encrypt itself."
@@ -2965,7 +2976,7 @@ Rectangle {
                                     Rectangle {
                                         Layout.preferredWidth: 84; height: 22; radius: 10
                                         color: "transparent"; border.color: root.accentOrange
-                                        Text { font.family: root.faceFont; anchors.centerIn: parent
+                                        Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent
                                             text: "Check again"; color: root.accentOrange; font.pixelSize: 9 }
                                         MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                                             onClicked: root.recheckAfterRestore() }
@@ -2975,7 +2986,7 @@ Rectangle {
                                 // The in-app alternative that needs no file copy at all. Only an
                                 // UNENCRYPTED copy can be read this way, which is exactly the file
                                 // an ungated encryptPlaintextWallet leaves its victim with.
-                                Text { font.family: root.faceFont;
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                     visible: root.displacedKind(dsRow.modelData) === "plain"
                                     text: "Or, without copying anything: it is unencrypted, so open it in a text "
                                         + "editor and paste each account's private key into \"Import a private "
@@ -2983,7 +2994,7 @@ Rectangle {
                                     color: root.textDisabled; font.pixelSize: 9
                                     wrapMode: Text.WordWrap; Layout.fillWidth: true
                                 }
-                                Text { font.family: root.faceFont;
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                     visible: root.displacedKind(dsRow.modelData) === "bak"
                                     text: "Or, without copying anything: if you have that wallet's recovery phrase, "
                                         + "\"Restore from recovery phrase\" rebuilds the same accounts from it."
@@ -2999,8 +3010,8 @@ Rectangle {
                 ColumnLayout {
                     visible: root.walletState === "new"
                     Layout.fillWidth: true; spacing: 6
-                    Text { font.family: root.faceFont; text: "No wallet yet"; color: root.textPrimary; font.pixelSize: 12; font.bold: true }
-                    Text { font.family: root.faceFont;
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "No wallet yet"; color: root.textPrimary; font.pixelSize: 12; font.bold: true }
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont;
                         text: "Go back and choose a password to create one. If you already have a "
                             + "recovery phrase, create a wallet first and then restore over it here."
                         color: root.textSecondary; font.pixelSize: 10; wrapMode: Text.WordWrap; Layout.fillWidth: true
@@ -3008,7 +3019,7 @@ Rectangle {
                     // Do not send someone who is halfway through putting an old store back off to
                     // create a new one: creating destroys nothing, but it re-fills the slot they
                     // just cleared and they would have to clear it again.
-                    Text { font.family: root.faceFont;
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont;
                         visible: root.restoreCandidate.length > 0
                         text: "You are in the middle of putting a previous store back (above): the "
                             + "slot is free, so run the copy command and press Check again rather "
@@ -3017,7 +3028,7 @@ Rectangle {
                     }
                     Rectangle {
                         Layout.preferredWidth: 124; height: 24; radius: 10; color: "transparent"; border.color: root.brandRed
-                        Text { font.family: root.faceFont; anchors.centerIn: parent; text: "Create a wallet"; color: root.brandRed; font.pixelSize: 10 }
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent; text: "Create a wallet"; color: root.brandRed; font.pixelSize: 10 }
                         MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.screen = "main" }
                     }
                 }
@@ -3034,8 +3045,8 @@ Rectangle {
                 ColumnLayout {
                     visible: root.storeUnprotected
                     Layout.fillWidth: true; spacing: 6
-                    Text { font.family: root.faceFont; text: "⚠ This wallet is not encrypted"; color: root.warningAmber; font.pixelSize: 12; font.bold: true }
-                    Text { font.family: root.faceFont;
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "⚠ This wallet is not encrypted"; color: root.warningAmber; font.pixelSize: 12; font.bold: true }
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont;
                         text: (root.protectionWarning.length > 0 ? root.protectionWarning
                                 : "Its storage has no password on it, so every key in it can be read "
                                 + "by any program running as you, and no password can change that.")
@@ -3055,7 +3066,7 @@ Rectangle {
                                 verticalAlignment: TextInput.AlignVCenter; echoMode: TextInput.Password
                                 color: root.textPrimary; font.pixelSize: 11; clip: true
                                 onAccepted: root.doSecureWallet(text)
-                                Text { font.family: root.faceFont;
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                     anchors.fill: parent; verticalAlignment: Text.AlignVCenter
                                     text: parent.text.length === 0 ? "choose a password" : ""
                                     color: root.textDisabled; font.pixelSize: 11
@@ -3068,14 +3079,14 @@ Rectangle {
                                  : secEncMa.containsMouse ? root.brandRedHover : root.brandRed
                             border.color: root.brandRed
                             Behavior on color { ColorAnimation { duration: root.motionQuick } }
-                            Text { font.family: root.faceFont; anchors.centerIn: parent
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent
                                 text: root.secBusy === "Encrypting" ? "…" : "Set password"
                                 color: root.textPrimary; font.pixelSize: 11 }
                             MouseArea { id: secEncMa; anchors.fill: parent; hoverEnabled: true
                                 cursorShape: Qt.PointingHandCursor; onClicked: root.doSecureWallet(secEncryptPw.text) }
                         }
                     }
-                    Text { font.family: root.faceFont;
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont;
                         text: "The unencrypted store is copied aside first and put back untouched if "
                             + "the encrypted one will not open, so this is reversible. A wallet saved "
                             + "this way never held a recovery phrase, so none is shown - back it up "
@@ -3084,13 +3095,13 @@ Rectangle {
                     }
                     RowLayout {
                         Layout.fillWidth: true; spacing: 6
-                        Text { font.family: root.faceFont;
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont;
                             text: "Not your wallet, or you would rather start clean?"
                             color: root.textDisabled; font.pixelSize: 9; wrapMode: Text.WordWrap; Layout.fillWidth: true
                         }
                         Rectangle {
                             Layout.preferredWidth: 124; height: 22; radius: 10; color: "transparent"; border.color: root.errorRed
-                            Text { font.family: root.faceFont;
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                 anchors.centerIn: parent
                                 text: root.resetArmed ? "Tap again to erase" : "Erase & start over"
                                 color: root.errorRed; font.pixelSize: 9
@@ -3107,8 +3118,8 @@ Rectangle {
                 ColumnLayout {
                     visible: root.walletState === "locked"
                     Layout.fillWidth: true; spacing: 6
-                    Text { font.family: root.faceFont; text: "🔒 Wallet is locked"; color: root.errorRed; font.pixelSize: 12; font.bold: true }
-                    Text { font.family: root.faceFont;
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "🔒 Wallet is locked"; color: root.errorRed; font.pixelSize: 12; font.bold: true }
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont;
                         text: "Enter your password to unlock the encrypted wallet."
                         color: root.textSecondary; font.pixelSize: 10; wrapMode: Text.WordWrap; Layout.fillWidth: true
                     }
@@ -3130,7 +3141,7 @@ Rectangle {
                                  : secUnlockMa.containsMouse ? root.brandRedHover : root.brandRed
                             border.color: root.brandRed
                             Behavior on color { ColorAnimation { duration: root.motionQuick } }
-                            Text { font.family: root.faceFont; anchors.centerIn: parent; text: root.secBusy === "Unlocking" ? "…" : "Unlock"; color: root.textPrimary; font.pixelSize: 11 }
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent; text: root.secBusy === "Unlocking" ? "…" : "Unlock"; color: root.textPrimary; font.pixelSize: 11 }
                             MouseArea { id: secUnlockMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.doUnlock(unlockField.text) }
                         }
                     }
@@ -3143,9 +3154,9 @@ Rectangle {
                     // credential there, and it moves the outgoing store aside rather than deleting
                     // it); without this the only route was Erase → create a throwaway wallet →
                     // restore over it, which asks a frightened user to erase first.
-                    Text { font.family: root.faceFont; text: "Restore from your recovery phrase"
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Restore from your recovery phrase"
                         color: root.textSecondary; font.pixelSize: 10 }
-                    Text { font.family: root.faceFont;
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont;
                         text: "Replaces the wallet on this machine with the one your phrase derives. "
                             + "The current storage is kept aside, never deleted."
                         color: root.textDisabled; font.pixelSize: 9; wrapMode: Text.WordWrap; Layout.fillWidth: true
@@ -3170,7 +3181,7 @@ Rectangle {
                                 anchors { fill: parent; leftMargin: 6; rightMargin: 6 }
                                 verticalAlignment: TextInput.AlignVCenter; echoMode: TextInput.Password
                                 color: root.textPrimary; font.pixelSize: 10; clip: true
-                                Text { font.family: root.faceFont;
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                     anchors.fill: parent; verticalAlignment: Text.AlignVCenter
                                     text: parent.text.length === 0 ? "new password" : ""
                                     color: root.textDisabled; font.pixelSize: 10
@@ -3179,7 +3190,7 @@ Rectangle {
                         }
                         Rectangle {
                             Layout.preferredWidth: 74; height: 26; radius: 10; color: "transparent"; border.color: root.accentOrange
-                            Text { font.family: root.faceFont; anchors.centerIn: parent
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent
                                 text: root.secBusy === "Restoring" ? "…" : "Restore"
                                 color: root.accentOrange; font.pixelSize: 10 }
                             MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
@@ -3190,13 +3201,13 @@ Rectangle {
                     // Escape hatch - forgotten password, no phrase either → start over.
                     RowLayout {
                         Layout.fillWidth: true; spacing: 6
-                        Text { font.family: root.faceFont;
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont;
                             text: "No phrase either, or it isn't your wallet?"
                             color: root.textDisabled; font.pixelSize: 9; wrapMode: Text.WordWrap; Layout.fillWidth: true
                         }
                         Rectangle {
                             Layout.preferredWidth: 124; height: 22; radius: 10; color: "transparent"; border.color: root.errorRed
-                            Text { font.family: root.faceFont;
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                 anchors.centerIn: parent
                                 text: root.resetArmed ? "Tap again to erase" : "Erase & start over"
                                 color: root.errorRed; font.pixelSize: 9
@@ -3217,8 +3228,8 @@ Rectangle {
                     visible: root.walletState === "ready"
                     Layout.fillWidth: true; spacing: 8
 
-                    Text { font.family: root.faceFont; text: "SECURITY & BACKUP"; color: root.brandRed; font.pixelSize: 9; font.bold: true; font.letterSpacing: 1.2 }
-                    Text { font.family: root.faceFont;
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "SECURITY & BACKUP"; color: root.brandRed; font.pixelSize: 9; font.bold: true; font.letterSpacing: 1.2 }
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont;
                         text: "Never share your recovery phrase or private keys - anyone with them controls your funds."
                         color: root.textDisabled; font.pixelSize: 9; wrapMode: Text.WordWrap; Layout.fillWidth: true
                     }
@@ -3235,7 +3246,7 @@ Rectangle {
                     // replaced by the truth and by the route that changes it.
                     RowLayout {
                         Layout.fillWidth: true; spacing: 6
-                        Text { font.family: root.faceFont; Layout.fillWidth: true
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont; Layout.fillWidth: true
                             color: root.textDisabled; font.pixelSize: 9; wrapMode: Text.WordWrap
                             text: root.signingBlocked
                                 ? "Not unlocked, and it cannot be: this store has no password on it, "
@@ -3253,7 +3264,7 @@ Rectangle {
                             Layout.preferredWidth: 84; height: 22; radius: 10
                             color: "transparent"
                             border.color: secLockMa.containsMouse ? root.brandRedHover : root.brandRed
-                            Text { font.family: root.faceFont; anchors.centerIn: parent
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent
                                 text: "Lock now"; color: root.brandRed; font.pixelSize: 9 }
                             MouseArea { id: secLockMa; anchors.fill: parent; hoverEnabled: true
                                 cursorShape: Qt.PointingHandCursor; onClicked: root.lockWallet() }
@@ -3275,7 +3286,7 @@ Rectangle {
                     // phrase" and got a refusal on the same screen that had just told them they
                     // were "Unlocked". They are disabled instead, with the reason and the route on
                     // the button's own row, and they come back the moment the store is migrated.
-                    Text { font.family: root.faceFont;
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont;
                         visible: root.signingBlocked
                         text: "Revealing the recovery phrase or a private key needs a wallet that can "
                             + "prove who is asking, so both are disabled while this store has no "
@@ -3294,13 +3305,13 @@ Rectangle {
                         Layout.fillWidth: true; spacing: 6
                         Rectangle {
                             Layout.preferredWidth: 160; height: 26; radius: 10; color: "transparent"; border.color: root.borderColor
-                            Text { font.family: root.faceFont; anchors.centerIn: parent; text: "Reveal recovery phrase"; color: root.textSecondary; font.pixelSize: 10 }
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent; text: "Reveal recovery phrase"; color: root.textSecondary; font.pixelSize: 10 }
                             MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.doExportMnemonic() }
                         }
                         Rectangle {
                             visible: root.exportedMnemonic.length > 0
                             Layout.preferredWidth: 52; height: 26; radius: 10; color: "transparent"; border.color: root.borderColor
-                            Text { font.family: root.faceFont; anchors.centerIn: parent; text: root.revealMnemonic ? "Hide" : "Show"; color: root.textSecondary; font.pixelSize: 10 }
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent; text: root.revealMnemonic ? "Hide" : "Show"; color: root.textSecondary; font.pixelSize: 10 }
                             MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.revealMnemonic = !root.revealMnemonic }
                         }
                         Item { Layout.fillWidth: true }
@@ -3309,7 +3320,7 @@ Rectangle {
                         visible: root.exportedMnemonic.length > 0 && root.revealMnemonic
                         Layout.fillWidth: true; height: phraseText.implicitHeight + 12
                         color: root.inputBg; border.color: root.borderColor; radius: 8
-                        Text { font.family: root.faceFont;
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont;
                             id: phraseText
                             anchors { fill: parent; margins: 6 }
                             text: root.exportedMnemonic; color: root.textPrimary
@@ -3326,10 +3337,10 @@ Rectangle {
                         Layout.fillWidth: true; spacing: 6
                         Rectangle {
                             Layout.preferredWidth: 160; height: 26; radius: 10; color: "transparent"; border.color: root.borderColor
-                            Text { font.family: root.faceFont; anchors.centerIn: parent; text: "Export account key"; color: root.textSecondary; font.pixelSize: 10 }
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent; text: "Export account key"; color: root.textSecondary; font.pixelSize: 10 }
                             MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.doExportKey() }
                         }
-                        Text { font.family: root.faceFont;
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont;
                             text: root.selectedFromId.length > 0 ? root.displayId(root.selectedFromId) : "select a public account"
                             color: root.textDisabled; font.pixelSize: 9; elide: Text.ElideMiddle; Layout.fillWidth: true
                         }
@@ -3337,7 +3348,7 @@ Rectangle {
                     Rectangle {
                         visible: root.exportedKey.length > 0
                         Layout.fillWidth: true; height: 26; color: root.inputBg; border.color: root.borderColor; radius: 8
-                        Text { font.family: root.faceFont;
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont;
                             anchors { fill: parent; leftMargin: 6; rightMargin: 6 }
                             verticalAlignment: Text.AlignVCenter
                             text: root.revealKey ? root.exportedKey : "•••••••••••••••• (tap to copy)"
@@ -3353,7 +3364,7 @@ Rectangle {
                     Rectangle { Layout.fillWidth: true; height: 1; color: root.borderColor }
 
                     // Restore from recovery phrase
-                    Text { font.family: root.faceFont; text: "Restore from recovery phrase"; color: root.textSecondary; font.pixelSize: 10 }
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Restore from recovery phrase"; color: root.textSecondary; font.pixelSize: 10 }
                     Rectangle {
                         Layout.fillWidth: true; height: 46; color: root.inputBg
                         border.color: restorePhrase.activeFocus ? root.accentOrange : root.borderColor; radius: 8
@@ -3372,7 +3383,7 @@ Rectangle {
                                 anchors { fill: parent; leftMargin: 6; rightMargin: 6 }
                                 verticalAlignment: TextInput.AlignVCenter; echoMode: TextInput.Password
                                 color: root.textPrimary; font.pixelSize: 10; clip: true
-                                Text { font.family: root.faceFont;
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                     anchors.fill: parent; verticalAlignment: Text.AlignVCenter
                                     text: parent.text.length === 0 ? "new password" : ""
                                     color: root.textDisabled; font.pixelSize: 10
@@ -3390,13 +3401,13 @@ Rectangle {
                         }
                         Rectangle {
                             Layout.preferredWidth: 74; height: 26; radius: 10; color: "transparent"; border.color: root.accentOrange
-                            Text { font.family: root.faceFont; anchors.centerIn: parent; text: root.secBusy === "Restoring" ? "…" : "Restore"; color: root.accentOrange; font.pixelSize: 10 }
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent; text: root.secBusy === "Restoring" ? "…" : "Restore"; color: root.accentOrange; font.pixelSize: 10 }
                             MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.doRestore(restorePhrase.text, restorePw.text, parseInt(restoreDepth.text, 10) || 5) }
                         }
                     }
 
                     // Import a private key
-                    Text { font.family: root.faceFont; text: "Import a private key"; color: root.textSecondary; font.pixelSize: 10 }
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Import a private key"; color: root.textSecondary; font.pixelSize: 10 }
                     RowLayout {
                         Layout.fillWidth: true; spacing: 6
                         Rectangle {
@@ -3406,7 +3417,7 @@ Rectangle {
                                 anchors { fill: parent; leftMargin: 6; rightMargin: 6 }
                                 verticalAlignment: TextInput.AlignVCenter
                                 color: root.textPrimary; font.pixelSize: 10; clip: true
-                                Text { font.family: root.faceFont;
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                     anchors.fill: parent; verticalAlignment: Text.AlignVCenter
                                     text: parent.text.length === 0 ? "64-char hex private key" : ""
                                     color: root.textDisabled; font.pixelSize: 10;                                }
@@ -3419,7 +3430,7 @@ Rectangle {
                                 anchors { fill: parent; leftMargin: 6; rightMargin: 6 }
                                 verticalAlignment: TextInput.AlignVCenter
                                 color: root.textPrimary; font.pixelSize: 10; clip: true
-                                Text { font.family: root.faceFont;
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                     anchors.fill: parent; verticalAlignment: Text.AlignVCenter
                                     text: parent.text.length === 0 ? "label" : ""
                                     color: root.textDisabled; font.pixelSize: 10
@@ -3428,7 +3439,7 @@ Rectangle {
                         }
                         Rectangle {
                             Layout.preferredWidth: 64; height: 26; radius: 10; color: "transparent"; border.color: root.accentOrange
-                            Text { font.family: root.faceFont; anchors.centerIn: parent; text: root.secBusy === "Importing" ? "…" : "Import"; color: root.accentOrange; font.pixelSize: 10 }
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent; text: root.secBusy === "Importing" ? "…" : "Import"; color: root.accentOrange; font.pixelSize: 10 }
                             MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.doImportKey(importKeyField.text, importLabelField.text) }
                         }
                     }
@@ -3453,13 +3464,13 @@ Rectangle {
                 RowLayout {   // back header
                     Layout.fillWidth: true; spacing: 6
                     Rectangle { width: 26; height: 24; radius: 10; color: "transparent"; border.color: root.borderColor
-                        Text { anchors.centerIn: parent; text: "←"; color: root.textSecondary; font.pixelSize: 13; font.family: root.faceFont }
+                        Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "←"; color: root.textSecondary; font.pixelSize: 13; font.family: root.faceFont }
                         MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.screen = "main" } }
-                    Text { font.family: root.faceFont; text: "Settings"; color: root.textPrimary; font.pixelSize: 13; font.bold: true }
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Settings"; color: root.textPrimary; font.pixelSize: 13; font.bold: true }
                     Item { Layout.fillWidth: true }
                 }
 
-                Text { font.family: root.faceFont; text: "Wallet CLI"; color: root.textSecondary; font.pixelSize: 10 }
+                Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Wallet CLI"; color: root.textSecondary; font.pixelSize: 10 }
                 // READ-ONLY on purpose. A stored CLI path was code execution plus password
                 // capture that outlived both a reboot and the module that planted it, so the core
                 // no longer reads the setting and setCliPath always refuses ("not-supported").
@@ -3468,7 +3479,7 @@ Rectangle {
                 Rectangle {
                     Layout.fillWidth: true; height: 26; color: root.inputBg
                     border.color: root.borderColor; radius: 8
-                    Text { font.family: root.faceFont;
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont;
                         id: cliPathField
                         anchors { fill: parent; leftMargin: 6; rightMargin: 6 }
                         verticalAlignment: Text.AlignVCenter
@@ -3482,7 +3493,7 @@ Rectangle {
                                      clipHelper.copy(); root.logActivity("Wallet CLI path copied", false) }
                     }
                 }
-                Text { font.family: root.faceFont
+                Text { textFormat: Text.PlainText; font.family: root.faceFont
                     visible: !root.cliFound
                     text: "This binary is missing, so no wallet operation can run. Reinstall the "
                         + "medusa_core module, or set MEDUSA_WALLET_CLI to a wallet binary in the "
@@ -3496,7 +3507,7 @@ Rectangle {
                     Layout.fillWidth: true
                     implicitHeight: cliIgnoredTxt.implicitHeight + 14
                     radius: 8; color: root.errorTint; border.color: root.errorRed; border.width: 1
-                    Text {
+                    Text { textFormat: Text.PlainText;
                         id: cliIgnoredTxt
                         anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter
                                   leftMargin: 8; rightMargin: 8 }
@@ -3508,12 +3519,12 @@ Rectangle {
                             + "MEDUSA_WALLET_CLI to point at a different build."
                     }
                 }
-                Text { font.family: root.faceFont
+                Text { textFormat: Text.PlainText; font.family: root.faceFont
                     text: "The wallet CLI is not configurable from here - medusa runs the binary "
                         + "bundled with the module. Set MEDUSA_WALLET_CLI before launching to use "
                         + "a different build."
                     color: root.textDisabled; font.pixelSize: 9; wrapMode: Text.WordWrap; Layout.fillWidth: true }
-                Text { font.family: root.faceFont
+                Text { textFormat: Text.PlainText; font.family: root.faceFont
                     text: "The network connection is configured per-zone - switch or add zones from the network selector at the top."
                     color: root.textDisabled; font.pixelSize: 9; wrapMode: Text.WordWrap; Layout.fillWidth: true }
             }
@@ -3541,14 +3552,14 @@ Rectangle {
                 RowLayout {
                     Layout.fillWidth: true; spacing: 6
                     Rectangle { width: 26; height: 24; radius: 10; color: "transparent"; border.color: root.borderColor
-                        Text { anchors.centerIn: parent; text: "←"; color: root.textSecondary; font.pixelSize: 13; font.family: root.faceFont }
+                        Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "←"; color: root.textSecondary; font.pixelSize: 13; font.family: root.faceFont }
                         MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.screen = "main" } }
-                    Text { font.family: root.faceFont; text: "Accounts"; color: root.textPrimary; font.pixelSize: 13; font.bold: true }
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Accounts"; color: root.textPrimary; font.pixelSize: 13; font.bold: true }
                     Item { Layout.fillWidth: true }
                     Rectangle {   // sync private balances
                         width: 22; height: 18; radius: 10; color: "transparent"
                         border.color: root.syncBusy ? root.accentOrange : root.borderColor
-                        Text { font.family: root.faceFont; anchors.centerIn: parent; text: "⟳"
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent; text: "⟳"
                             color: root.syncBusy ? root.accentOrange : root.textSecondary; font.pixelSize: 11
                             SequentialAnimation on opacity { running: root.syncBusy; loops: Animation.Infinite
                                 NumberAnimation { to: 0.3; duration: 400 } NumberAnimation { to: 1.0; duration: 400 } } }
@@ -3565,7 +3576,7 @@ Rectangle {
                     section.property: "type"
                     section.delegate: RowLayout {
                         width: accountListView.width; height: 20; spacing: 6
-                        Text { font.family: root.faceFont; text: section === "public" ? "PUBLIC" : "PRIVATE"
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont; text: section === "public" ? "PUBLIC" : "PRIVATE"
                             color: root.textDisabled; font.pixelSize: 9; font.bold: true; font.letterSpacing: 1.2; Layout.leftMargin: 2 }
                         Rectangle { Layout.fillWidth: true; height: 1; color: root.borderColor }
                     }
@@ -3614,18 +3625,18 @@ Rectangle {
                                         font.family: root.faceFont; font.pixelSize: 11; color: root.textPrimary; clip: true
                                         onVisibleChanged: if (visible) { text = name; forceActiveFocus(); selectAll() }
                                         onAccepted: root.renameAccount(id, text)
-                                        Text { anchors.fill: parent; verticalAlignment: Text.AlignVCenter
+                                        Text { textFormat: Text.PlainText; anchors.fill: parent; verticalAlignment: Text.AlignVCenter
                                             text: parent.text.length === 0 ? "account name" : ""
                                             color: root.textDisabled; font.pixelSize: 11; font.family: root.faceFont } }
                                 }
-                                Text { visible: !renaming; font.family: root.faceFont; text: root.acctTitle(id, name)
+                                Text { textFormat: Text.PlainText; visible: !renaming; font.family: root.faceFont; text: root.acctTitle(id, name)
                                     color: root.selectedFromId === id ? root.textPrimary : root.textSecondary
                                     font.pixelSize: 11; font.bold: name.length > 0; Layout.fillWidth: true; elide: Text.ElideMiddle }
                                 // subtitle: short id (when a name is shown) + balance
                                 RowLayout { visible: !renaming; Layout.fillWidth: true; spacing: 6
-                                    Text { font.family: root.faceFont; visible: name.length > 0; text: root.displayId(id)
+                                    Text { textFormat: Text.PlainText; font.family: root.faceFont; visible: name.length > 0; text: root.displayId(id)
                                         color: root.textDisabled; font.pixelSize: 8 }
-                                    Text { font.family: root.faceFont; visible: balance !== "" && balance !== "-"
+                                    Text { textFormat: Text.PlainText; font.family: root.faceFont; visible: balance !== "" && balance !== "-"
                                         text: balance + " LEZ"
                                         color: root.selectedFromId === id ? root.accentOrange : root.textDisabled; font.pixelSize: 9 }
                                     Item { Layout.fillWidth: true } }
@@ -3634,7 +3645,7 @@ Rectangle {
                             Rectangle { Layout.preferredWidth: 24; height: 24; radius: 8
                                 color: renaming ? root.accentTint14 : "transparent"
                                 border.color: renaming ? root.accentOrange : root.borderColor
-                                Text { anchors.centerIn: parent; text: renaming ? "✓" : "✎"
+                                Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: renaming ? "✓" : "✎"
                                     color: renaming ? root.accentOrange : root.silver; font.pixelSize: 11; font.family: root.faceFont }
                                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                                     onClicked: { if (renaming) root.renameAccount(id, renameField.text); else root.renamingAcctId = id } }
@@ -3647,7 +3658,7 @@ Rectangle {
                     Layout.fillWidth: true; spacing: 6
                     Rectangle {
                         Layout.fillWidth: true; height: 30; radius: 10; color: "transparent"; border.color: root.accentOrange
-                        Text { font.family: root.faceFont; anchors.centerIn: parent; text: "+ Public account"; color: root.accentOrange; font.pixelSize: 11 }
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent; text: "+ Public account"; color: root.accentOrange; font.pixelSize: 11 }
                         MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                             onClicked: {
                                 root.logActivity("Creating public account…", false)
@@ -3658,7 +3669,7 @@ Rectangle {
                     }
                     Rectangle {
                         Layout.fillWidth: true; height: 30; radius: 10; color: "transparent"; border.color: root.borderColor
-                        Text { font.family: root.faceFont; anchors.centerIn: parent; text: "+ Private account"; color: root.textSecondary; font.pixelSize: 11 }
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent; text: "+ Private account"; color: root.textSecondary; font.pixelSize: 11 }
                         MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.createPrivateAccount() }
                     }
                 }
@@ -3684,9 +3695,9 @@ Rectangle {
                 RowLayout {   // back header
                     Layout.fillWidth: true; spacing: 6
                     Rectangle { width: 26; height: 24; radius: 10; color: "transparent"; border.color: root.borderColor
-                        Text { anchors.centerIn: parent; text: "←"; color: root.textSecondary; font.pixelSize: 13; font.family: root.faceFont }
+                        Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "←"; color: root.textSecondary; font.pixelSize: 13; font.family: root.faceFont }
                         MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.screen = "main" } }
-                    Text { font.family: root.faceFont; text: "Zones"; color: root.textPrimary; font.pixelSize: 13; font.bold: true }
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Zones"; color: root.textPrimary; font.pixelSize: 13; font.bold: true }
                     Item { Layout.fillWidth: true }
                 }
                 Repeater {
@@ -3708,26 +3719,26 @@ Rectangle {
                                 color: root.zoneDotColor(modelData) }
                             ColumnLayout { spacing: 1; Layout.fillWidth: true
                                 RowLayout { spacing: 6; Layout.fillWidth: true
-                                    Text { font.family: root.faceFont; text: modelData.name; color: root.textPrimary; font.pixelSize: 12; font.bold: true }
+                                    Text { textFormat: Text.PlainText; font.family: root.faceFont; text: modelData.name; color: root.textPrimary; font.pixelSize: 12; font.bold: true }
                                     // Two built-in zones are both named "Paradox Computer"; the tag is
                                     // the only thing that tells them apart.
                                     ZoneTag { tag: root.zoneTransportTag(modelData)
                                               tagColor: root.zoneTagColor(root.zoneTransportTag(modelData))
                                               face: root.faceFont }
                                     Item { Layout.fillWidth: true } }
-                                Text { font.family: root.faceFont; text: root.zoneKindDesc(modelData); color: root.textDisabled; font.pixelSize: 9
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont; text: root.zoneKindDesc(modelData); color: root.textDisabled; font.pixelSize: 9
                                     elide: Text.ElideRight; Layout.fillWidth: true } }
-                            Text { visible: root.network === modelData.id; font.family: root.faceFont; text: "✓"; color: root.accentOrange; font.pixelSize: 14 }
+                            Text { textFormat: Text.PlainText; visible: root.network === modelData.id; font.family: root.faceFont; text: "✓"; color: root.accentOrange; font.pixelSize: 14 }
                             // edit (user zones only) - visible "Edit" chip
                             Rectangle { visible: !modelData.builtin; Layout.preferredWidth: 40; height: 24; radius: 8
                                 color: root.selectBg; border.color: root.borderColor; border.width: 1
-                                Text { anchors.centerIn: parent; text: "Edit"; color: root.silver; font.pixelSize: 9; font.family: root.faceFont }
+                                Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "Edit"; color: root.silver; font.pixelSize: 9; font.family: root.faceFont }
                                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                                     onClicked: root.beginEditZone(modelData) } }
                             // remove (user zones only)
                             Rectangle { visible: !modelData.builtin; Layout.preferredWidth: 24; height: 24; radius: 8
                                 color: root.selectBg; border.color: root.borderColor; border.width: 1
-                                Text { anchors.centerIn: parent; text: "✕"; color: root.errorRed; font.pixelSize: 11; font.family: root.faceFont }
+                                Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "✕"; color: root.errorRed; font.pixelSize: 11; font.family: root.faceFont }
                                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                                     onClicked: {
                                         var wasActive = (root.network === modelData.id)
@@ -3748,7 +3759,7 @@ Rectangle {
                 Rectangle {
                     Layout.fillWidth: true; height: 36; radius: 12
                     color: "transparent"; border.color: root.accentOrange
-                    Text { anchors.centerIn: parent; text: root.addZoneOpen ? "Cancel" : "+ Add zone"; color: root.accentOrange; font.pixelSize: 11; font.family: root.faceFont }
+                    Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: root.addZoneOpen ? "Cancel" : "+ Add zone"; color: root.accentOrange; font.pixelSize: 11; font.family: root.faceFont }
                     MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                         onClicked: {
                             if (root.addZoneOpen) { root.addZoneOpen = false; root.editingZoneId = ""; zNameF.text = ""; zEndF.text = "" }
@@ -3758,31 +3769,31 @@ Rectangle {
                 ColumnLayout {
                     visible: root.addZoneOpen
                     Layout.fillWidth: true; spacing: 6
-                    Text { font.family: root.faceFont; Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 9; color: root.textDisabled
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 9; color: root.textDisabled
                         text: root.editingZoneId !== "" ? "Edit this zone's name, endpoint, or transport."
                                                         : "Connect to a shared LEZ zone (someone's sequencer)." }
                     Rectangle { Layout.fillWidth: true; height: 28; radius: 8; color: root.inputBg; border.color: zNameF.activeFocus ? root.accentOrange : root.borderColor
                         TextInput { id: zNameF; anchors { fill: parent; leftMargin: 8; rightMargin: 8 }
                             verticalAlignment: TextInput.AlignVCenter
                             font.family: root.faceFont; font.pixelSize: 11; color: root.textPrimary; clip: true
-                            Text { anchors.fill: parent; verticalAlignment: Text.AlignVCenter; text: parent.text.length === 0 ? "name (e.g. Logos DEX)" : ""; color: root.textDisabled; font.pixelSize: 11; font.family: root.faceFont } } }
+                            Text { textFormat: Text.PlainText; anchors.fill: parent; verticalAlignment: Text.AlignVCenter; text: parent.text.length === 0 ? "name (e.g. Logos DEX)" : ""; color: root.textDisabled; font.pixelSize: 11; font.family: root.faceFont } } }
                     RowLayout { Layout.fillWidth: true; spacing: 8
-                        Text { font.family: root.faceFont; text: "Transport"; color: root.textSecondary; font.pixelSize: 10 }
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Transport"; color: root.textSecondary; font.pixelSize: 10 }
                         Rectangle { id: zTorTog; property bool checked: false   // default: clearnet
                             Layout.preferredWidth: 80; height: 24; radius: 12; color: root.inputBg; border.color: root.borderColor
-                            Text { font.family: root.faceFont; anchors.centerIn: parent; text: parent.checked ? "Tor" : "Direct"; font.pixelSize: 10; color: root.textPrimary }
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent; text: parent.checked ? "Tor" : "Direct"; font.pixelSize: 10; color: root.textPrimary }
                             MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: parent.checked = !parent.checked } }
                         Item { Layout.fillWidth: true } }
                     Rectangle { Layout.fillWidth: true; height: 28; radius: 8; color: root.inputBg; border.color: zEndF.activeFocus ? root.accentOrange : root.borderColor
                         TextInput { id: zEndF; anchors { fill: parent; leftMargin: 8; rightMargin: 8 }
                             verticalAlignment: TextInput.AlignVCenter
                             font.family: root.faceFont; font.pixelSize: 10; color: root.textPrimary; clip: true
-                            Text { anchors.fill: parent; verticalAlignment: Text.AlignVCenter
+                            Text { textFormat: Text.PlainText; anchors.fill: parent; verticalAlignment: Text.AlignVCenter
                                 text: parent.text.length === 0 ? (zTorTog.checked ? "sequencer .onion address" : "https://sequencer.example:3072/") : ""
                                 color: root.textDisabled; font.pixelSize: 10; font.family: root.faceFont } } }
                     Rectangle { Layout.fillWidth: true; height: 32; radius: 10
                         color: root.accentTint14; border.color: root.accentOrange
-                        Text { anchors.centerIn: parent; text: root.editingZoneId !== "" ? "Save changes" : "Add zone"; color: root.accentOrange; font.pixelSize: 11; font.bold: true; font.family: root.faceFont }
+                        Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: root.editingZoneId !== "" ? "Save changes" : "Add zone"; color: root.accentOrange; font.pixelSize: 11; font.bold: true; font.family: root.faceFont }
                         MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                             onClicked: {
                                 var tor = zTorTog.checked
@@ -3809,7 +3820,7 @@ Rectangle {
                             } }
                     }
                 }
-                Text { font.family: root.faceFont; Layout.fillWidth: true; wrapMode: Text.WordWrap
+                Text { textFormat: Text.PlainText; font.family: root.faceFont; Layout.fillWidth: true; wrapMode: Text.WordWrap
                     text: "Your accounts are the same on every zone; balances and tokens are per-zone. The wallet must match the zone's Logos version."
                     color: root.textDisabled; font.pixelSize: 9 }
             }
@@ -3829,12 +3840,12 @@ Rectangle {
                 RowLayout {   // back header
                     Layout.fillWidth: true; spacing: 6
                     Rectangle { width: 26; height: 24; radius: 10; color: "transparent"; border.color: root.borderColor
-                        Text { anchors.centerIn: parent; text: "←"; color: root.textSecondary; font.pixelSize: 13; font.family: root.faceFont }
+                        Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "←"; color: root.textSecondary; font.pixelSize: 13; font.family: root.faceFont }
                         MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.screen = "main" } }
-                    Text { font.family: root.faceFont; text: "Add token"; color: root.textPrimary; font.pixelSize: 13; font.bold: true }
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Add token"; color: root.textPrimary; font.pixelSize: 13; font.bold: true }
                     Item { Layout.fillWidth: true }
                 }
-                Text { font.family: root.faceFont; text: "FROM THE WHITELIST"; color: root.brandRed; font.pixelSize: 9; font.bold: true; font.letterSpacing: 1.2 }
+                Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "FROM THE WHITELIST"; color: root.brandRed; font.pixelSize: 9; font.bold: true; font.letterSpacing: 1.2 }
                 Repeater {
                     model: root.whitelistTokens
                     delegate: Rectangle {
@@ -3845,22 +3856,22 @@ Rectangle {
                             anchors { fill: parent; leftMargin: 10; rightMargin: 10 }
                             spacing: 10
                             Rectangle { width: 26; height: 26; radius: 13; color: root.avatarColor(modelData.def); Layout.alignment: Qt.AlignVCenter
-                                Text { anchors.centerIn: parent; text: modelData.name.substring(0,1); color: root.textPrimary; font.pixelSize: 13; font.bold: true; font.family: root.faceFont } }
+                                Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: modelData.name.substring(0,1); color: root.textPrimary; font.pixelSize: 13; font.bold: true; font.family: root.faceFont } }
                             ColumnLayout { spacing: 0
-                                Text { font.family: root.faceFont; text: modelData.name; color: root.textPrimary; font.pixelSize: 12; font.bold: true }
-                                Text { font.family: root.faceFont; text: root.displayId(modelData.def); color: root.textDisabled; font.pixelSize: 9 } }
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont; text: modelData.name; color: root.textPrimary; font.pixelSize: 12; font.bold: true }
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont; text: root.displayId(modelData.def); color: root.textDisabled; font.pixelSize: 9 } }
                             Item { Layout.fillWidth: true }
                             Rectangle { Layout.preferredWidth: 50; height: 24; radius: 10; color: "transparent"; border.color: root.accentOrange
-                                Text { anchors.centerIn: parent; text: "+ add"; color: root.accentOrange; font.pixelSize: 10; font.family: root.faceFont }
+                                Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "+ add"; color: root.accentOrange; font.pixelSize: 10; font.family: root.faceFont }
                                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                                     onClicked: { root.doAddToken(modelData.def); root.activeTab = "tokens"; root.screen = "main" } } }
                         }
                     }
                 }
-                Text { font.family: root.faceFont; visible: root.whitelistTokens.length === 0; text: "No whitelist configured."; color: root.textDisabled; font.pixelSize: 10 }
+                Text { textFormat: Text.PlainText; font.family: root.faceFont; visible: root.whitelistTokens.length === 0; text: "No whitelist configured."; color: root.textDisabled; font.pixelSize: 10 }
 
                 Rectangle { Layout.fillWidth: true; height: 1; color: root.borderColor }
-                Text { font.family: root.faceFont; text: "OR BY DEFINITION ID"; color: root.textDisabled; font.pixelSize: 9; font.bold: true; font.letterSpacing: 1.2 }
+                Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "OR BY DEFINITION ID"; color: root.textDisabled; font.pixelSize: 9; font.bold: true; font.letterSpacing: 1.2 }
                 RowLayout {
                     Layout.fillWidth: true; spacing: 6
                     Rectangle {
@@ -3868,12 +3879,12 @@ Rectangle {
                         color: root.inputBg; border.color: customTokField.activeFocus ? root.accentOrange : root.borderColor
                         TextInput { id: customTokField; anchors { fill: parent; leftMargin: 8; rightMargin: 8 }
                             verticalAlignment: TextInput.AlignVCenter; font.family: root.faceFont; font.pixelSize: 10; color: root.textPrimary; clip: true
-                            Text { anchors.fill: parent; verticalAlignment: Text.AlignVCenter
+                            Text { textFormat: Text.PlainText; anchors.fill: parent; verticalAlignment: Text.AlignVCenter
                                 text: parent.text.length === 0 ? "paste token definition id…" : ""
                                 color: root.textDisabled; font.pixelSize: 10; font.family: root.faceFont } }
                     }
                     Rectangle { Layout.preferredWidth: 54; height: 28; radius: 10; color: "transparent"; border.color: root.accentOrange
-                        Text { anchors.centerIn: parent; text: "+ add"; color: root.accentOrange; font.pixelSize: 10; font.family: root.faceFont }
+                        Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "+ add"; color: root.accentOrange; font.pixelSize: 10; font.family: root.faceFont }
                         MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                             onClicked: if (customTokField.text.trim().length > 0) { root.doAddToken(customTokField.text.trim()); customTokField.text = ""; root.activeTab = "tokens"; root.screen = "main" } } }
                 }
@@ -3930,12 +3941,12 @@ Rectangle {
                         }
                     }
                 }
-                Text { font.family: root.faceFont;
+                Text { textFormat: Text.PlainText; font.family: root.faceFont;
                     Layout.alignment: Qt.AlignHCenter
                     text: "MEDUSA"; font.pixelSize: 26; font.bold: true; font.letterSpacing: 7
                     color: root.textPrimary
                 }
-                Text { font.family: root.faceFont;
+                Text { textFormat: Text.PlainText; font.family: root.faceFont;
                     Layout.alignment: Qt.AlignHCenter
                     text: "Your many heads to Logos"; font.pixelSize: root.fsXS; font.letterSpacing: 1
                     color: root.silver
@@ -3945,7 +3956,7 @@ Rectangle {
                     color: root.silver; opacity: 0.85 }
 
                 // ── State-specific prompt ──
-                Text { font.family: root.faceFont;
+                Text { textFormat: Text.PlainText; font.family: root.faceFont;
                     Layout.alignment: Qt.AlignHCenter; Layout.topMargin: 4
                     text: root.walletState === "locked"    ? (root.freshlySealed ? "Wallet ready" : "Welcome back")
                         : root.walletState === "plaintext" ? "Secure your wallet"
@@ -3953,7 +3964,7 @@ Rectangle {
                         : "Create your wallet"
                     font.pixelSize: 15; font.bold: true; color: root.textPrimary
                 }
-                Text { font.family: root.faceFont;
+                Text { textFormat: Text.PlainText; font.family: root.faceFont;
                     Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap
                     color: root.textSecondary; font.pixelSize: 11
                     text: root.walletState === "locked"    ? (root.freshlySealed
@@ -3972,7 +3983,7 @@ Rectangle {
                     Layout.fillWidth: true; Layout.topMargin: 2
                     implicitHeight: connHintTxt.implicitHeight + 16; radius: 10
                     color: root.accentTint10; border.color: root.accentOrange
-                    Text {
+                    Text { textFormat: Text.PlainText;
                         id: connHintTxt
                         anchors { fill: parent; margins: 8 }
                         font.family: root.faceFont; font.pixelSize: 10; wrapMode: Text.WordWrap
@@ -3993,7 +4004,7 @@ Rectangle {
                     Layout.fillWidth: true
                     Layout.preferredHeight: bphrase.implicitHeight + 16   // preferredHeight - a plain `height` is ignored by ColumnLayout, collapsing the box
                     color: root.inputBg; border.color: root.accentOrange; radius: 10
-                    Text { font.family: root.faceFont;
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont;
                         id: bphrase
                         x: 8; y: 8
                         width: parent.width - 16                          // explicit wrap width (not anchors.fill) so implicitHeight computes cleanly
@@ -4012,7 +4023,7 @@ Rectangle {
                          : backupSavedMa.containsMouse ? root.brandRedHover : root.brandRed
                     border.color: root.brandRed
                     Behavior on color { ColorAnimation { duration: root.motionQuick } }
-                    Text { font.family: root.faceFont; anchors.centerIn: parent; text: "I've saved it - open my wallet"; color: root.textPrimary; font.pixelSize: 12; font.bold: true }
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent; text: "I've saved it - open my wallet"; color: root.textPrimary; font.pixelSize: 12; font.bold: true }
                     MouseArea { id: backupSavedMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.finishBackup() }
                 }
 
@@ -4027,7 +4038,7 @@ Rectangle {
                         verticalAlignment: TextInput.AlignVCenter; echoMode: TextInput.Password
                         color: root.textPrimary; font.pixelSize: 12; clip: true
                         onAccepted: if (root.walletState === "locked") root.doUnlock(text)
-                        Text { font.family: root.faceFont;
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont;
                             anchors.fill: parent; verticalAlignment: Text.AlignVCenter
                             text: parent.text.length === 0 ? "password" : ""
                             color: root.textDisabled; font.pixelSize: 12
@@ -4047,14 +4058,14 @@ Rectangle {
                         anchors { fill: parent; leftMargin: 8; rightMargin: 8 }
                         verticalAlignment: TextInput.AlignVCenter; echoMode: TextInput.Password
                         color: root.textPrimary; font.pixelSize: 12; clip: true
-                        Text { font.family: root.faceFont;
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont;
                             anchors.fill: parent; verticalAlignment: Text.AlignVCenter
                             text: parent.text.length === 0 ? "confirm password" : ""
                             color: root.textDisabled; font.pixelSize: 12
                         }
                     }
                 }
-                Text { font.family: root.faceFont;
+                Text { textFormat: Text.PlainText; font.family: root.faceFont;
                     visible: root.walletState !== "locked" && root.walletState !== "backup"
                              && onbPw2.text.length > 0 && onbPw.text !== onbPw2.text
                     text: "passwords don't match"; color: root.errorRed; font.pixelSize: 10
@@ -4074,7 +4085,7 @@ Rectangle {
                     border.color: can ? root.brandRed : root.borderColor
                     opacity: can ? 1 : 0.5
                     Behavior on color { ColorAnimation { duration: root.motionQuick } }
-                    Text { font.family: root.faceFont;
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont;
                         anchors.centerIn: parent
                         text: root.secBusy.length > 0 ? root.secBusy + "…"
                             : root.walletState === "locked"    ? "Unlock"
@@ -4107,7 +4118,7 @@ Rectangle {
                     visible: root.walletState !== "new" && root.walletState !== "backup"
                     Layout.alignment: Qt.AlignHCenter; Layout.preferredWidth: 190; height: 22; radius: 10
                     color: "transparent"; border.color: root.borderColor
-                    Text { font.family: root.faceFont;
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont;
                         anchors.centerIn: parent
                         text: root.resetArmed ? "Tap again to erase wallet"
                             : root.walletState === "locked" ? "Forgot password? Reset"
@@ -4122,7 +4133,7 @@ Rectangle {
                 // The other two escapes are behind unlabelled icons in the top bar, which is not
                 // discoverable, so name them: Security & Backup restores from a recovery phrase,
                 // Settings names the wallet binary that has to exist for any of this to work.
-                Text { font.family: root.faceFont;
+                Text { textFormat: Text.PlainText; font.family: root.faceFont;
                     visible: root.walletState !== "backup"
                     Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap
                     text: "Have a recovery phrase, or nothing working at all? The key and cog icons "
@@ -4152,15 +4163,15 @@ Rectangle {
                             NumberAnimation { to: 0.3; duration: 550 } NumberAnimation { to: 1.0; duration: 550 } } }
                     ColumnLayout { spacing: 0; Layout.fillWidth: true
                         RowLayout { spacing: 6; Layout.fillWidth: true
-                            Text { font.family: root.faceFont; text: "Connecting to " + root.zoneName(root.network)
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Connecting to " + root.zoneName(root.network)
                                 color: root.textPrimary; font.pixelSize: 12; font.bold: true; elide: Text.ElideRight; Layout.fillWidth: true }
                             ZoneTag { tag: root.zoneTagOf(root.network); tagColor: root.zoneTagColorOf(root.network)
                                       face: root.faceFont; Layout.alignment: Qt.AlignVCenter } }
-                        Text { font.family: root.faceFont
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont
                             text: root.torPercent < 100 ? "Step 1 of 2 · Tor network" : "Step 2 of 2 · Sequencer onion"
                             color: root.silver; font.pixelSize: 9 } }
                     // % shown when we have a real number (bootstrap, or onion stage from the control port)
-                    Text { visible: root.torPercent < 100 || root.torOnionStage.length > 0
+                    Text { textFormat: Text.PlainText; visible: root.torPercent < 100 || root.torOnionStage.length > 0
                         font.family: root.faceFont
                         text: (root.torPercent < 100 ? root.torPercent : root.torOnionPct) + "%"
                         color: root.torPercent < 100 ? root.accentOrange : root.successGreen; font.pixelSize: 14; font.bold: true }
@@ -4180,7 +4191,7 @@ Rectangle {
                             NumberAnimation { from: -torTrack.width * 0.35; to: torTrack.width
                                 duration: 1300; easing.type: Easing.InOutQuad } } }
                 }
-                Text { font.family: root.faceFont; Layout.fillWidth: true; wrapMode: Text.WordWrap; elide: Text.ElideRight; maximumLineCount: 2
+                Text { textFormat: Text.PlainText; font.family: root.faceFont; Layout.fillWidth: true; wrapMode: Text.WordWrap; elide: Text.ElideRight; maximumLineCount: 2
                     text: root.torPercent < 100
                          ? (root.torStage.length > 0 ? "Bootstrapping Tor - " + root.torStage : "Starting Tor…")
                          : (root.torOnionStage.length > 0 ? root.torOnionStage
@@ -4197,7 +4208,7 @@ Rectangle {
                     Rectangle {
                         Layout.preferredWidth: 108; height: 26; radius: 8
                         color: "transparent"; border.color: root.borderColor; border.width: 1
-                        Text { anchors.centerIn: parent; font.family: root.faceFont; font.pixelSize: 10
+                        Text { textFormat: Text.PlainText; anchors.centerIn: parent; font.family: root.faceFont; font.pixelSize: 10
                             text: "Stop connecting"; color: root.textSecondary }
                         MouseArea {
                             anchors.fill: parent; cursorShape: Qt.PointingHandCursor
@@ -4234,28 +4245,28 @@ Rectangle {
                 anchors.centerIn: parent
                 width: parent.width - 36
                 spacing: root.sp1 + 2
-                Text { font.family: root.faceFont; text: "TOTAL BALANCE"; color: root.textDisabled
+                Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "TOTAL BALANCE"; color: root.textDisabled
                     font.pixelSize: root.fsXS; font.letterSpacing: 2; Layout.alignment: Qt.AlignHCenter }
                 RowLayout {
                     Layout.alignment: Qt.AlignHCenter; spacing: root.sp2
-                    Text { font.family: root.faceFont; text: root.heroTotal; font.pixelSize: root.fs3XL; font.weight: Font.DemiBold; color: root.textPrimary }
-                    Text { font.family: root.faceFont; text: "LEZ"; font.pixelSize: root.fsLG; font.weight: Font.Medium; color: root.silver; Layout.alignment: Qt.AlignBottom; bottomPadding: 7 }
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; text: root.heroTotal; font.pixelSize: root.fs3XL; font.weight: Font.DemiBold; color: root.textPrimary }
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "LEZ"; font.pixelSize: root.fsLG; font.weight: Font.Medium; color: root.silver; Layout.alignment: Qt.AlignBottom; bottomPadding: 7 }
                 }
                 RowLayout {
                     Layout.alignment: Qt.AlignHCenter; spacing: 14
                     RowLayout { spacing: 5
                         Rectangle { width: 7; height: 7; radius: 4; color: root.greenBright; Layout.alignment: Qt.AlignVCenter }
-                        Text { font.family: root.faceFont; text: root.heroPublicTotal + " public"; color: root.textSecondary; font.pixelSize: root.fsXS } }
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont; text: root.heroPublicTotal + " public"; color: root.textSecondary; font.pixelSize: root.fsXS } }
                     RowLayout { spacing: 5
                         Rectangle { width: 7; height: 7; radius: 4; color: root.silver; Layout.alignment: Qt.AlignVCenter }
-                        Text { font.family: root.faceFont; text: root.heroPrivateTotal + " private"; color: root.textSecondary; font.pixelSize: root.fsXS } }
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont; text: root.heroPrivateTotal + " private"; color: root.textSecondary; font.pixelSize: root.fsXS } }
                     Rectangle {
                         id: faucetChip
                         Layout.preferredWidth: 96; height: 26; radius: root.rChip
                         color: faucetChipMa.containsMouse ? root.accentTint14 : root.accentTint10
                         border.color: root.accentTint22; border.width: 1
                         Behavior on color { ColorAnimation { duration: root.motionQuick } }
-                        Text { anchors.centerIn: parent; text: "⛲  Faucet"; color: root.silver; font.pixelSize: root.fsXS - 1; font.weight: Font.Medium; font.family: root.faceFont }
+                        Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "⛲  Faucet"; color: root.silver; font.pixelSize: root.fsXS - 1; font.weight: Font.Medium; font.family: root.faceFont }
                         MouseArea { id: faucetChipMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.doClaimFaucet() }
                     }
                 }
@@ -4288,7 +4299,7 @@ Rectangle {
                         Behavior on scale { NumberAnimation { duration: root.motionQuick; easing.type: Easing.OutCubic } }
                         // Send/Receive keep their reliable text arrows; Privacy uses a real
                         // shield SVG (the ◈ glyph read poorly), colourized to the same tint.
-                        Text { visible: modelData.k !== "privacy"
+                        Text { textFormat: Text.PlainText; visible: modelData.k !== "privacy"
                             anchors.centerIn: parent; text: modelData.g; font.pixelSize: 22; font.weight: Font.Medium
                             color: actBtn.parent.on ? root.bgColor : root.textPrimary; font.family: root.faceFont }
                         Image { visible: modelData.k === "privacy"
@@ -4311,7 +4322,7 @@ Rectangle {
                                     root.runBusy("Loading tokens", function() { root.refreshTokens() })
                             } }
                     }
-                    Text { Layout.alignment: Qt.AlignHCenter; font.family: root.faceFont; text: modelData.t
+                    Text { textFormat: Text.PlainText; Layout.alignment: Qt.AlignHCenter; font.family: root.faceFont; text: modelData.t
                         color: parent.on ? root.silver : root.textSecondary; font.pixelSize: root.fsXS; font.weight: Font.Medium }
                 }
             }
@@ -4329,7 +4340,7 @@ Rectangle {
                     required property var modelData
                     Layout.fillWidth: true; height: 30
                     color: "transparent"
-                    Text { anchors.centerIn: parent; font.family: root.faceFont; text: modelData.t
+                    Text { textFormat: Text.PlainText; anchors.centerIn: parent; font.family: root.faceFont; text: modelData.t
                         color: root.activeTab === modelData.k ? root.textPrimary : root.textDisabled
                         font.pixelSize: 12; font.bold: root.activeTab === modelData.k }
                     Rectangle { anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
@@ -4392,12 +4403,12 @@ Rectangle {
                             anchors { fill: parent; leftMargin: 10; rightMargin: 12 }
                             spacing: 10
                             Rectangle { width: 26; height: 26; radius: 13; color: root.successGreen; Layout.alignment: Qt.AlignVCenter
-                                Text { anchors.centerIn: parent; text: "Ł"; color: root.textPrimary; font.pixelSize: 14; font.bold: true; font.family: root.faceFont } }
+                                Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "Ł"; color: root.textPrimary; font.pixelSize: 14; font.bold: true; font.family: root.faceFont } }
                             ColumnLayout { spacing: 0
-                                Text { font.family: root.faceFont; text: "LEZ"; color: root.textPrimary; font.pixelSize: 12; font.bold: true }
-                                Text { font.family: root.faceFont; text: "Native token"; color: root.textDisabled; font.pixelSize: 9 } }
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "LEZ"; color: root.textPrimary; font.pixelSize: 12; font.bold: true }
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Native token"; color: root.textDisabled; font.pixelSize: 9 } }
                             Item { Layout.fillWidth: true }
-                            Text { font.family: root.faceFont
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont
                                 text: (root.selectedFromBalance !== "" && root.selectedFromBalance !== "-") ? root.selectedFromBalance : "0"
                                 color: root.textPrimary; font.pixelSize: 15; font.bold: true }
                         }
@@ -4419,12 +4430,12 @@ Rectangle {
                                 anchors { fill: parent; leftMargin: 10; rightMargin: 12 }
                             spacing: 10
                                 Rectangle { width: 26; height: 26; radius: 13; color: root.avatarColor(modelData.definitionId); Layout.alignment: Qt.AlignVCenter
-                                    Text { anchors.centerIn: parent; text: modelData.ticker.substring(0,1); color: root.textPrimary; font.pixelSize: 13; font.bold: true; font.family: root.faceFont } }
+                                    Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: modelData.ticker.substring(0,1); color: root.textPrimary; font.pixelSize: 13; font.bold: true; font.family: root.faceFont } }
                                 ColumnLayout { spacing: 0
-                                    Text { font.family: root.faceFont; text: modelData.ticker; color: root.textPrimary; font.pixelSize: 12; font.bold: true }
-                                    Text { font.family: root.faceFont; text: "Token"; color: root.textDisabled; font.pixelSize: 9 } }
+                                    Text { textFormat: Text.PlainText; font.family: root.faceFont; text: modelData.ticker; color: root.textPrimary; font.pixelSize: 12; font.bold: true }
+                                    Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Token"; color: root.textDisabled; font.pixelSize: 9 } }
                                 Item { Layout.fillWidth: true }
-                                Text { font.family: root.faceFont; text: modelData.balance; color: root.textPrimary; font.pixelSize: 15; font.bold: true }
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont; text: modelData.balance; color: root.textPrimary; font.pixelSize: 15; font.bold: true }
                             }
                         }
                     }
@@ -4432,7 +4443,7 @@ Rectangle {
                     Rectangle {   // open the Add-token screen (whitelist picker + custom id)
                         Layout.fillWidth: true; height: 32; radius: 12
                         color: "transparent"; border.color: root.accentOrange
-                        Text { anchors.centerIn: parent; text: "+ Add token"; color: root.accentOrange; font.pixelSize: 11; font.family: root.faceFont }
+                        Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "+ Add token"; color: root.accentOrange; font.pixelSize: 11; font.family: root.faceFont }
                         MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                             onClicked: { root.refreshWhitelist(); root.screen = "addtoken" } }
                     }
@@ -4450,7 +4461,7 @@ Rectangle {
                         Layout.fillWidth: true
                         Layout.topMargin: 2
                         spacing: 3
-                        Text {
+                        Text { textFormat: Text.PlainText;
                             Layout.fillWidth: true
                             text: root.faucetOnChainNote
                             color: root.textDisabled; font.pixelSize: 9; font.family: root.faceFont
@@ -4468,21 +4479,21 @@ Rectangle {
                     RowLayout {   // back header
                         Layout.fillWidth: true; spacing: 6
                         Rectangle { width: 26; height: 24; radius: 10; color: "transparent"; border.color: root.borderColor
-                            Text { anchors.centerIn: parent; text: "←"; color: root.textSecondary; font.pixelSize: 13; font.family: root.faceFont }
+                            Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "←"; color: root.textSecondary; font.pixelSize: 13; font.family: root.faceFont }
                             MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.screen = "main" } }
-                        Text { font.family: root.faceFont; text: "Send"; color: root.textPrimary; font.pixelSize: 13; font.bold: true }
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Send"; color: root.textPrimary; font.pixelSize: 13; font.bold: true }
                         Item { Layout.fillWidth: true }
                     }
 
                     // Asset selector - LEZ + the account's tokens
-                    Text { font.family: root.faceFont; text: "Asset"; color: root.textSecondary; font.pixelSize: 10 }
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Asset"; color: root.textSecondary; font.pixelSize: 10 }
                     Flow {
                         Layout.fillWidth: true; spacing: 5
                         Rectangle {   // LEZ
                             width: lezChip.implicitWidth + 18; height: 24; radius: 12
                             color: root.sendTokenDef === "" ? root.accentTint14 : "transparent"
                             border.color: root.sendTokenDef === "" ? root.accentOrange : root.borderColor
-                            Text { id: lezChip; anchors.centerIn: parent; text: "LEZ"; font.pixelSize: 10; font.family: root.faceFont
+                            Text { textFormat: Text.PlainText; id: lezChip; anchors.centerIn: parent; text: "LEZ"; font.pixelSize: 10; font.family: root.faceFont
                                 color: root.sendTokenDef === "" ? root.accentOrange : root.textSecondary }
                             MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: { root.sendTokenDef = ""; root.sendTokenName = "LEZ" } }
                         }
@@ -4493,14 +4504,14 @@ Rectangle {
                                 width: tChip.implicitWidth + 18; height: 24; radius: 12
                                 color: root.sendTokenDef === modelData.definitionId ? root.accentTint14 : "transparent"
                                 border.color: root.sendTokenDef === modelData.definitionId ? root.accentOrange : root.borderColor
-                                Text { id: tChip; anchors.centerIn: parent; text: modelData.ticker + " · " + modelData.balance; font.pixelSize: 10; font.family: root.faceFont
+                                Text { textFormat: Text.PlainText; id: tChip; anchors.centerIn: parent; text: modelData.ticker + " · " + modelData.balance; font.pixelSize: 10; font.family: root.faceFont
                                     color: root.sendTokenDef === modelData.definitionId ? root.accentOrange : root.textSecondary }
                                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: { root.sendTokenDef = modelData.definitionId; root.sendTokenName = modelData.ticker } }
                             }
                         }
                     }
 
-                    Text { font.family: root.faceFont; text: "To"; color: root.textSecondary; font.pixelSize: 10 }
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "To"; color: root.textSecondary; font.pixelSize: 10 }
                     Rectangle {
                         Layout.fillWidth: true; height: 26; color: root.inputBg
                         border.color: toField.activeFocus ? root.accentOrange : root.borderColor; radius: 8
@@ -4509,7 +4520,7 @@ Rectangle {
                             anchors { fill: parent; leftMargin: 6; rightMargin: 6 }
                             verticalAlignment: TextInput.AlignVCenter
                             color: root.textPrimary; font.pixelSize: 11; clip: true
-                            Text { font.family: root.faceFont;
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                 anchors.fill: parent; verticalAlignment: Text.AlignVCenter
                                 text: parent.text.length === 0 ? "recipient account id" : ""
                                 color: root.textDisabled; font.pixelSize: 11;                            }
@@ -4517,9 +4528,9 @@ Rectangle {
                     }
 
                     RowLayout { Layout.fillWidth: true
-                        Text { font.family: root.faceFont; text: "Amount (" + (root.sendTokenDef === "" ? "LEZ" : root.sendTokenName) + ")"; color: root.textSecondary; font.pixelSize: 10 }
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Amount (" + (root.sendTokenDef === "" ? "LEZ" : root.sendTokenName) + ")"; color: root.textSecondary; font.pixelSize: 10 }
                         Item { Layout.fillWidth: true }
-                        Text { font.family: root.faceFont; font.pixelSize: 10
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont; font.pixelSize: 10
                             color: root.sendBalance() > 0 ? root.silver : root.errorRed
                             text: root.sendBalance() > 0 ? ("available: " + root.sendBalance()) : "no balance" } }
                     Rectangle {
@@ -4532,7 +4543,7 @@ Rectangle {
                             color: root.textPrimary; font.pixelSize: 11; clip: true
                             inputMethodHints: Qt.ImhDigitsOnly
                             validator: IntValidator { bottom: 0 }   // whole LEZ only - no decimals
-                            Text { font.family: root.faceFont;
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                 anchors.fill: parent; verticalAlignment: Text.AlignVCenter
                                 text: parent.text.length === 0 ? "e.g. 10" : ""
                                 color: root.textDisabled; font.pixelSize: 11;                            }
@@ -4541,7 +4552,7 @@ Rectangle {
 
                     // Signing is a gated verb, so it cannot succeed while the store is plaintext.
                     // Say so where the button is, not after it fails.
-                    Text { font.family: root.faceFont; visible: root.signingBlocked
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; visible: root.signingBlocked
                         text: "Sending needs a wallet that can prove who is asking. This store has no "
                             + "password on it, so the send would be refused. Set a password in "
                             + "Security & Backup (it keeps your accounts), then unlock."
@@ -4562,7 +4573,7 @@ Rectangle {
                         opacity: canSend ? 1.0 : 0.4
                         Behavior on color { ColorAnimation { duration: root.motionQuick } }
 
-                        Text { font.family: root.faceFont;
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont;
                             anchors.centerIn: parent
                             text: root.sendTokenDef === "" ? "Confirm Send" : ("Send " + root.sendTokenName)
                             color: confirmBtn.canSend ? root.textPrimary : root.textDisabled
@@ -4577,7 +4588,7 @@ Rectangle {
                             onClicked: root.doSend(toField.text.trim(), amountField.text.trim())
                         }
                     }
-                    Text { font.family: root.faceFont; visible: root.sendTokenDef !== ""
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; visible: root.sendTokenDef !== ""
                         text: "Token sends create the recipient's token account and confirm on-chain - runs in the background (~30s)."
                         color: root.textDisabled; font.pixelSize: 9; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                 }
@@ -4591,37 +4602,37 @@ Rectangle {
                     RowLayout {   // back header
                         Layout.fillWidth: true; spacing: 6
                         Rectangle { width: 26; height: 24; radius: 10; color: "transparent"; border.color: root.borderColor
-                            Text { anchors.centerIn: parent; text: "←"; color: root.textSecondary; font.pixelSize: 13; font.family: root.faceFont }
+                            Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "←"; color: root.textSecondary; font.pixelSize: 13; font.family: root.faceFont }
                             MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.screen = "main" } }
-                        Text { font.family: root.faceFont; text: "Receive"; color: root.textPrimary; font.pixelSize: 13; font.bold: true }
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Receive"; color: root.textPrimary; font.pixelSize: 13; font.bold: true }
                         Item { Layout.fillWidth: true }
                     }
-                        Text { font.family: root.faceFont; text: "Share this account address to receive LEZ or tokens."
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Share this account address to receive LEZ or tokens."
                             color: root.textDisabled; font.pixelSize: 9; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                         Rectangle {
                             Layout.fillWidth: true; Layout.preferredHeight: recvAddr.implicitHeight + 14
                             color: root.inputBg; border.color: root.borderColor; radius: 10
-                            Text { id: recvAddr; x: 8; y: 7; width: parent.width - 16
+                            Text { textFormat: Text.PlainText; id: recvAddr; x: 8; y: 7; width: parent.width - 16
                                 text: root.selectedFromId; color: root.textPrimary; font.pixelSize: 11; font.family: root.faceFont; wrapMode: Text.WrapAnywhere }
                             MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                                 onClicked: { clipHelper.text = root.selectedFromId; clipHelper.selectAll(); clipHelper.copy(); root.logActivity("Address copied", false) } }
                         }
-                        Text { font.family: root.faceFont; text: "Tap to copy"; color: root.textDisabled; font.pixelSize: 9 }
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Tap to copy"; color: root.textDisabled; font.pixelSize: 9 }
                         // private accounts: reveal receive keys (npk/vpk) for foreign senders
                         RowLayout {
                             visible: root.selectedFromType === "private"
                             Layout.fillWidth: true; spacing: 6
                             Rectangle { Layout.preferredWidth: 150; height: 24; radius: 10; color: "transparent"; border.color: root.borderColor
-                                Text { font.family: root.faceFont; anchors.centerIn: parent; text: "Show receive keys (npk/vpk)"; color: root.textSecondary; font.pixelSize: 9 }
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent; text: "Show receive keys (npk/vpk)"; color: root.textSecondary; font.pixelSize: 9 }
                                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.showReceiveKeys(root.selectedFromId) } }
                         }
                         ColumnLayout {
                             visible: root.receiveKeys !== null && root.selectedFromType === "private"
                             Layout.fillWidth: true; spacing: 2
-                            Text { font.family: root.faceFont; visible: text.length > 0; Layout.fillWidth: true; elide: Text.ElideRight
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont; visible: text.length > 0; Layout.fillWidth: true; elide: Text.ElideRight
                                 text: root.receiveKeys && root.receiveKeys.npk ? ("npk " + root.receiveKeys.npk) : ""
                                 color: root.textDisabled; font.pixelSize: 9 }
-                            Text { font.family: root.faceFont; visible: text.length > 0; Layout.fillWidth: true; elide: Text.ElideRight
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont; visible: text.length > 0; Layout.fillWidth: true; elide: Text.ElideRight
                                 text: root.receiveKeys && root.receiveKeys.vpk ? ("vpk " + root.receiveKeys.vpk) : ""
                                 color: root.textDisabled; font.pixelSize: 9 }
                         }
@@ -4651,9 +4662,9 @@ Rectangle {
                         RowLayout {   // back header
                             Layout.fillWidth: true; spacing: 6
                             Rectangle { width: 26; height: 24; radius: 10; color: "transparent"; border.color: root.borderColor
-                                Text { anchors.centerIn: parent; text: "←"; color: root.textSecondary; font.pixelSize: 13; font.family: root.faceFont }
+                                Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "←"; color: root.textSecondary; font.pixelSize: 13; font.family: root.faceFont }
                                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.screen = "main" } }
-                            Text { font.family: root.faceFont; text: "Privacy - shield / deshield"; color: root.textPrimary; font.pixelSize: 13; font.bold: true }
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Privacy - shield / deshield"; color: root.textPrimary; font.pixelSize: 13; font.bold: true }
                             Item { Layout.fillWidth: true }
                         }
 
@@ -4667,7 +4678,7 @@ Rectangle {
                         RowLayout {
                             Layout.fillWidth: true
                             spacing: 6
-                            Text { font.family: root.faceFont; text: "Mode"; color: root.textSecondary; font.pixelSize: 10; Layout.preferredWidth: 48 }
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Mode"; color: root.textSecondary; font.pixelSize: 10; Layout.preferredWidth: 48 }
                             Repeater {
                                 model: [ { k: "shield", t: "Shield" }, { k: "deshield", t: "Deshield" } ]
                                 delegate: Rectangle {
@@ -4675,7 +4686,7 @@ Rectangle {
                                     Layout.fillWidth: true; height: 24; radius: 10
                                     color: root.privMode === modelData.k ? root.accentTint14 : "transparent"
                                     border.color: root.privMode === modelData.k ? root.accentOrange : root.borderColor
-                                    Text { font.family: root.faceFont;
+                                    Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                         anchors.centerIn: parent; text: modelData.t
                                         color: root.privMode === modelData.k ? root.accentOrange : root.textSecondary; font.pixelSize: 10
                                     }
@@ -4696,7 +4707,7 @@ Rectangle {
                             visible: root.privMode === "shield" || root.privMode === "deshield"
                             Layout.fillWidth: true
                             spacing: 6
-                            Text { font.family: root.faceFont; text: "Asset"; color: root.textSecondary; font.pixelSize: 10; Layout.preferredWidth: 48 }
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Asset"; color: root.textSecondary; font.pixelSize: 10; Layout.preferredWidth: 48 }
                             Flow {
                                 Layout.fillWidth: true
                                 spacing: 4
@@ -4710,7 +4721,7 @@ Rectangle {
                                         width: assetChipText.implicitWidth + 18
                                         color: root.privTokenDef === modelData.definitionId ? root.accentTint14 : "transparent"
                                         border.color: root.privTokenDef === modelData.definitionId ? root.accentOrange : root.borderColor
-                                        Text { font.family: root.faceFont;
+                                        Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                             id: assetChipText
                                             anchors.centerIn: parent
                                             text: modelData.ticker + (modelData.balance ? " · " + modelData.balance : "")
@@ -4731,7 +4742,7 @@ Rectangle {
                                 }
                             }
                         }
-                        Text { font.family: root.faceFont;
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont;
                             visible: root.privMode === "shield" && root.shieldableTokens.length === 0
                             text: "Tokens in regular (ATA) balances can't be shielded on this chain version - only direct-owned holdings (e.g. a token you minted). LEZ shielding is unaffected."
                             wrapMode: Text.WordWrap; Layout.fillWidth: true
@@ -4749,9 +4760,9 @@ Rectangle {
                                 id: warnCol
                                 anchors { left: parent.left; right: parent.right; top: parent.top; margins: 8 }
                                 spacing: 4
-                                Text { font.family: root.faceFont; text: "⚠  You are revealing transaction info"
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "⚠  You are revealing transaction info"
                                     color: root.errorRed; font.pixelSize: 11; font.bold: true }
-                                Text {
+                                Text { textFormat: Text.PlainText;
                                     font.family: root.faceFont; Layout.fillWidth: true; wrapMode: Text.WordWrap
                                     color: root.textSecondary; font.pixelSize: 9
                                     text: root.privMode === "deshield"
@@ -4763,29 +4774,29 @@ Rectangle {
                                     Rectangle {
                                         width: 14; height: 14; radius: 2; border.color: root.borderColor; border.width: 1
                                         color: root.deshieldAck ? root.accentOrange : "transparent"
-                                        Text { anchors.centerIn: parent; visible: root.deshieldAck; text: "✓"; color: root.bgColor; font.pixelSize: 10; font.family: root.faceFont }
+                                        Text { textFormat: Text.PlainText; anchors.centerIn: parent; visible: root.deshieldAck; text: "✓"; color: root.bgColor; font.pixelSize: 10; font.family: root.faceFont }
                                         MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.deshieldAck = !root.deshieldAck }
                                     }
-                                    Text { font.family: root.faceFont; text: "I understand this reveals transaction info"
+                                    Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "I understand this reveals transaction info"
                                         color: root.textSecondary; font.pixelSize: 9 }
                                 }
                             }
                         }
 
                         // From (uses the account selected in the left column)
-                        Text { font.family: root.faceFont; text: "From"; color: root.textSecondary; font.pixelSize: 10 }
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "From"; color: root.textSecondary; font.pixelSize: 10 }
                         Rectangle {
                             Layout.fillWidth: true; height: 26; radius: 8
                             color: root.inputBg; border.color: root.privFromValid ? root.borderColor : root.errorRed
                             RowLayout {
                                 anchors { fill: parent; leftMargin: 6; rightMargin: 6 }
-                                Text { font.family: root.faceFont;
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                     text: root.selectedFromId.length > 0 ? root.displayId(root.selectedFromId) : "- pick an account from the selector above -"
                                     color: root.selectedFromId.length > 0 ? root.textPrimary : root.textDisabled
                                     font.pixelSize: 11; elide: Text.ElideMiddle
                                     Layout.fillWidth: true
                                 }
-                                Text { font.family: root.faceFont;
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                     visible: root.selectedFromId.length > 0
                                     text: (root.selectedFromType || "public").toUpperCase()
                                     color: root.privFromValid ? root.successGreen : root.errorRed
@@ -4793,7 +4804,7 @@ Rectangle {
                                 }
                             }
                         }
-                        Text { font.family: root.faceFont;
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont;
                             visible: root.selectedFromId.length > 0 && !root.privFromValid
                             text: root.privMode === "shield" ? "Shield needs a PUBLIC source account."
                                                              : "Deshield / transfer needs a PRIVATE source account."
@@ -4805,7 +4816,7 @@ Rectangle {
                             visible: root.privMode === "transfer"
                             Layout.fillWidth: true
                             spacing: 6
-                            Text { font.family: root.faceFont; text: "To"; color: root.textSecondary; font.pixelSize: 10; Layout.preferredWidth: 48 }
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "To"; color: root.textSecondary; font.pixelSize: 10; Layout.preferredWidth: 48 }
                             Repeater {
                                 model: [ { k: "owned", t: "Owned" }, { k: "foreign", t: "Foreign" } ]
                                 delegate: Rectangle {
@@ -4813,7 +4824,7 @@ Rectangle {
                                     Layout.preferredWidth: 70; height: 24; radius: 10
                                     color: root.privToMode === modelData.k ? root.accentTint14 : "transparent"
                                     border.color: root.privToMode === modelData.k ? root.accentOrange : root.borderColor
-                                    Text { font.family: root.faceFont;
+                                    Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                         anchors.centerIn: parent; text: modelData.t
                                         color: root.privToMode === modelData.k ? root.accentOrange : root.textSecondary; font.pixelSize: 10
                                     }
@@ -4828,7 +4839,7 @@ Rectangle {
                             visible: !(root.privMode === "transfer" && root.privToMode === "foreign")
                             Layout.fillWidth: true
                             spacing: 4
-                            Text { font.family: root.faceFont;
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                 text: root.privMode === "shield" ? "To (private account)"
                                     : root.privMode === "deshield" ? "To (public account)"
                                     : "To (private account)"
@@ -4845,7 +4856,7 @@ Rectangle {
                                         width: chipText.implicitWidth + 18
                                         color: root.privToId === modelData ? root.accentTint14 : "transparent"
                                         border.color: root.privToId === modelData ? root.accentOrange : root.borderColor
-                                        Text { font.family: root.faceFont;
+                                        Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                             id: chipText
                                             anchors.centerIn: parent
                                             text: root.displayId(modelData)
@@ -4855,7 +4866,7 @@ Rectangle {
                                     }
                                 }
                             }
-                            Text { font.family: root.faceFont;
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                 visible: root.eligibleTo.length === 0
                                 text: root.privMode === "deshield" ? "No public accounts - create one on the left."
                                                                    : "No FRESH private accounts - tap “+ Private” on the left. (A private account that already holds funds can't receive again - protocol limit.)"
@@ -4871,7 +4882,7 @@ Rectangle {
                             Layout.fillWidth: true
                             spacing: 4
 
-                            Text { font.family: root.faceFont; text: "Recipient npk (32-byte hex)"; color: root.textSecondary; font.pixelSize: 10 }
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Recipient npk (32-byte hex)"; color: root.textSecondary; font.pixelSize: 10 }
                             Rectangle {
                                 Layout.fillWidth: true; height: 24; color: root.inputBg
                                 border.color: npkField.activeFocus ? root.accentOrange : root.borderColor; radius: 8
@@ -4884,7 +4895,7 @@ Rectangle {
                                     onTextEdited: root.privToNpk = text
                                 }
                             }
-                            Text { font.family: root.faceFont; text: "Recipient vpk (33-byte hex)"; color: root.textSecondary; font.pixelSize: 10 }
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Recipient vpk (33-byte hex)"; color: root.textSecondary; font.pixelSize: 10 }
                             Rectangle {
                                 Layout.fillWidth: true; height: 24; color: root.inputBg
                                 border.color: vpkField.activeFocus ? root.accentOrange : root.borderColor; radius: 8
@@ -4897,7 +4908,7 @@ Rectangle {
                                     onTextEdited: root.privToVpk = text
                                 }
                             }
-                            Text { font.family: root.faceFont; text: "Recipient identifier"; color: root.textSecondary; font.pixelSize: 10 }
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Recipient identifier"; color: root.textSecondary; font.pixelSize: 10 }
                             Rectangle {
                                 Layout.fillWidth: true; height: 24; color: root.inputBg
                                 border.color: identField.activeFocus ? root.accentOrange : root.borderColor; radius: 8
@@ -4919,14 +4930,14 @@ Rectangle {
                             spacing: 6
                             Rectangle {
                                 Layout.preferredWidth: 130; height: 22; radius: 10; color: "transparent"; border.color: root.borderColor
-                                Text { font.family: root.faceFont; anchors.centerIn: parent; text: "Show my receive keys"; color: root.textSecondary; font.pixelSize: 10 }
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent; text: "Show my receive keys"; color: root.textSecondary; font.pixelSize: 10 }
                                 MouseArea {
                                     anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                                     enabled: root.selectedFromType === "private"
                                     onClicked: root.showReceiveKeys(root.selectedFromId)
                                 }
                             }
-                            Text { font.family: root.faceFont;
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                 visible: root.selectedFromType !== "private"
                                 text: "select a private account first"
                                 color: root.textDisabled; font.pixelSize: 9
@@ -4936,12 +4947,12 @@ Rectangle {
                             visible: root.privMode === "transfer" && root.receiveKeys !== null
                             Layout.fillWidth: true
                             spacing: 2
-                            Text { font.family: root.faceFont;
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                 text: root.receiveKeys && root.receiveKeys.npk ? ("npk " + root.receiveKeys.npk) : ""
                                 visible: text.length > 0
                                 color: root.textDisabled; font.pixelSize: 9;                                Layout.fillWidth: true; elide: Text.ElideRight
                             }
-                            Text { font.family: root.faceFont;
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                 text: root.receiveKeys && root.receiveKeys.vpk ? ("vpk " + root.receiveKeys.vpk) : ""
                                 visible: text.length > 0
                                 color: root.textDisabled; font.pixelSize: 9;                                Layout.fillWidth: true; elide: Text.ElideRight
@@ -4949,7 +4960,7 @@ Rectangle {
                         }
 
                         // Amount
-                        Text { font.family: root.faceFont; text: "Amount (" + (root.privAsset === "token" ? (root.privTokenTicker || "tokens") : "LEZ") + ")"; color: root.textSecondary; font.pixelSize: 10 }
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Amount (" + (root.privAsset === "token" ? (root.privTokenTicker || "tokens") : "LEZ") + ")"; color: root.textSecondary; font.pixelSize: 10 }
                         Rectangle {
                             Layout.fillWidth: true; height: 26; color: root.inputBg
                             border.color: privAmountField.activeFocus ? root.accentOrange : root.borderColor; radius: 8
@@ -4961,7 +4972,7 @@ Rectangle {
                                 inputMethodHints: Qt.ImhDigitsOnly
                                 text: root.privAmount
                                 onTextEdited: root.privAmount = text
-                                Text { font.family: root.faceFont;
+                                Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                     anchors.fill: parent; verticalAlignment: Text.AlignVCenter
                                     text: parent.text.length === 0 ? "e.g. 10" : ""
                                     color: root.textDisabled; font.pixelSize: 11;                                }
@@ -4970,7 +4981,7 @@ Rectangle {
 
                         // Shield / deshield / private transfer are all gated verbs, so none of
                         // them can succeed while the store is plaintext. Same rule as Send.
-                        Text { font.family: root.faceFont; visible: root.signingBlocked
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont; visible: root.signingBlocked
                             text: "Shielding, de-shielding and private transfers need a wallet that can "
                                 + "prove who is asking. This store has no password on it, so they would "
                                 + "be refused. Set a password in Security & Backup, then unlock."
@@ -4997,7 +5008,7 @@ Rectangle {
                             border.color: canConfirm ? root.brandRed : root.borderColor
                             opacity: canConfirm ? 1.0 : 0.4
                             Behavior on color { ColorAnimation { duration: root.motionQuick } }
-                            Text { font.family: root.faceFont;
+                            Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                 anchors.centerIn: parent
                                 text: root.privBusy ? "Submitting…"
                                     : root.privMode === "shield" ? "Shield"
@@ -5015,7 +5026,7 @@ Rectangle {
                             }
                         }
 
-                        Text { font.family: root.faceFont;
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont;
                             text: "Generates a STARK locally - fast in dev-mode, several minutes on CPU. Runs in the background."
                             color: root.textDisabled; font.pixelSize: 9; wrapMode: Text.WordWrap; Layout.fillWidth: true
                         }
@@ -5036,12 +5047,12 @@ Rectangle {
                         anchors { fill: parent; margins: 8 }
                         spacing: 6
 
-                        Text { font.family: root.faceFont;
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont;
                             text: "HISTORY"
                             color: root.textDisabled; font.pixelSize: 9; font.bold: true; font.letterSpacing: 1.2
                         }
 
-                        Text { font.family: root.faceFont;
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont;
                             visible: txHistoryModel.count === 0
                             text: "No transactions yet"
                             color: root.textDisabled; font.pixelSize: 11
@@ -5085,12 +5096,12 @@ Rectangle {
                                     RowLayout {
                                         Layout.fillWidth: true
                                         spacing: 6
-                                        Text { font.family: root.faceFont;
+                                        Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                             text: direction
                                             color: root.textSecondary
                                             font.pixelSize: 11; font.bold: true
                                         }
-                                        Text { font.family: root.faceFont;
+                                        Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                             // An on-chain faucet claim carries no figure: the
                                             // program picks a pseudorandom amount PER TOKEN
                                             // on-chain and reports none back, so " LEZ" here
@@ -5100,7 +5111,7 @@ Rectangle {
                                             color: root.textPrimary; font.pixelSize: 11; font.bold: true
                                             Layout.fillWidth: true
                                         }
-                                        Text { font.family: root.faceFont;
+                                        Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                             text: ts.length > 16
                                                   ? ts.substring(0, 10) + "  " + ts.substring(11, 16)
                                                   : ts
@@ -5108,7 +5119,7 @@ Rectangle {
                                         }
                                     }
 
-                                    Text { font.family: root.faceFont;
+                                    Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                         visible: type !== "faucet" && type !== "tokenfaucet"
                                         text: (isSent ? "→ " : "← ") + root.displayId(counterparty)
                                         color: root.textDisabled; font.pixelSize: 10;                                        Layout.fillWidth: true; elide: Text.ElideMiddle
@@ -5143,7 +5154,7 @@ Rectangle {
                 anchors { left: parent.left; right: parent.right; top: parent.top; margins: 8 }
                 spacing: 4
 
-                Text { font.family: root.faceFont; text: "JOBS"; color: root.brandRed; font.pixelSize: 9; font.bold: true; font.letterSpacing: 1.2 }
+                Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "JOBS"; color: root.brandRed; font.pixelSize: 9; font.bold: true; font.letterSpacing: 1.2 }
 
                 Repeater {
                     model: ListModel { id: jobsModel }
@@ -5171,8 +5182,8 @@ Rectangle {
                                 NumberAnimation { to: 1.0; duration: 500 }
                             }
                         }
-                        Text { font.family: root.faceFont; text: root.opLabel(op); color: root.textPrimary; font.pixelSize: 10; font.bold: true }
-                        Text { font.family: root.faceFont;
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont; text: root.opLabel(op); color: root.textPrimary; font.pixelSize: 10; font.bold: true }
+                        Text { textFormat: Text.PlainText; font.family: root.faceFont;
                             // Only when there IS a figure. A token-faucet claim has none - the
                             // program picks the amount per token on-chain - and a bare " tok"
                             // reads as a zero payout that never happened.
@@ -5190,7 +5201,7 @@ Rectangle {
                             spacing: 0
                             Layout.alignment: Qt.AlignVCenter
                             Layout.maximumWidth: 180
-                            Text {
+                            Text { textFormat: Text.PlainText;
                                 Layout.alignment: Qt.AlignRight
                                 font.family: root.faceFont; font.pixelSize: 10; font.bold: true
                                 // "queued" is a real state, not a stall: the faucet's token half
@@ -5206,7 +5217,7 @@ Rectangle {
                                      : state === "done"  ? root.accentOrange
                                      : root.textSecondary
                             }
-                            Text {
+                            Text { textFormat: Text.PlainText;
                                 Layout.alignment: Qt.AlignRight
                                 Layout.maximumWidth: 180
                                 font.family: root.faceFont; font.pixelSize: 9
@@ -5246,7 +5257,7 @@ Rectangle {
             id: toastCol
             anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter; leftMargin: 12; rightMargin: 12 }
             spacing: 7
-            Text {
+            Text { textFormat: Text.PlainText;
                 id: noticeText
                 Layout.fillWidth: true
                 font.family: root.faceFont; font.pixelSize: 11; wrapMode: Text.WrapAtWordBoundaryOrAnywhere
@@ -5261,7 +5272,7 @@ Rectangle {
                 Rectangle { Layout.preferredWidth: 70; height: 26; radius: 8
                     color: toastCard.copied ? Qt.rgba(62/255,142/255,88/255,0.18) : root.selectBg
                     border.color: toastCard.copied ? root.successGreen : root.errorRed
-                    Text { anchors.centerIn: parent; text: toastCard.copied ? "Copied ✓" : "Copy"
+                    Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: toastCard.copied ? "Copied ✓" : "Copy"
                         color: toastCard.copied ? root.successGreen : root.errorRed; font.pixelSize: 10; font.family: root.faceFont }
                     MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                         onClicked: {
@@ -5269,7 +5280,7 @@ Rectangle {
                             toastCard.copied = true; copiedResetTimer.restart()
                         } } }
                 Rectangle { Layout.preferredWidth: 70; height: 26; radius: 8; color: "transparent"; border.color: root.borderColor
-                    Text { anchors.centerIn: parent; text: "Dismiss"; color: root.textSecondary; font.pixelSize: 10; font.family: root.faceFont }
+                    Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "Dismiss"; color: root.textSecondary; font.pixelSize: 10; font.family: root.faceFont }
                     MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.notice = "" } }
             }
         }
@@ -5294,13 +5305,13 @@ Rectangle {
             id: bannerRow
             anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter; leftMargin: 16; rightMargin: 16 }
             spacing: 12
-            Text { text: "⚠"; color: "#E8A317"; font.pixelSize: 18; Layout.alignment: Qt.AlignTop; Layout.topMargin: 2 }
+            Text { textFormat: Text.PlainText; text: "⚠"; color: "#E8A317"; font.pixelSize: 18; Layout.alignment: Qt.AlignTop; Layout.topMargin: 2 }
             ColumnLayout {
                 Layout.fillWidth: true; spacing: 2
-                Text { color: root.textPrimary; font.family: root.faceFont; font.pixelSize: 13; font.bold: true
+                Text { textFormat: Text.PlainText; color: root.textPrimary; font.family: root.faceFont; font.pixelSize: 13; font.bold: true
                     text: root.torBinaryMissing ? "This network routes over Tor, but no Tor was found"
                                                 : "This network needs a running local sequencer" }
-                Text {
+                Text { textFormat: Text.PlainText;
                     Layout.fillWidth: true; wrapMode: Text.WordWrap
                     color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 11
                     text: root.torBinaryMissing
@@ -5313,7 +5324,7 @@ Rectangle {
             Rectangle {
                 Layout.preferredWidth: 128; Layout.preferredHeight: 30; radius: 8
                 color: chooseNetMa.containsMouse ? "#3A2C10" : "transparent"; border.color: root.accentOrange; border.width: 1
-                Text { anchors.centerIn: parent; text: "Choose network"; color: root.accentOrange; font.family: root.faceFont; font.pixelSize: 11 }
+                Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "Choose network"; color: root.accentOrange; font.family: root.faceFont; font.pixelSize: 11 }
                 MouseArea { id: chooseNetMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                     onClicked: root.screen = "network" }
             }
@@ -5344,7 +5355,7 @@ Rectangle {
                         NumberAnimation { to: 1.0; duration: 500 }
                     }
                 }
-                Text {
+                Text { textFormat: Text.PlainText;
                     Layout.alignment: Qt.AlignHCenter; font.family: root.faceFont
                     color: root.textPrimary; font.pixelSize: 12; font.letterSpacing: 1
                     text: root.secBusy.length > 0 ? root.secBusy + "…"
@@ -5376,7 +5387,7 @@ Rectangle {
                     NumberAnimation { to: 0.25; duration: 500 }
                     NumberAnimation { to: 1.0; duration: 500 } }
             }
-            Text {
+            Text { textFormat: Text.PlainText;
                 Layout.fillWidth: true; font.family: root.faceFont; font.pixelSize: 12
                 color: root.updState === "error" ? root.errorRed : root.textPrimary; elide: Text.ElideRight
                 text: root.updState.length > 0 ? root.updMsg : ("Update available - Medusa v" + root.updVersion)
@@ -5385,7 +5396,7 @@ Rectangle {
                 visible: root.updAvailable && root.updState === ""
                 implicitWidth: 80; height: 28; radius: 6
                 color: updMa.containsMouse ? root.accentHover : root.accentOrange
-                Text { anchors.centerIn: parent; text: "Update"; color: root.bgColor
+                Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "Update"; color: root.bgColor
                     font.family: root.faceFont; font.pixelSize: 11; font.bold: true }
                 MouseArea { id: updMa; anchors.fill: parent; hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor; onClicked: root.doUpdate() }
@@ -5393,7 +5404,7 @@ Rectangle {
             Rectangle {
                 visible: root.updState === "" || root.updState === "done" || root.updState === "error"
                 width: 24; height: 24; radius: 12; color: "transparent"
-                Text { anchors.centerIn: parent; text: "✕"; color: root.textSecondary
+                Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "✕"; color: root.textSecondary
                     font.pixelSize: 12; font.family: root.faceFont }
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                     onClicked: { root.updAvailable = false; root.updState = ""; root.updMsg = "" } }
@@ -5457,16 +5468,16 @@ Rectangle {
                         clip: true
                         Image {
                             anchors.fill: parent; anchors.margins: 2
-                            visible: connectSheet.req && (connectSheet.req.app
-                                     ? (connectSheet.req.app.icon || "") : "") !== ""
-                            source: connectSheet.req && connectSheet.req.app
-                                    ? (connectSheet.req.app.icon || "") : ""
+                            visible: root.safeIcon(connectSheet.req && connectSheet.req.app
+                                     ? connectSheet.req.app.icon : "") !== ""
+                            source: root.safeIcon(connectSheet.req && connectSheet.req.app
+                                    ? connectSheet.req.app.icon : "")
                             fillMode: Image.PreserveAspectFit
                         }
-                        Text {
+                        Text { textFormat: Text.PlainText;
                             anchors.centerIn: parent
-                            visible: !(connectSheet.req && connectSheet.req.app
-                                       && (connectSheet.req.app.icon || "") !== "")
+                            visible: root.safeIcon(connectSheet.req && connectSheet.req.app
+                                       ? connectSheet.req.app.icon : "") === ""
                             text: "🔗"; font.pixelSize: 18
                         }
                     }
@@ -5479,7 +5490,7 @@ Rectangle {
                         // "Tip Jar\nNetwork: Paradox Computer · clearnet\nhttps://…" would paint
                         // extra lines in 15px bold textPrimary right above the network card and
                         // read as the wallet's own statement of the network.
-                        Text {
+                        Text { textFormat: Text.PlainText;
                             Layout.fillWidth: true
                             text: connectSheet.req && connectSheet.req.app
                                   ? (connectSheet.req.app.appName || "An app") : "An app"
@@ -5487,7 +5498,7 @@ Rectangle {
                             font.pixelSize: 15; font.bold: true
                             maximumLineCount: 1; elide: Text.ElideRight
                         }
-                        Text {
+                        Text { textFormat: Text.PlainText;
                             Layout.fillWidth: true
                             text: "wants to connect to your wallet"
                             color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 11
@@ -5519,13 +5530,13 @@ Rectangle {
                                 color: root.seqStatus === "running"  ? root.greenBright
                                      : root.seqStatus === "starting" ? root.connectGray : root.errorRed
                             }
-                            Text {
+                            Text { textFormat: Text.PlainText;
                                 text: "CONNECTING YOU ON"
                                 color: root.textSecondary; font.family: root.faceFont
                                 font.pixelSize: 10; font.letterSpacing: 1
                             }
                             Item { Layout.fillWidth: true }
-                            Text {
+                            Text { textFormat: Text.PlainText;
                                 visible: root.seqStatus === "starting"
                                 text: "checking…"; color: root.textDisabled
                                 font.family: root.faceFont; font.pixelSize: 9
@@ -5534,7 +5545,7 @@ Rectangle {
                         // Name line, clamped + "custom"-tagged (see the action sheet's copy).
                         RowLayout {
                             Layout.fillWidth: true; spacing: 6
-                            Text {
+                            Text { textFormat: Text.PlainText;
                                 Layout.fillWidth: true
                                 text: root.zoneName(root.network)
                                 color: root.textPrimary; font.family: root.faceFont
@@ -5548,14 +5559,14 @@ Rectangle {
                             ZoneTag { tag: root.zoneTagOf(root.network)
                                       tagColor: root.zoneTagColorOf(root.network)
                                       face: root.faceFont; Layout.alignment: Qt.AlignVCenter }
-                            Text {
+                            Text { textFormat: Text.PlainText;
                                 visible: root.activeZoneIsCustom
                                 text: "custom"; color: root.textDisabled
                                 font.family: root.faceFont; font.pixelSize: 9
                             }
                         }
                         // Load-bearing: WRAPPED, never elided (see the action sheet's copy).
-                        Text {
+                        Text { textFormat: Text.PlainText;
                             Layout.fillWidth: true; visible: text.length > 0
                             text: root.netShownAddr
                             color: root.textSecondary; font.family: root.monoFont
@@ -5564,17 +5575,17 @@ Rectangle {
                         RowLayout {
                             visible: root.netAlert !== ""
                             Layout.fillWidth: true; Layout.topMargin: 2; spacing: 6
-                            Text { text: "⚠"; color: root.netAlertColor; font.pixelSize: 12
+                            Text { textFormat: Text.PlainText; text: "⚠"; color: root.netAlertColor; font.pixelSize: 12
                                    Layout.alignment: Qt.AlignTop }
                             ColumnLayout {
                                 Layout.fillWidth: true; spacing: 1
-                                Text {
+                                Text { textFormat: Text.PlainText;
                                     Layout.fillWidth: true; text: root.netAlertTitle()
                                     color: root.netAlertColor; font.family: root.faceFont
                                     font.pixelSize: 10; font.bold: true
                                     wrapMode: Text.WrapAtWordBoundaryOrAnywhere
                                 }
-                                Text {
+                                Text { textFormat: Text.PlainText;
                                     Layout.fillWidth: true; text: root.netAlertBody()
                                     color: root.textSecondary; font.family: root.faceFont
                                     font.pixelSize: 9; wrapMode: Text.WrapAtWordBoundaryOrAnywhere
@@ -5582,15 +5593,15 @@ Rectangle {
                                 ColumnLayout {
                                     visible: root.netAlert === "repoint"
                                     Layout.fillWidth: true; Layout.topMargin: 3; spacing: 1
-                                    Text { text: "configured for this zone"; color: root.textDisabled
+                                    Text { textFormat: Text.PlainText; text: "configured for this zone"; color: root.textDisabled
                                            font.family: root.faceFont; font.pixelSize: 9 }
-                                    Text { Layout.fillWidth: true; text: root.netExpectedDial
+                                    Text { textFormat: Text.PlainText; Layout.fillWidth: true; text: root.netExpectedDial
                                            color: root.textSecondary; font.family: root.monoFont
                                            font.pixelSize: 9; wrapMode: Text.WrapAnywhere }
-                                    Text { text: "actually dialling"; color: root.textDisabled
+                                    Text { textFormat: Text.PlainText; text: "actually dialling"; color: root.textDisabled
                                            font.family: root.faceFont; font.pixelSize: 9
                                            Layout.topMargin: 2 }
-                                    Text { Layout.fillWidth: true; text: root.netActualDial
+                                    Text { textFormat: Text.PlainText; Layout.fillWidth: true; text: root.netActualDial
                                            color: root.errorRed; font.family: root.monoFont
                                            font.pixelSize: 9; wrapMode: Text.WrapAnywhere }
                                 }
@@ -5599,7 +5610,7 @@ Rectangle {
                     }
                 }
 
-                Text {
+                Text { textFormat: Text.PlainText;
                     Layout.fillWidth: true
                     text: "Permissions requested"
                     color: root.textSecondary; font.family: root.faceFont
@@ -5612,7 +5623,7 @@ Rectangle {
                         Rectangle {
                             width: permLbl.implicitWidth + 16; height: 22; radius: 11
                             color: root.selectBg; border.color: root.borderColor
-                            Text {
+                            Text { textFormat: Text.PlainText;
                                 id: permLbl; anchors.centerIn: parent; text: modelData
                                 color: root.silver; font.family: root.faceFont; font.pixelSize: 10
                             }
@@ -5620,7 +5631,7 @@ Rectangle {
                     }
                 }
 
-                Text {
+                Text { textFormat: Text.PlainText;
                     Layout.fillWidth: true
                     text: "Expose accounts (none selected = nothing shared)"
                     color: root.textSecondary; font.family: root.faceFont
@@ -5638,10 +5649,10 @@ Rectangle {
                                 Layout.preferredWidth: 18; Layout.preferredHeight: 18; radius: 5
                                 color: connAcctRow.picked ? root.accentOrange : root.inputBg
                                 border.color: connAcctRow.picked ? root.accentOrange : root.borderColor
-                                Text { anchors.centerIn: parent; visible: connAcctRow.picked
+                                Text { textFormat: Text.PlainText; anchors.centerIn: parent; visible: connAcctRow.picked
                                        text: "✓"; color: root.bgColor; font.pixelSize: 11 }
                             }
-                            Text {
+                            Text { textFormat: Text.PlainText;
                                 Layout.fillWidth: true
                                 text: root.displayId(model.id) + "  ·  " + (model.type || "public")
                                 color: root.textPrimary; font.family: root.faceFont
@@ -5659,7 +5670,7 @@ Rectangle {
                             }
                         }
                     }
-                    Text {
+                    Text { textFormat: Text.PlainText;
                         visible: accountModel.count === 0
                         text: "No accounts yet - create one first."
                         color: root.textDisabled; font.family: root.faceFont; font.pixelSize: 11
@@ -5671,7 +5682,7 @@ Rectangle {
                     Rectangle {
                         Layout.fillWidth: true; height: 38; radius: 10
                         color: "transparent"; border.color: root.borderColor
-                        Text { anchors.centerIn: parent; text: "Reject"
+                        Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "Reject"
                                color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 13 }
                         MouseArea {
                             anchors.fill: parent; cursorShape: Qt.PointingHandCursor
@@ -5684,7 +5695,7 @@ Rectangle {
                         color: connectApproveMa.pressed ? root.brandRedPressed
                              : connectApproveMa.containsMouse ? root.brandRedHover : root.brandRed
                         Behavior on color { ColorAnimation { duration: root.motionQuick } }
-                        Text { anchors.centerIn: parent; text: "Connect"
+                        Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "Connect"
                                color: root.textPrimary; font.family: root.faceFont; font.pixelSize: 13; font.bold: true }
                         MouseArea {
                             id: connectApproveMa
@@ -5752,14 +5763,14 @@ Rectangle {
                     width: 52; height: 52; radius: 26
                     color: Qt.rgba(62/255, 158/255, 91/255, 0.16)
                     border.color: root.successGreen; border.width: 1.5
-                    Text { anchors.centerIn: parent; text: "✓"; color: root.greenBright; font.pixelSize: 26; font.bold: true }
+                    Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "✓"; color: root.greenBright; font.pixelSize: 26; font.bold: true }
                 }
-                Text {
+                Text { textFormat: Text.PlainText;
                     Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter
                     text: "Authorized!"
                     color: root.textPrimary; font.family: root.faceFont; font.pixelSize: 17; font.bold: true
                 }
-                Text {
+                Text { textFormat: Text.PlainText;
                     Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter
                     wrapMode: Text.WordWrap
                     text: "Now go back to " + root.connAuthorizedApp + "."
@@ -5770,7 +5781,7 @@ Rectangle {
                     color: authDoneMa.pressed ? root.brandRedPressed
                          : authDoneMa.containsMouse ? root.brandRedHover : root.brandRed
                     Behavior on color { ColorAnimation { duration: root.motionQuick } }
-                    Text { anchors.centerIn: parent; text: "Done"
+                    Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "Done"
                            color: root.textPrimary; font.family: root.faceFont; font.pixelSize: 13; font.bold: true }
                     MouseArea {
                         id: authDoneMa
@@ -5828,13 +5839,13 @@ Rectangle {
                 anchors { left: parent.left; right: parent.right; top: parent.top; margins: 16 }
                 spacing: 12
 
-                Text {
+                Text { textFormat: Text.PlainText;
                     Layout.fillWidth: true
                     text: "Approve " + (actionSheet.req ? (actionSheet.req.op || "send") : "send")
                     color: root.textPrimary; font.family: root.faceFont
                     font.pixelSize: 15; font.bold: true
                 }
-                Text {
+                Text { textFormat: Text.PlainText;
                     Layout.fillWidth: true
                     text: "A connected app requested this transfer"
                     color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 11
@@ -5850,16 +5861,16 @@ Rectangle {
                         spacing: 6
                         RowLayout {
                             Layout.fillWidth: true
-                            Text { text: "From"; color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 11 }
+                            Text { textFormat: Text.PlainText; text: "From"; color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 11 }
                             Item { Layout.fillWidth: true }
-                            Text { text: actionSheet.req ? root.displayId(actionSheet.req.from) : ""
+                            Text { textFormat: Text.PlainText; text: actionSheet.req ? root.displayId(actionSheet.req.from) : ""
                                    color: root.textPrimary; font.family: root.faceFont; font.pixelSize: 11 }
                         }
                         RowLayout {
                             Layout.fillWidth: true
-                            Text { text: "To"; color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 11 }
+                            Text { textFormat: Text.PlainText; text: "To"; color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 11 }
                             Item { Layout.fillWidth: true }
-                            Text {
+                            Text { textFormat: Text.PlainText;
                                 text: actionSheet.req
                                       ? (actionSheet.req.to && actionSheet.req.to.length > 0
                                          ? root.displayId(actionSheet.req.to) : "(foreign recipient)")
@@ -5869,9 +5880,9 @@ Rectangle {
                         }
                         RowLayout {
                             Layout.fillWidth: true
-                            Text { text: "Amount"; color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 11 }
+                            Text { textFormat: Text.PlainText; text: "Amount"; color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 11 }
                             Item { Layout.fillWidth: true }
-                            Text { text: actionSheet.req
+                            Text { textFormat: Text.PlainText; text: actionSheet.req
                                         ? (actionSheet.req.amount + " " +
                                            ((actionSheet.req.asset === "token") ? "token" : "LEZ"))
                                         : ""
@@ -5879,9 +5890,9 @@ Rectangle {
                         }
                         RowLayout {
                             Layout.fillWidth: true
-                            Text { text: "Mode"; color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 11 }
+                            Text { textFormat: Text.PlainText; text: "Mode"; color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 11 }
                             Item { Layout.fillWidth: true }
-                            Text { text: actionSheet.req ? (actionSheet.req.op || "send") : ""
+                            Text { textFormat: Text.PlainText; text: actionSheet.req ? (actionSheet.req.op || "send") : ""
                                    color: root.silver; font.family: root.faceFont; font.pixelSize: 11 }
                         }
                     }
@@ -5910,13 +5921,13 @@ Rectangle {
                                 color: root.seqStatus === "running"  ? root.greenBright
                                      : root.seqStatus === "starting" ? root.connectGray : root.errorRed
                             }
-                            Text {
+                            Text { textFormat: Text.PlainText;
                                 text: "NETWORK THIS RUNS ON"
                                 color: root.textSecondary; font.family: root.faceFont
                                 font.pixelSize: 10; font.letterSpacing: 1
                             }
                             Item { Layout.fillWidth: true }
-                            Text {
+                            Text { textFormat: Text.PlainText;
                                 visible: root.seqStatus === "starting"
                                 text: "checking…"; color: root.textDisabled
                                 font.family: root.faceFont; font.pixelSize: 9
@@ -5928,7 +5939,7 @@ Rectangle {
                         // lines. The "custom" tag says the name is not one of the wallet's.
                         RowLayout {
                             Layout.fillWidth: true; spacing: 6
-                            Text {
+                            Text { textFormat: Text.PlainText;
                                 Layout.fillWidth: true
                                 text: root.zoneName(root.network)
                                 color: root.textPrimary; font.family: root.faceFont
@@ -5942,7 +5953,7 @@ Rectangle {
                             ZoneTag { tag: root.zoneTagOf(root.network)
                                       tagColor: root.zoneTagColorOf(root.network)
                                       face: root.faceFont; Layout.alignment: Qt.AlignVCenter }
-                            Text {
+                            Text { textFormat: Text.PlainText;
                                 visible: root.activeZoneIsCustom
                                 text: "custom"; color: root.textDisabled
                                 font.family: root.faceFont; font.pixelSize: 9
@@ -5952,7 +5963,7 @@ Rectangle {
                         // name above and changes only this, so a truncated address would
                         // defeat the entire purpose. WrapAnywhere so a 62-char .onion reads
                         // in full in a 380px sheet.
-                        Text {
+                        Text { textFormat: Text.PlainText;
                             Layout.fillWidth: true; visible: text.length > 0
                             text: root.netShownAddr
                             color: root.textSecondary; font.family: root.monoFont
@@ -5961,17 +5972,17 @@ Rectangle {
                         RowLayout {
                             visible: root.netAlert !== ""
                             Layout.fillWidth: true; Layout.topMargin: 2; spacing: 6
-                            Text { text: "⚠"; color: root.netAlertColor; font.pixelSize: 12
+                            Text { textFormat: Text.PlainText; text: "⚠"; color: root.netAlertColor; font.pixelSize: 12
                                    Layout.alignment: Qt.AlignTop }
                             ColumnLayout {
                                 Layout.fillWidth: true; spacing: 1
-                                Text {
+                                Text { textFormat: Text.PlainText;
                                     Layout.fillWidth: true; text: root.netAlertTitle()
                                     color: root.netAlertColor; font.family: root.faceFont
                                     font.pixelSize: 10; font.bold: true
                                     wrapMode: Text.WrapAtWordBoundaryOrAnywhere
                                 }
-                                Text {
+                                Text { textFormat: Text.PlainText;
                                     Layout.fillWidth: true; text: root.netAlertBody()
                                     color: root.textSecondary; font.family: root.faceFont
                                     font.pixelSize: 9; wrapMode: Text.WrapAtWordBoundaryOrAnywhere
@@ -5981,15 +5992,15 @@ Rectangle {
                                 ColumnLayout {
                                     visible: root.netAlert === "repoint"
                                     Layout.fillWidth: true; Layout.topMargin: 3; spacing: 1
-                                    Text { text: "configured for this zone"; color: root.textDisabled
+                                    Text { textFormat: Text.PlainText; text: "configured for this zone"; color: root.textDisabled
                                            font.family: root.faceFont; font.pixelSize: 9 }
-                                    Text { Layout.fillWidth: true; text: root.netExpectedDial
+                                    Text { textFormat: Text.PlainText; Layout.fillWidth: true; text: root.netExpectedDial
                                            color: root.textSecondary; font.family: root.monoFont
                                            font.pixelSize: 9; wrapMode: Text.WrapAnywhere }
-                                    Text { text: "actually dialling"; color: root.textDisabled
+                                    Text { textFormat: Text.PlainText; text: "actually dialling"; color: root.textDisabled
                                            font.family: root.faceFont; font.pixelSize: 9
                                            Layout.topMargin: 2 }
-                                    Text { Layout.fillWidth: true; text: root.netActualDial
+                                    Text { textFormat: Text.PlainText; Layout.fillWidth: true; text: root.netActualDial
                                            color: root.errorRed; font.family: root.monoFont
                                            font.pixelSize: 9; wrapMode: Text.WrapAnywhere }
                                 }
@@ -5998,7 +6009,7 @@ Rectangle {
                     }
                 }
 
-                Text {
+                Text { textFormat: Text.PlainText;
                     Layout.fillWidth: true
                     text: root.connActionHint(actionSheet.req)
                     color: root.textSecondary; font.family: root.faceFont
@@ -6008,7 +6019,7 @@ Rectangle {
                 // approveAction is a gated verb: on a plaintext store it is refused, so approving
                 // could only ever fail and leave the dApp waiting. Reject stays live (it is
                 // ungated and it is the honest answer here), and the reason is on the sheet.
-                Text {
+                Text { textFormat: Text.PlainText;
                     visible: root.signingBlocked
                     Layout.fillWidth: true
                     text: "This wallet's storage has no password on it, so it cannot prove who is "
@@ -6023,7 +6034,7 @@ Rectangle {
                     Rectangle {
                         Layout.fillWidth: true; height: 38; radius: 10
                         color: "transparent"; border.color: root.borderColor
-                        Text { anchors.centerIn: parent; text: "Reject"
+                        Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "Reject"
                                color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 13 }
                         MouseArea {
                             anchors.fill: parent; cursorShape: Qt.PointingHandCursor
@@ -6040,7 +6051,7 @@ Rectangle {
                              : actionApproveMa.containsMouse ? root.brandRedHover : root.brandRed
                         border.color: enabled ? root.brandRed : root.borderColor
                         Behavior on color { ColorAnimation { duration: root.motionQuick } }
-                        Text { anchors.centerIn: parent; text: "Approve"
+                        Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "Approve"
                                color: actionApproveBtn.enabled ? root.textPrimary : root.textDisabled
                                font.family: root.faceFont; font.pixelSize: 13; font.bold: true }
                         MouseArea {
@@ -6108,7 +6119,7 @@ Rectangle {
                     Rectangle {
                         Layout.preferredWidth: 38; Layout.preferredHeight: 38; radius: 10
                         color: root.surface2; border.color: root.borderColor
-                        Text { anchors.centerIn: parent; text: "⇄"; font.pixelSize: 18; color: root.silver }
+                        Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "⇄"; font.pixelSize: 18; color: root.silver }
                     }
                     ColumnLayout {
                         Layout.fillWidth: true; spacing: 1
@@ -6117,7 +6128,7 @@ Rectangle {
                         // sequencer"` in one wrapping 15px-bold run, which handed a dApp the
                         // wallet's title voice: an appName carrying newlines could paint whole
                         // extra lines that read as the wallet talking.
-                        Text {
+                        Text { textFormat: Text.PlainText;
                             Layout.fillWidth: true
                             text: "An app wants to change your network"
                             color: root.textPrimary; font.family: root.faceFont
@@ -6125,7 +6136,7 @@ Rectangle {
                             maximumLineCount: 1; elide: Text.ElideRight
                         }
                         // The dApp's name for itself: attributed, subordinate colour, one line.
-                        Text {
+                        Text { textFormat: Text.PlainText;
                             Layout.fillWidth: true
                             text: "asked by " + (zoneSheet.req ? (zoneSheet.req.appName || "an app")
                                                                : "an app")
@@ -6158,13 +6169,13 @@ Rectangle {
                                 color: root.seqStatus === "running"  ? root.greenBright
                                      : root.seqStatus === "starting" ? root.connectGray : root.errorRed
                             }
-                            Text {
+                            Text { textFormat: Text.PlainText;
                                 text: "YOU ARE ON NOW"
                                 color: root.textSecondary; font.family: root.faceFont
                                 font.pixelSize: 10; font.letterSpacing: 1
                             }
                             Item { Layout.fillWidth: true }
-                            Text {
+                            Text { textFormat: Text.PlainText;
                                 visible: root.seqStatus === "starting"
                                 text: "checking…"; color: root.textDisabled
                                 font.family: root.faceFont; font.pixelSize: 9
@@ -6172,7 +6183,7 @@ Rectangle {
                         }
                         RowLayout {
                             Layout.fillWidth: true; spacing: 6
-                            Text {
+                            Text { textFormat: Text.PlainText;
                                 Layout.fillWidth: true
                                 text: root.zoneName(root.network)
                                 color: root.textPrimary; font.family: root.faceFont
@@ -6186,13 +6197,13 @@ Rectangle {
                             ZoneTag { tag: root.zoneTagOf(root.network)
                                       tagColor: root.zoneTagColorOf(root.network)
                                       face: root.faceFont; Layout.alignment: Qt.AlignVCenter }
-                            Text {
+                            Text { textFormat: Text.PlainText;
                                 visible: root.activeZoneIsCustom
                                 text: "custom"; color: root.textDisabled
                                 font.family: root.faceFont; font.pixelSize: 9
                             }
                         }
-                        Text {
+                        Text { textFormat: Text.PlainText;
                             Layout.fillWidth: true; visible: text.length > 0
                             text: root.netShownAddr
                             color: root.textSecondary; font.family: root.monoFont
@@ -6201,17 +6212,17 @@ Rectangle {
                         RowLayout {
                             visible: root.netAlert !== ""
                             Layout.fillWidth: true; Layout.topMargin: 2; spacing: 6
-                            Text { text: "⚠"; color: root.netAlertColor; font.pixelSize: 12
+                            Text { textFormat: Text.PlainText; text: "⚠"; color: root.netAlertColor; font.pixelSize: 12
                                    Layout.alignment: Qt.AlignTop }
                             ColumnLayout {
                                 Layout.fillWidth: true; spacing: 1
-                                Text {
+                                Text { textFormat: Text.PlainText;
                                     Layout.fillWidth: true; text: root.netAlertTitle()
                                     color: root.netAlertColor; font.family: root.faceFont
                                     font.pixelSize: 10; font.bold: true
                                     wrapMode: Text.WrapAtWordBoundaryOrAnywhere
                                 }
-                                Text {
+                                Text { textFormat: Text.PlainText;
                                     Layout.fillWidth: true; text: root.netAlertBody()
                                     color: root.textSecondary; font.family: root.faceFont
                                     font.pixelSize: 9; wrapMode: Text.WrapAtWordBoundaryOrAnywhere
@@ -6219,15 +6230,15 @@ Rectangle {
                                 ColumnLayout {
                                     visible: root.netAlert === "repoint"
                                     Layout.fillWidth: true; Layout.topMargin: 3; spacing: 1
-                                    Text { text: "configured for this zone"; color: root.textDisabled
+                                    Text { textFormat: Text.PlainText; text: "configured for this zone"; color: root.textDisabled
                                            font.family: root.faceFont; font.pixelSize: 9 }
-                                    Text { Layout.fillWidth: true; text: root.netExpectedDial
+                                    Text { textFormat: Text.PlainText; Layout.fillWidth: true; text: root.netExpectedDial
                                            color: root.textSecondary; font.family: root.monoFont
                                            font.pixelSize: 9; wrapMode: Text.WrapAnywhere }
-                                    Text { text: "actually dialling"; color: root.textDisabled
+                                    Text { textFormat: Text.PlainText; text: "actually dialling"; color: root.textDisabled
                                            font.family: root.faceFont; font.pixelSize: 9
                                            Layout.topMargin: 2 }
-                                    Text { Layout.fillWidth: true; text: root.netActualDial
+                                    Text { textFormat: Text.PlainText; Layout.fillWidth: true; text: root.netActualDial
                                            color: root.errorRed; font.family: root.monoFont
                                            font.pixelSize: 9; wrapMode: Text.WrapAnywhere }
                                 }
@@ -6236,7 +6247,7 @@ Rectangle {
                     }
                 }
 
-                Text {
+                Text { textFormat: Text.PlainText;
                     Layout.alignment: Qt.AlignHCenter
                     text: "↓"; color: root.silver; font.pixelSize: 14
                 }
@@ -6267,13 +6278,13 @@ Rectangle {
                         spacing: 4
                         RowLayout {
                             Layout.fillWidth: true; spacing: 6
-                            Text {
+                            Text { textFormat: Text.PlainText;
                                 text: "THE APP WANTS YOU ON"
                                 color: root.textSecondary; font.family: root.faceFont
                                 font.pixelSize: 10; font.letterSpacing: 1
                             }
                             Item { Layout.fillWidth: true }
-                            Text {
+                            Text { textFormat: Text.PlainText;
                                 text: "supplied by the app"
                                 color: root.textDisabled; font.family: root.faceFont; font.pixelSize: 9
                             }
@@ -6281,14 +6292,14 @@ Rectangle {
                         // The proposal itself: wrapped in full, never elided. This used to be
                         // ElideMiddle, which hides the middle of an .onion - the only part that
                         // distinguishes it from a lookalike.
-                        Text {
+                        Text { textFormat: Text.PlainText;
                             Layout.fillWidth: true
                             text: zoneSheet.req ? (zoneSheet.req.sequencer || "") : ""
                             color: root.textPrimary; font.family: root.monoFont
                             font.pixelSize: 11; wrapMode: Text.WrapAnywhere
                         }
                         // The app's own label, clearly marked as the app's words.
-                        Text {
+                        Text { textFormat: Text.PlainText;
                             Layout.fillWidth: true
                             visible: zoneSheet.req !== null && (zoneSheet.req.label || "") !== ""
                             text: "the app calls it \"" + (zoneSheet.req ? (zoneSheet.req.label || "") : "") + "\""
@@ -6301,7 +6312,7 @@ Rectangle {
                                 width: 7; height: 7; radius: 4; Layout.alignment: Qt.AlignVCenter
                                 color: (zoneSheet.req && zoneSheet.req.tor) ? root.successGreen : root.warningAmber
                             }
-                            Text {
+                            Text { textFormat: Text.PlainText;
                                 text: (zoneSheet.req && zoneSheet.req.tor)
                                       ? "Routed over Tor" : "Clearnet (not over Tor)"
                                 color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 10
@@ -6309,7 +6320,7 @@ Rectangle {
                         }
                         // THE WALLET'S VERDICT on the proposal - derived from getZones(), not
                         // from anything the dApp said about itself.
-                        Text {
+                        Text { textFormat: Text.PlainText;
                             Layout.fillWidth: true; Layout.topMargin: 2
                             wrapMode: Text.WrapAtWordBoundaryOrAnywhere
                             font.family: root.faceFont; font.pixelSize: 9
@@ -6334,7 +6345,7 @@ Rectangle {
                 // approveZone is gated for the same reason approveAction is (it repoints the wallet
                 // at someone else's sequencer), so it is refused on a plaintext store. Same
                 // treatment: Reject stays live, Approve is disabled and says why.
-                Text {
+                Text { textFormat: Text.PlainText;
                     visible: root.signingBlocked
                     Layout.fillWidth: true
                     text: "This wallet's storage has no password on it, so it cannot prove who is "
@@ -6349,7 +6360,7 @@ Rectangle {
                     Rectangle {
                         Layout.fillWidth: true; height: 38; radius: 10
                         color: "transparent"; border.color: root.borderColor
-                        Text { anchors.centerIn: parent; text: "Reject"
+                        Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "Reject"
                                color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 13 }
                         MouseArea {
                             anchors.fill: parent; cursorShape: Qt.PointingHandCursor
@@ -6366,7 +6377,7 @@ Rectangle {
                              : zoneApproveMa.containsMouse ? root.brandRedHover : root.brandRed
                         border.color: enabled ? root.brandRed : root.borderColor
                         Behavior on color { ColorAnimation { duration: root.motionQuick } }
-                        Text { anchors.centerIn: parent; text: "Approve"
+                        Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "Approve"
                                color: zoneApproveBtn.enabled ? root.textPrimary : root.textDisabled
                                font.family: root.faceFont; font.pixelSize: 13; font.bold: true }
                         MouseArea {
@@ -6439,7 +6450,7 @@ Rectangle {
                                     : jobDoneSheet.head.state === "error" ? root.errorRed
                                     : jobDoneSheet.head.state === "note"  ? root.silver
                                     : root.successGreen
-                        Text {
+                        Text { textFormat: Text.PlainText;
                             anchors.centerIn: parent
                             text: !jobDoneSheet.head ? "✓"
                                 : jobDoneSheet.head.state === "error" ? "✕"
@@ -6454,7 +6465,7 @@ Rectangle {
                     }
                     ColumnLayout {
                         Layout.fillWidth: true; spacing: 1
-                        Text {
+                        Text { textFormat: Text.PlainText;
                             Layout.fillWidth: true
                             // A summary that spans several halves supplies its own heading -
                             // "<op> complete" cannot describe two outcomes at once.
@@ -6466,7 +6477,7 @@ Rectangle {
                             color: root.textPrimary; font.family: root.faceFont
                             font.pixelSize: 15; font.bold: true; wrapMode: Text.WordWrap
                         }
-                        Text {
+                        Text { textFormat: Text.PlainText;
                             Layout.fillWidth: true
                             // Only when there IS a figure: an on-chain faucet claim has none
                             // (the program picks the amount per token), and " LEZ" on its own
@@ -6490,7 +6501,7 @@ Rectangle {
                         id: jobDoneDetail
                         anchors { left: parent.left; right: parent.right; top: parent.top; margins: 10 }
                         spacing: 6
-                        Text {
+                        Text { textFormat: Text.PlainText;
                             Layout.fillWidth: true
                             wrapMode: Text.WrapAtWordBoundaryOrAnywhere
                             font.family: root.faceFont; font.pixelSize: 12
@@ -6506,7 +6517,7 @@ Rectangle {
                                     ? (jobDoneSheet.head.error.length > 0 ? jobDoneSheet.head.error : "Failed")
                                     : "Sent to L2 - awaiting L1 confirmation"
                         }
-                        Text {
+                        Text { textFormat: Text.PlainText;
                             Layout.fillWidth: true
                             visible: text.length > 0
                             elide: Text.ElideMiddle
@@ -6525,7 +6536,7 @@ Rectangle {
                     color: jobDoneDismissMa.pressed ? root.brandRedPressed
                          : jobDoneDismissMa.containsMouse ? root.brandRedHover : root.brandRed
                     Behavior on color { ColorAnimation { duration: root.motionQuick } }
-                    Text { anchors.centerIn: parent; text: "Done"
+                    Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "Done"
                            color: root.textPrimary; font.family: root.faceFont; font.pixelSize: 13; font.bold: true }
                     MouseArea {
                         id: jobDoneDismissMa
@@ -6606,17 +6617,17 @@ Rectangle {
                     Rectangle {
                         Layout.preferredWidth: 38; Layout.preferredHeight: 38; radius: 19
                         color: "transparent"; border.width: 1; border.color: root.errorRed
-                        Text { anchors.centerIn: parent
+                        Text { textFormat: Text.PlainText; anchors.centerIn: parent
                             text: root.zoneOfflineMismatch ? "≠" : "⚡"
                             color: root.errorRed; font.pixelSize: 17; font.bold: true }
                     }
                     ColumnLayout {
                         Layout.fillWidth: true; spacing: 1
-                        Text { Layout.fillWidth: true
+                        Text { textFormat: Text.PlainText; Layout.fillWidth: true
                             text: root.zoneOfflineMismatch ? "Zone build mismatch" : "Zone connection offline"
                             color: root.textPrimary; font.family: root.faceFont
                             font.pixelSize: 15; font.bold: true; elide: Text.ElideRight }
-                        Text { Layout.fillWidth: true
+                        Text { textFormat: Text.PlainText; Layout.fillWidth: true
                             visible: root.zoneOfflineOp.length > 0
                             text: root.zoneOfflineOp + (root.zoneOfflineMismatch
                                   ? " can't run against this zone" : " needs a zone connection")
@@ -6640,18 +6651,18 @@ Rectangle {
                                 Layout.alignment: Qt.AlignVCenter
                                 color: root.seqStatus === "running"  ? root.greenBright
                                      : root.seqStatus === "starting" ? root.connectGray : root.errorRed }
-                            Text { Layout.fillWidth: true; text: root.zoneName(root.network)
+                            Text { textFormat: Text.PlainText; Layout.fillWidth: true; text: root.zoneName(root.network)
                                 color: root.textPrimary; font.family: root.faceFont; font.pixelSize: 12
                                 font.bold: true; elide: Text.ElideRight }
                             ZoneTag { tag: root.zoneTagOf(root.network)
                                       tagColor: root.zoneTagColorOf(root.network)
                                       face: root.faceFont; Layout.alignment: Qt.AlignVCenter }
                         }
-                        Text { Layout.fillWidth: true; visible: text.length > 0
+                        Text { textFormat: Text.PlainText; Layout.fillWidth: true; visible: text.length > 0
                             text: root.zoneEndpointDesc()
                             color: root.textDisabled; font.family: root.monoFont; font.pixelSize: 9
                             elide: Text.ElideMiddle }
-                        Text { Layout.fillWidth: true
+                        Text { textFormat: Text.PlainText; Layout.fillWidth: true
                             wrapMode: Text.WrapAtWordBoundaryOrAnywhere
                             font.family: root.faceFont; font.pixelSize: 10; color: root.textSecondary
                             text: zoneOfflineSheet.hintText() }
@@ -6666,7 +6677,7 @@ Rectangle {
                              : zoneOffRetryMa.pressed ? root.brandRedPressed
                              : zoneOffRetryMa.containsMouse ? root.brandRedHover : root.brandRed
                         Behavior on color { ColorAnimation { duration: root.motionQuick } }
-                        Text { anchors.centerIn: parent
+                        Text { textFormat: Text.PlainText; anchors.centerIn: parent
                             text: root.zoneRetryBusy ? "Checking…" : "Retry"
                             color: root.textPrimary; font.family: root.faceFont; font.pixelSize: 13; font.bold: true }
                         MouseArea { id: zoneOffRetryMa; anchors.fill: parent; hoverEnabled: true
@@ -6677,7 +6688,7 @@ Rectangle {
                     Rectangle {   // Close - the error toast (if any) stays for copying
                         Layout.preferredWidth: 96; Layout.preferredHeight: 38; radius: 10
                         color: "transparent"; border.color: root.borderStrong; border.width: 1
-                        Text { anchors.centerIn: parent; text: "Close"
+                        Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "Close"
                             color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 12 }
                         MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                             onClicked: { zoneRetryTimer.stop(); root.zoneRetryBusy = false; root.zoneOfflineOpen = false } }
