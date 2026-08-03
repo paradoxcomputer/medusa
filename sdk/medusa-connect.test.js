@@ -187,5 +187,43 @@ ok(s1after.zone === "z-paradox-computer" && s1after.zoneAtConnect === "diaphani"
 // 10) disconnect
 ok(medusa.disconnect("sess-1").ok === true, "disconnect() ok");
 
+// 11) A bridge reply that is valid JSON but NOT an object must still obey the documented
+// contract ("every call returns a plain object, nothing throws"). "null" is the realistic one:
+// a null QVariant from a wallet verb serialises to it, and returning it verbatim made the
+// caller's `r.error` throw a TypeError inside the QML host and kill the dApp view.
+["null", "5", "false", "\"hi\"", "[]"].forEach(function (raw) {
+    const m = sdk.create({ appName: "t", call: function () { return raw; } });
+    let r, threw = false;
+    try { r = m.status("req-x"); const _ = r.error; } catch (e) { threw = true; }
+    const isArr = (raw === "[]");
+    ok(!threw && r !== null && typeof r === "object"
+       && (isArr ? Array.isArray(r) : typeof r.error === "string"),
+       "bridge reply " + raw + " -> " + (isArr ? "array passes through" : "clean { error }, no throw"));
+});
+
+// getTokens legitimately returns an ARRAY, so the non-object guard must not swallow it.
+{
+    const m = sdk.create({ appName: "t", call: function () { return '[{"ticker":"GOLD","balance":"7"}]'; } });
+    const t = m.getTokens("sess-1", "Public/a");
+    ok(Array.isArray(t) && t[0].ticker === "GOLD", "getTokens() array reply survives _parse");
+}
+
+// 12) The op aliases must not brand the CALLER's action object. Reusing one action object
+// across shield() then send() used to submit the second call as a shield, silently turning a
+// public transfer into a public-to-private move.
+{
+    const seen = [];
+    const m = sdk.create({ appName: "t", call: function (mod, meth, args) {
+        seen.push(args); return JSON.stringify({ requestId: "r" });
+    } });
+    const act = { from: "Public/a", to: "Public/b", amount: "1", asset: "native" };
+    m.shield("sess-1", act);
+    ok(act.op === undefined, "shield() leaves the caller's action object unbranded");
+    m.send("sess-1", act);
+    ok(JSON.parse(seen[1][1]).op === undefined,
+       "a reused action object still sends as a plain send, not a shield");
+    ok(JSON.parse(seen[0][1]).op === "shield", "shield() still submits op=shield");
+}
+
 console.log(fail === 0 ? "\nALL PASS" : "\n" + fail + " FAILED");
 process.exit(fail === 0 ? 0 : 1);

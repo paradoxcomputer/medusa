@@ -1,6 +1,6 @@
 {
   "name": "@paradoxcomputer/medusa-connect",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Connect with Medusa - dApp SDK for the Medusa privacy wallet on Logos Basecamp. Request a wallet connection and submit transfers / shields / deshields through the user's wallet, with per-action approval in the wallet UI.",
   "license": "GPL-3.0-only",
   "main": "medusa-connect.js",

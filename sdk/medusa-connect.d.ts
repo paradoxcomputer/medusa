@@ -1,4 +1,4 @@
-// Type declarations for @paradoxcomputer/medusa-connect (v0.2.0, the shipped synchronous wrapper).
+// Type declarations for @paradoxcomputer/medusa-connect (v0.2.2, the shipped synchronous wrapper).
 // Mirrors medusa-connect.js: a thin, QML-importable wrapper over Basecamp's `logos.callModule` bridge.
 // Connect + writes are user-approved IN THE WALLET, so they are 2-phase: a *Request returns
 // { requestId }, then you poll status(requestId) (drive it from a QML Timer) until it resolves.

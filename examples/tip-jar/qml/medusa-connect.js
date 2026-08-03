@@ -27,11 +27,37 @@ function create(opts) { return new Medusa(opts); }
 
 function _parse(raw) {
     // The bridge returns a JSON string (sometimes double-encoded). Normalise to an object.
+    //
+    // A reply that parses to anything OTHER than an object or an array is not a wallet reply.
+    // This used to be returned verbatim, so a null QVariant arriving as "null" became a literal
+    // null and the caller's `r.error` / `r.status` threw a TypeError inside the QML host, taking
+    // the dApp's whole view down; a reply of `5` or `"hi"` left `r.status` undefined and a
+    // polling Timer that never terminated. The documented contract is that every call returns a
+    // plain object and nothing throws, so it is honoured HERE rather than at each call site.
+    // Arrays are valid and must pass through: getTokens returns one.
     try {
         var t = JSON.parse(raw);
-        if (typeof t === "string") { try { return JSON.parse(t); } catch (e) { return t; } }
+        if (typeof t === "string") {
+            try { t = JSON.parse(t); }
+            catch (e) { return { error: "bridge returned a bare string: " + t }; }
+        }
+        if (t === null || typeof t !== "object")
+            return { error: "bridge returned a non-object reply: " + String(raw) };
         return t;
     } catch (e) { return { error: "bridge returned non-JSON: " + String(raw) }; }
+}
+
+// Copy before stamping `op`. The shield/deshield/privateSend aliases used to set `op` on the
+// CALLER's own action object, so a dApp that keeps one action object per form and calls
+// shield() once had every later send() on that same object silently submitted as a shield,
+// turning a public transfer into a public-to-private move the user never asked for.
+function _withOp(action, op) {
+    var out = {};
+    action = action || {};
+    for (var k in action)
+        if (Object.prototype.hasOwnProperty.call(action, k)) out[k] = action[k];
+    out.op = op;
+    return out;
 }
 
 function Medusa(opts) {
@@ -123,9 +149,9 @@ Medusa.prototype.send = function (sessionId, action) {
     return this._invoke("requestAction", [sessionId, JSON.stringify(action)]);
 };
 // convenience aliases (explicit mode; all route through requestAction's op auto-detect)
-Medusa.prototype.shield      = function (sid, a) { a = a || {}; a.op = "shield";   return this.send(sid, a); };
-Medusa.prototype.deshield    = function (sid, a) { a = a || {}; a.op = "deshield"; return this.send(sid, a); };
-Medusa.prototype.privateSend = function (sid, a) { a = a || {}; a.op = "private";  return this.send(sid, a); };
+Medusa.prototype.shield      = function (sid, a) { return this.send(sid, _withOp(a, "shield")); };
+Medusa.prototype.deshield    = function (sid, a) { return this.send(sid, _withOp(a, "deshield")); };
+Medusa.prototype.privateSend = function (sid, a) { return this.send(sid, _withOp(a, "private")); };
 
 // ── zone (sequencer) ─────────────────────────────────────────────────────────
 // Ask the wallet to switch to a sequencer/zone so the dApp and wallet share a chain
