@@ -71,7 +71,22 @@ Guest build plumbing (why it looks the way it does):
 - risc0-zkvm is pinned `=3.0.5` (the upstream pin) in guest + shared so exactly one
   zkVM copy links into the guest.
 
-Verified build of this tree (2026-07-30):
+Verified build of this tree (2026-08-03), the guest that refuses a claim naming the same
+token twice:
+
+- Build path used: `cargo risczero build` in docker (reproducible), 221s.
+- `.bin`: `wallet/target/riscv32im-risc0-zkvm-elf/docker/medusa_faucet.bin`, 439 892 bytes
+- ImageID / program id:
+  `3c56ad0e1d2be3b57582d91187892daa8be2b63d300c2c9d9df318a494dcb885`
+- Deployed and funded on BOTH zones the same day (paradox-clearnet block 4637, logos-testnet),
+  every treasury initialized and minted to 1000000 / 5000000 / 20000000. A live claim on
+  logos-testnet at block 48541 dispensed 295 / 331 / 195.
+- The six treasury addresses are PDAs of this program id and are hardcoded in
+  `kFaucetZones`; `shared/tests/derive_addrs.rs` re-derives them and fails if the program id
+  and the table are ever edited apart.
+
+PREVIOUS build (2026-07-30), superseded because one claim could drain n * claim_amount from a
+treasury against a single cooldown by naming the same token in several pairs:
 
 - Build path used: `cargo risczero build` in docker (reproducible path; the
   risc0/risc0-guest-builder image), after the context/lockfile fixes above.

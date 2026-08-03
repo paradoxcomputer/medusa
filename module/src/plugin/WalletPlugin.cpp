@@ -120,9 +120,11 @@ static constexpr const char* kFaucetProgramId =
 //
 // Re-derived 2026-08-03 for the guest build that rejects a claim naming the same token twice
 // (the previous build let one claim drain n * claim_amount from a treasury against a single
-// cooldown). PENDING ON CHAIN: the program must be deployed and each treasury initialized and
-// funded on both zones before a claim can succeed against these addresses; until then
-// faucetStatus reports the honest "not-funded" reason.
+// cooldown). DEPLOYED AND FUNDED the same day on both zones: program at paradox-clearnet block
+// 4637 and on logos-testnet, every treasury below initialized and minted to 1000000 / 5000000 /
+// 20000000, and a live claim on logos-testnet (block 48541) dispensed 295 / 331 / 195, each
+// inside the advertised 10..500 band. The addresses were derived offline first and the chain
+// then reported the same ones back from init-treasury.
 struct FaucetToken {
     const char* ticker;      // display name, e.g. "GOLD"
     const char* definition;  // token definition account id (base58)
