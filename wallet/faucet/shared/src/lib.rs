@@ -127,6 +127,27 @@ mod helpers {
         AccountId::for_public_pda(faucet_program_id, &marker_seed(claimant_id))
     }
 
+    /// The first token definition that appears more than once in `definition_ids`, or `None`
+    /// when they are all distinct.
+    ///
+    /// A claim pays `claim_amount` once per (recipient, treasury) PAIR, and the whole claim
+    /// binds a SINGLE cooldown marker (the one derived from the first recipient). So a claim
+    /// that names the same definition in several pairs is paid several times over while
+    /// spending one cooldown: passing the GOLD treasury n times is n * claim_amount out of
+    /// that one treasury, bounded only by how many accounts fit in a transaction. The pairs
+    /// are individually well-formed (each treasury really is that definition's PDA), so no
+    /// per-pair check can catch it. Distinctness is a property OF THE SET and has to be
+    /// checked as one.
+    #[must_use]
+    pub fn duplicate_definition(definition_ids: &[AccountId]) -> Option<AccountId> {
+        for (i, id) in definition_ids.iter().enumerate() {
+            if definition_ids[i + 1..].contains(id) {
+                return Some(*id);
+            }
+        }
+        None
+    }
+
     /// Deterministic per-claim amount:
     /// `MIN + (first 8 LE bytes of SHA-256(clock_ms_le || claimant_id || def_id) mod (MAX - MIN + 1))`.
     #[must_use]
@@ -233,6 +254,23 @@ mod tests {
             let back: Instruction = risc0_zkvm::serde::from_slice(&words).expect("decodes");
             assert_eq!(back, ins);
         }
+    }
+
+    // The set-level rule the guest cannot express per pair. Every pair in a duplicated claim
+    // is individually valid, so this is the only thing standing between a treasury and being
+    // drained n * claim_amount at the cost of one cooldown.
+    #[test]
+    fn distinct_definitions_are_accepted_and_repeats_are_caught() {
+        assert_eq!(duplicate_definition(&[]), None);
+        assert_eq!(duplicate_definition(&[id(1)]), None);
+        assert_eq!(duplicate_definition(&[id(1), id(2), id(3)]), None);
+        // adjacent
+        assert_eq!(duplicate_definition(&[id(1), id(1)]), Some(id(1)));
+        // NOT adjacent: the drain does not have to put the repeats side by side
+        assert_eq!(duplicate_definition(&[id(1), id(2), id(1)]), Some(id(1)));
+        assert_eq!(duplicate_definition(&[id(4), id(2), id(3), id(2)]), Some(id(2)));
+        // the whole claim being one repeated definition is the maximal drain
+        assert_eq!(duplicate_definition(&[id(7); 8]), Some(id(7)));
     }
 
     #[test]

@@ -168,6 +168,7 @@ fn claim(
 
     let mut post_states = Vec::with_capacity(pre_states.len());
     let mut chained_calls = Vec::with_capacity(n);
+    let mut definition_ids = Vec::with_capacity(n);
 
     for (recipient, treasury) in recipients.iter().zip(treasuries) {
         // "Claimant-signed": the recipient holding must carry the top-level signature,
@@ -195,6 +196,8 @@ fn claim(
             "Treasury account must be the faucet's PDA for its own definition"
         );
 
+        definition_ids.push(definition_id);
+
         let amount = shared::claim_amount(now_ms, &claimant_id, &definition_id);
 
         // Flip authorization for the chained call; the seed proves our authority
@@ -216,6 +219,17 @@ fn claim(
         // Recipient balances move inside the chained token transfer; at faucet level
         // every account other than the marker is unchanged.
         post_states.push(AccountPostState::new(recipient.account.clone()));
+    }
+
+    // ONE COOLDOWN PAYS FOR THE WHOLE CLAIM, so the claim must not be able to name the same
+    // token twice. Every pair above is individually well-formed - each treasury really is its
+    // own definition's PDA - which is exactly why no per-pair assert can see this: repeat the
+    // GOLD pair n times and each iteration legitimately transfers claim_amount out of the one
+    // GOLD treasury, n * claim_amount in total, against the single marker derived from
+    // recipients[0]. n is bounded only by how many accounts fit in a transaction. Distinctness
+    // is a property of the SET, so it is checked once, here, over what the loop derived.
+    if let Some(dup) = shared::duplicate_definition(&definition_ids) {
+        panic!("Token definition {dup:?} appears in more than one pair of a single claim");
     }
 
     for treasury in treasuries {
