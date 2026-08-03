@@ -311,6 +311,46 @@ class WrapperTest(unittest.TestCase):
             self.assertEqual(self.reg()["names"][DEF], "TOK")   # raises if the file is torn
             self.assertEqual(self.scratch_litter(), [])
 
+    def test_every_token_verb_refuses_a_non_whole_or_non_positive_amount(self):
+        """LEZ has no decimals. Each verb used to get this wrong differently: deshield did not
+        check at all (and only found out after a 900s sync and a real ata create), transfer
+        parsed to None and then skipped every balance guard, shield accepted 0 and negatives
+        because int() returns them happily."""
+        self.std_state()   # a compatible zone, so the amount is what fails and not the probe
+        for amt, why in [("1.5", "decimal"), ("abc", "not a number"),
+                         ("0", "zero"), ("-5", "negative"), ("", "empty")]:
+            rc, out = self.wrap("token-shield", "Public/" + OWNER, PRIV, DEF, amt)
+            self.assertEqual(rc, 1, "shield accepted %s (%s): %s" % (amt, why, out))
+            self.assertIn("amount must be", out["error"])
+
+            rc, out = self.wrap("token-transfer", "Public/" + OWNER, "Public/" + RECIP, DEF, amt)
+            self.assertEqual(rc, 1, "transfer accepted %s (%s): %s" % (amt, why, out))
+            self.assertIn("amount must be", out["error"])
+
+            rc, out = self.wrap("token-deshield", PRIV, "Public/" + OWNER, DEF, amt)
+            self.assertEqual(rc, 1, "deshield accepted %s (%s): %s" % (amt, why, out))
+            self.assertIn("amount must be", out["error"])
+
+    def test_a_non_integer_transfer_amount_never_reaches_the_chain(self):
+        """The old code set amt_n=None, skipped all three balance branches and fell through to
+        an unguarded `ata send` with the raw string."""
+        self.std_state(vault_bal=40, ata_bal=60)
+        before = json.load(open(self.chain))
+        rc, out = self.wrap("token-transfer", "Public/" + OWNER, "Public/" + RECIP, DEF, "1.5")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(json.load(open(self.chain)), before, "the chain was touched anyway")
+
+    def test_the_one_shot_guard_sees_the_joined_to_flag(self):
+        """clap accepts --to=X as readily as --to X, but the guard only scanned the separated
+        form, so the joined one walked straight past it into the engine."""
+        self.std_state()
+        self.seed_reg(definitions=[DEF], names={DEF: "TOK"},
+                      vaults={OWNER: {DEF: VAULT}}, privateDests=[PRIV])
+        rc, out = self.wrap("token", "send", "--from", "Public/" + VAULT,
+                            "--to=" + PRIV, "--amount", "5")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("one-shot", out["error"])
+
     def test_legacy_registry_migrates_to_devnet(self):
         self.seed_chain({})
         with open(os.path.join(self.home, "wallet_config.json"), "w") as f:

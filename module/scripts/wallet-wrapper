@@ -127,6 +127,14 @@ def run(cmd, timeout=90):
         return subprocess.run([WALLET, *cmd], capture_output=True, text=True, input=pw, timeout=timeout)
     except subprocess.TimeoutExpired as e:
         return subprocess.CompletedProcess(cmd, 124, e.stdout or "", "timed out")
+    except OSError as e:
+        # The engine is missing, not executable, or its interpreter is gone. This escaped as an
+        # unhandled FileNotFoundError, so the caller got a Python traceback on stderr and NO
+        # JSON on stdout: the module parses stdout, so a broken install surfaced in the UI as an
+        # empty or unparseable reply rather than as the reason. Every other failure in here
+        # returns a CompletedProcess, so this one does too.
+        return subprocess.CompletedProcess(
+            cmd, 127, "", "wallet engine cannot be run (%s): %s" % (WALLET, e))
 
 
 # ── Token registry (the chain has no holding-enumeration primitive, so we track the
@@ -283,6 +291,25 @@ ZONE_MISMATCH = ("this zone runs a different LEZ build than this wallet (program
                  "switch zone, or install a Medusa built for it")
 
 
+def require_whole_amount(raw):
+    """A positive whole amount, or exit with the JSON error contract.
+
+    LEZ has no decimals, so every amount is a whole number of base units. The three token verbs
+    each used to check this differently, and each was wrong in its own way: token-deshield did
+    not check at all and only found out after a 900s private sync and an on-chain ata create;
+    token-transfer parsed to None on a non-integer and then SKIPPED every balance branch,
+    sending the raw string on a path whose guards had all been bypassed; token-shield parsed as
+    an int but accepted 0 and negatives, which int() is perfectly happy to return. One helper,
+    used by all three, so the rule cannot drift again."""
+    try:
+        n = int(str(raw).strip())
+    except (TypeError, ValueError):
+        print(json.dumps({"error": "amount must be a whole number"})); sys.exit(1)
+    if n <= 0:
+        print(json.dumps({"error": "amount must be greater than zero"})); sys.exit(1)
+    return n
+
+
 # ── THE CLIENT-SIDE TOKEN FAUCET IS GONE ───────────────────────────────────────────────
 # `pinata claim` used to do two things: claim native LEZ on-chain, and then have a SEPARATE
 # treasury wallet (~/.local/share/medusa-treasury) `token send` a random amount of each
@@ -366,9 +393,17 @@ def emit(proc):
 
 
 def id_arg():
+    # BOTH spellings. clap accepts `--to X` and `--to=X` alike, so a scan that only knew the
+    # separated form silently returned None for the joined one: the one-shot private-recipient
+    # guard and the pre-send private sync both key off this, and both would quietly skip on a
+    # `--to=Private/...` the engine went on to execute. The module always emits the separated
+    # form, but the wrapper is a CLI in its own right and passes user argv through verbatim.
     for i, a in enumerate(args):
         if a in ("--to", "--account-id") and i + 1 < len(args):
             return args[i + 1]
+        for flag in ("--to=", "--account-id="):
+            if a.startswith(flag):
+                return a[len(flag):]
     return None
 
 
@@ -580,10 +615,18 @@ if args and args[0] == "tokens":
 # ATA to the recipient's ATA: derive both ATAs, create the recipient's (permissionless,
 # idempotent), token-send from the sender's ATA, and WAIT for the balance to land.
 if args and args[0] == "token-transfer" and len(args) >= 5:
+    # Same gate token-shield has. Without it a program-id mismatch surfaced as
+    # "insufficient token balance": the balance probes read a chain whose token program is a
+    # different build, come back 0, and the wallet blames the user's funds for a zone problem.
+    if not zone_compatible():
+        print(json.dumps({"error": ZONE_MISMATCH})); sys.exit(1)
     frm = args[1].split("/")[-1]
     to = args[2].split("/")[-1]
     defb = args[3].split("/")[-1]
     amt = args[4]
+    # Validated HERE, before the recipient's ATA is created on chain below: a bad amount used
+    # to be caught only after that write, so a typo still cost a real transaction.
+    amt_n = require_whole_amount(amt)
 
     def ata_addr(owner):
         r = run(["ata", "address", "--owner", owner, "--token-definition", defb])
@@ -613,10 +656,6 @@ if args and args[0] == "token-transfer" and len(args) >= 5:
     vault_ok = (vd == defb)
     vb = vb or 0
     ata_src = ata_balance(frm, defb) or 0
-    try:
-        amt_n = int(amt)
-    except ValueError:
-        amt_n = None
     if amt_n is not None and vault_ok and vb >= amt_n:
         snd = run(["token", "send", "--from", "Public/" + v,
                    "--to", "Public/" + recip_ata, "--amount", amt], timeout=300)
@@ -666,10 +705,7 @@ if args and args[0] == "token-shield" and len(args) >= 5:
         print(json.dumps({"error": ZONE_MISMATCH})); sys.exit(1)
     dest = args[2] if args[2].startswith("Private/") else "Private/" + args[2].split("/")[-1]
     defb = args[3].split("/")[-1]
-    try:
-        amt = int(args[4])
-    except ValueError:
-        print(json.dumps({"error": "amount must be a whole number"})); sys.exit(1)
+    amt = require_whole_amount(args[4])
     blocked = private_dest_block(dest)
     if blocked:
         print(json.dumps({"error": blocked})); sys.exit(1)
@@ -711,10 +747,15 @@ if args and args[0] == "token-shield" and len(args) >= 5:
 # recipient owner's ATA: sync the private tree, ensure the ATA exists (permissionless,
 # idempotent), then send from the private note to the ATA (proven recipient shape).
 if args and args[0] == "token-deshield" and len(args) >= 5:
+    if not zone_compatible():
+        print(json.dumps({"error": ZONE_MISMATCH})); sys.exit(1)
     frm = args[1] if args[1].startswith("Private/") else "Private/" + args[1].split("/")[-1]
     to_owner = args[2].split("/")[-1]
     defb = args[3].split("/")[-1]
-    amt = args[4]
+    # Validated BEFORE the 900s private sync and the on-chain ata create below: this verb used
+    # to take the amount on trust, so a typo bought a quarter-hour of syncing and a real
+    # transaction before the engine rejected it.
+    amt = str(require_whole_amount(args[4]))
     run(["account", "sync-private"], timeout=900)
     run(["ata", "create", "--owner", "Public/" + to_owner, "--token-definition", defb],
         timeout=300)
@@ -943,12 +984,14 @@ def _sends_from_private(a):
 # native and token alike). Checked BEFORE the sync hook: rejecting a bad destination
 # must not cost the caller a multi-minute chain scan first.
 if "send" in args:
-    for _i in range(len(args) - 1):
-        if args[_i] == "--to" and args[_i + 1].startswith("Private/"):
-            _blocked = private_dest_block(args[_i + 1])
-            if _blocked:
-                print(json.dumps({"error": _blocked})); sys.exit(1)
-            break
+    # Via id_arg(), which knows both `--to X` and `--to=X`. This used to scan for the separated
+    # form inline, so a `--to=Private/...` slipped past the guard and into the engine: the same
+    # blind spot the sync hook below already avoided by using id_arg().
+    _dest = id_arg()
+    if _dest and _dest.startswith("Private/"):
+        _blocked = private_dest_block(_dest)
+        if _blocked:
+            print(json.dumps({"error": _blocked})); sys.exit(1)
 
 # AUTO-REGISTER THE RECIPIENT of an outbound native transfer (see ensure_recipient_registered
 # above for the eight-minute silent failure this prevents). Placed here, on the passthrough
