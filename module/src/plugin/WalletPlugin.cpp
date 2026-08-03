@@ -82,7 +82,7 @@ static QString logosTestnetUrl()
 // the claim at a DIFFERENT program. faucetPreflight() runs `info --bin` (offline: no wallet, no
 // network) and refuses unless the answer is exactly this string.
 static constexpr const char* kFaucetProgramId =
-    "523320bdfff97cdbec1f01fdb5de9c37b4555abb7585cd123d77e9d09756e571";
+    "3c56ad0e1d2be3b57582d91187892daa8be2b63d300c2c9d9df318a494dcb885";
 
 // ── WHICH ZONES HAVE THE TOKEN FAUCET, AND WHAT IT DISPENSES ON EACH ──────────────────────────
 // The program ID above is one constant for every zone (see why, above). The TOKENS are not: a
@@ -112,8 +112,17 @@ static constexpr const char* kFaucetProgramId =
 // because it is the account an operator funds and the account faucetStatus() has to be able to
 // name, and because a row that gives only the definition is half a fact.
 //
-// Verified on chain 2026-07-31 (decoded from raw getAccount bytes): every treasury below is
-// initialized and funded, 1000000 / 5000000 / 20000000 respectively on each zone.
+// THESE ADDRESSES BELONG TO THE PROGRAM ID ABOVE. A treasury is a PDA of the faucet program,
+// so changing the guest changes its ImageID, which changes the program id, which moves every
+// treasury below. The two are one fact and must be edited together: wallet/faucet/shared's
+// `shipped_table_matches_the_program_id` test derives these six from kFaucetProgramId and fails
+// if anyone updates one without the other.
+//
+// Re-derived 2026-08-03 for the guest build that rejects a claim naming the same token twice
+// (the previous build let one claim drain n * claim_amount from a treasury against a single
+// cooldown). PENDING ON CHAIN: the program must be deployed and each treasury initialized and
+// funded on both zones before a claim can succeed against these addresses; until then
+// faucetStatus reports the honest "not-funded" reason.
 struct FaucetToken {
     const char* ticker;      // display name, e.g. "GOLD"
     const char* definition;  // token definition account id (base58)
@@ -127,19 +136,19 @@ static constexpr FaucetZoneRow kFaucetZones[] = {
     // Paradox Computer clearnet - https://seq-testnet.paradox.computer/
     { "paradox-clearnet", {
         { "GOLD", "5YEhWdY2edtRFkCruXjtnFH5F62VkCiCxXmNAvHuVkEY",
-                  "A9NwZksDYPzZzpdnbHmJkcEwgHvbGmmYNsYV9rHGoxAF" },
+                  "Fed1dmPD9aNNyMQrPkSbLznyqVBCJ7Q25bbzQV1rxGnL" },
         { "SILV", "HUDERmRqyX6swMnuk9FT5vmqNbcdLNbVxDRtLEdzsMXk",
-                  "5iG2BTUhWCmgviBw54ZMtr3qjSMyLfPz7pMNAwvk6kiQ" },
+                  "CWd7PbmCfebZ9ziK1bvmjj8RiDi5XCXW78H4qYdWCTMP" },
         { "BRNZ", "3zS3bGdToZcqPU9jBZC8c1aK9MQvpekse9EJ52nD1wiM",
-                  "89MWMvGchyEVq4FZFQPsXS747LQjLe4L9ev4hXMBY8PK" } } },
+                  "7HvJ5wqSL3NXf1CmGpoDDLj8nk42S39wULuM2TAtzmXx" } } },
     // Logos public testnet - https://testnet.lez.logos.co/
     { "logos-testnet", {
         { "GOLD", "7ZZGE941fzSGCAfxxdkPWQszSspBhZEcjHUkLqWrrnz6",
-                  "8LM3oT3tBjd1yjU4bUWgSqbNuiBx4KCevoqDC8wJ2Ygc" },
+                  "D8ScxGNvPLtCeLbPphWSKeei36Lj5tbmFxGGgxr66jsV" },
         { "SILV", "CfuvpaUhbxEzWd6ZtLDiKWVg5DZLiYj14Q8HgtDUwuS6",
-                  "y9ri8KzcYcDepcwLBPzr6J9LgGo2av95zzM7juKLX98" },
+                  "DZQnfiJBz9YZkzkmMDFhHjgk2zZEKLM5oSrfX8SmXXdB" },
         { "BRNZ", "EEMUsdWL1WxrQBi1SmNFUKVcMUjgVcky12NRv2BjBuxp",
-                  "51M7wrFPUKpo9dZAd53U8RdUmrgARXtqT3Ls9DksuALm" } } },
+                  "CZxne337Uh7ezNVZcNASN5yN9G7uEkCm1MLpHHdVRPD" } } },
 };
 
 // The row for a zone, or nullptr when that zone has no token faucet. The ONE place the

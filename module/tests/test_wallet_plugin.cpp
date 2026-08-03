@@ -88,7 +88,7 @@ static const QString kForeignRecipient =
 // mixed in. It was deployed under exactly this id to seq-testnet.paradox.computer (block 975)
 // and testnet.lez.logos.co (block 44810) on 2026-07-31.
 static const QString kFaucetId =
-    QStringLiteral("523320bdfff97cdbec1f01fdb5de9c37b4555abb7585cd123d77e9d09756e571");
+    QStringLiteral("3c56ad0e1d2be3b57582d91187892daa8be2b63d300c2c9d9df318a494dcb885");
 
 // ── The per-zone faucet token table, transcribed independently of the module ───────────────
 // Same reasoning as kFaucetId: these are chain facts (definitions minted and treasuries funded
@@ -100,9 +100,9 @@ static const QStringList kParadoxDefs{
     QStringLiteral("HUDERmRqyX6swMnuk9FT5vmqNbcdLNbVxDRtLEdzsMXk"),   // SILV
     QStringLiteral("3zS3bGdToZcqPU9jBZC8c1aK9MQvpekse9EJ52nD1wiM") }; // BRNZ
 static const QStringList kParadoxTreasuries{
-    QStringLiteral("A9NwZksDYPzZzpdnbHmJkcEwgHvbGmmYNsYV9rHGoxAF"),
-    QStringLiteral("5iG2BTUhWCmgviBw54ZMtr3qjSMyLfPz7pMNAwvk6kiQ"),
-    QStringLiteral("89MWMvGchyEVq4FZFQPsXS747LQjLe4L9ev4hXMBY8PK") };
+    QStringLiteral("Fed1dmPD9aNNyMQrPkSbLznyqVBCJ7Q25bbzQV1rxGnL"),
+    QStringLiteral("CWd7PbmCfebZ9ziK1bvmjj8RiDi5XCXW78H4qYdWCTMP"),
+    QStringLiteral("7HvJ5wqSL3NXf1CmGpoDDLj8nk42S39wULuM2TAtzmXx") };
 static const QStringList kLogosDefs{
     QStringLiteral("7ZZGE941fzSGCAfxxdkPWQszSspBhZEcjHUkLqWrrnz6"),   // GOLD
     QStringLiteral("CfuvpaUhbxEzWd6ZtLDiKWVg5DZLiYj14Q8HgtDUwuS6"),   // SILV
