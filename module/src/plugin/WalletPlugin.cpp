@@ -2937,6 +2937,23 @@ QString WalletPlugin::startTokenFaucet(const QString& accountId, const QString& 
     if (!pf.ok)
         return errorJson(pf.message, pf.reason);
 
+    // REGISTER THIS ZONE'S DEFINITIONS. The Tokens view asks the wrapper for `tokens
+    // <account>`, and that walks reg["definitions"] - a definition the registry has never
+    // heard of is a token the wallet cannot display, whatever the chain says the account
+    // holds. Those entries used to arrive as a SIDE EFFECT of `token-registry vault`, which
+    // ensureFaucetRecipients ran once per definition on every claim; removing the minting
+    // removed the registration with it, and a freshly claimed wallet showed no tokens at all.
+    // Registering here, on the claim itself, is where it belongs: this is the moment the
+    // wallet learns the zone pays these three tokens. faucetStatus must NOT do it - it is the
+    // read-only path the Tokens tab polls.
+    for (const QString& def : std::as_const(pf.definitions)) {
+        const QString reg = runWalletCommand({ QStringLiteral("token-registry"),
+                                               QStringLiteral("add"), def }, 30000);
+        if (QJsonDocument::fromJson(reg.toUtf8()).object().contains(QStringLiteral("error")))
+            appendLog(QStringLiteral("faucet: could not register %1 for display: %2")
+                          .arg(def, reg), QStringLiteral("error"));
+    }
+
     // NOTHING IS MINTED HERE ANY MORE. The faucet pays into the claiming account's own
     // associated token accounts, which are DERIVED from (account, definition) rather than
     // created as accounts of their own, so there is nothing to provision and nothing new for

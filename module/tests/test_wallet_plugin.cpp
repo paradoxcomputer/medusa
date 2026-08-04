@@ -962,6 +962,31 @@ private slots:
     // A claim never uses the user's own account as a recipient. On rc5 an account holds exactly
     // ONE token definition, so spending the main account here would bind it to one token
     // permanently - the wallet's per-definition holdings are the only correct targets.
+    // A CLAIM MAKES THE ZONE'S TOKENS DISPLAYABLE. The Tokens view walks the registry's
+    // definitions, so a definition it has never heard of is a token the wallet cannot show
+    // whatever the chain says the account holds. These entries used to arrive as a side effect
+    // of `token-registry vault`, which the old minting path ran per definition; when the ATA
+    // rewrite removed the minting it removed the registration too, and a freshly claimed
+    // wallet displayed no tokens at all.
+    void testAClaimRegistersTheZonesDefinitionsSoTheyCanBeDisplayed()
+    {
+        useWorkingFaucet();
+        WalletPlugin p;
+        arm(p);
+        const QString cliArgv = qEnvironmentVariable("MEDUSA_WALLET_CLI") + QStringLiteral(".argv");
+        QFile::remove(cliArgv);
+
+        const auto r = parseObj(p.startTokenFaucet(QStringLiteral("Public/my-main-account"), kPw));
+        QVERIFY2(r.contains(QStringLiteral("jobId")), qPrintable(QJsonDocument(r).toJson()));
+        awaitJob(p, r[QStringLiteral("jobId")].toString());
+
+        const QString argv = slurp(cliArgv);
+        for (const QString& def : kParadoxDefs)
+            QVERIFY2(argv.contains(QStringLiteral("token-registry\nadd\n") + def),
+                     qPrintable(QStringLiteral("definition %1 was never registered:\n%2")
+                                    .arg(def, argv)));
+    }
+
     // THE CLAIM NAMES THE USER'S OWN ACCOUNT, exactly one of them. The client derives that
     // account's ATA per definition, so the account the user selected is the one credited, and
     // the cooldown marker binds to it rather than to whatever holding happened to be paid.

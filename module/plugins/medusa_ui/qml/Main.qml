@@ -625,6 +625,9 @@ Rectangle {
         if (isError === true) noticeTimer.stop()
         else noticeTimer.restart()
     }
+    // True while any account balance is still the "…" placeholder, i.e. the background chain
+    // fetch has not returned. Drives the "counting" hint on the totals.
+    property bool   balancesLoading: false
     property string notice:      ""
     property bool   noticeError: false
 
@@ -1193,8 +1196,14 @@ Rectangle {
     // ── Privacy helpers ─────────────────────────────────────────────────────────
     function refreshAccountBuckets() {
         var pub = [], priv = [], privEmpty = [], pubT = 0, privT = 0
+        root.balancesLoading = false
         for (var i = 0; i < accountModel.count; i++) {
             var a = accountModel.get(i)
+            // The account LIST is local and instant; balances arrive from a background chain
+            // fetch and land as "…" until it returns. A total built from those is INCOMPLETE,
+            // and shown bare it reads as "you have nothing" - the one reading a wallet must
+            // never invite. So track it and say we are still counting.
+            if (a.balance === "…" || a.balance === "") root.balancesLoading = true
             var n = parseFloat(a.balance) || 0          // native LEZ balance
             if ((a.type || "public") === "private") {
                 priv.push(a.id); privT += n
@@ -4276,7 +4285,13 @@ Rectangle {
                 anchors.centerIn: parent
                 width: parent.width - 36
                 spacing: root.sp1 + 2
-                Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "TOTAL BALANCE"; color: root.textDisabled
+                Text { textFormat: Text.PlainText; font.family: root.faceFont
+                    // Says WHY the figure below may be short. The account list is local and
+                    // appears at once; the balances come from a background chain fetch, and a
+                    // total assembled from placeholders looked like an empty wallet with no
+                    // indication anything was still happening.
+                    text: root.balancesLoading ? "COUNTING BALANCES…" : "TOTAL BALANCE"
+                    color: root.balancesLoading ? root.accentOrange : root.textDisabled
                     font.pixelSize: root.fsXS; font.letterSpacing: 2; Layout.alignment: Qt.AlignHCenter }
                 RowLayout {
                     Layout.alignment: Qt.AlignHCenter; spacing: root.sp2
