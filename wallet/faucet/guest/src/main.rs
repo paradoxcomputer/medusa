@@ -29,6 +29,7 @@ use lee_core::{
         ProgramOutput, read_lee_inputs,
     },
 };
+use associated_token_account_core::verify_ata_and_get_seed;
 use medusa_faucet_shared::{self as shared, Instruction};
 use token_core::TokenHolding;
 
@@ -52,7 +53,9 @@ fn main() {
 
     let (post_states, chained_calls) = match instruction {
         Instruction::InitTreasury => init_treasury(self_program_id, &pre_states),
-        Instruction::Claim => claim(self_program_id, &pre_states),
+        Instruction::Claim { ata_program_id } => {
+            claim(self_program_id, ata_program_id, &pre_states)
+        }
     };
 
     ProgramOutput::new(
@@ -116,25 +119,37 @@ fn init_treasury(
     (post_states, vec![chained_call])
 }
 
-/// `Claim`: pre-states `[recipient_1..recipient_n, treasury_1..treasury_n, marker, clock]`.
+/// `Claim`: pre-states `[owner, ata_1..ata_n, treasury_1..treasury_n, marker, clock]`.
 ///
-/// Enforces the cooldown via `CLOCK_01`, records the claim in the marker PDA
-/// (created on first use via `Claim::Pda`), and emits one chained token transfer per
-/// treasury, each authorized with that treasury's own PDA seed.
+/// Dispenses into the CLAIMANT'S OWN associated token accounts. A LEZ account holds exactly
+/// one token definition, so a person's account cannot hold three; their ATAs can, and an ATA
+/// is derived from (owner, definition), so the balance is already that account's. Nothing new
+/// appears in the user's account list, and the cooldown binds to the account they actually
+/// have rather than to a holding that can be re-minted for a fresh cooldown.
 fn claim(
     self_program_id: ProgramId,
+    ata_program_id: ProgramId,
     pre_states: &[AccountWithMetadata],
 ) -> (Vec<AccountPostState>, Vec<ChainedCall>) {
     assert!(
-        pre_states.len() >= 4 && pre_states.len() % 2 == 0,
-        "Claim requires 2n + 2 accounts: [recipients.., treasuries.., marker, clock]"
+        pre_states.len() >= 5 && pre_states.len() % 2 == 1,
+        "Claim requires 2n + 3 accounts: [owner, atas.., treasuries.., marker, clock]"
     );
-    let n = (pre_states.len() - 2) / 2;
-    let (recipients, rest) = pre_states.split_at(n);
+    let n = (pre_states.len() - 3) / 2;
+    let (owner, rest) = pre_states.split_first().expect("length checked above");
+    let (atas, rest) = rest.split_at(n);
     let (treasuries, tail) = rest.split_at(n);
     let [marker, clock] = tail else {
         unreachable!("tail is exactly [marker, clock] by construction");
     };
+
+    // THE ONLY THING PROVING WHO IS CLAIMING. The ATAs below carry no signature of their own
+    // (they are PDAs, and the token program authorizes the SENDER only), so without this a
+    // caller could name somebody else's ATAs, or their own with a marker they picked.
+    assert!(
+        owner.is_authorized,
+        "The claimant's owner account must be authorized"
+    );
 
     // Clock account: read-only system pre-state (mirrors pinata_cooldown).
     assert_eq!(
@@ -143,8 +158,8 @@ fn claim(
     );
     let now_ms = ClockAccountData::from_bytes(&clock.account.data.clone().into_inner()).timestamp;
 
-    // The claimant is the first recipient; the marker PDA is bound to it.
-    let claimant_id = recipients[0].account_id;
+    // The cooldown binds to the OWNER, not to any holding it happens to be paid into.
+    let claimant_id = owner.account_id;
     let m_seed = shared::marker_seed(&claimant_id);
     assert_eq!(
         marker.account_id,
@@ -170,14 +185,9 @@ fn claim(
     let mut chained_calls = Vec::with_capacity(n);
     let mut definition_ids = Vec::with_capacity(n);
 
-    for (recipient, treasury) in recipients.iter().zip(treasuries) {
-        // "Claimant-signed": the recipient holding must carry the top-level signature,
-        // which also lets the token program claim/initialize it on first transfer.
-        assert!(
-            recipient.is_authorized,
-            "Recipient holding must be signed by the claimant"
-        );
+    post_states.push(AccountPostState::new(owner.account.clone()));
 
+    for (ata, treasury) in atas.iter().zip(treasuries) {
         // Token program id derived from the treasury holding's owner - never hardcoded
         // (mirrors ata::transfer).
         let token_program_id = treasury.account.program_owner;
@@ -196,6 +206,12 @@ fn claim(
             "Treasury account must be the faucet's PDA for its own definition"
         );
 
+        // The destination must be THIS owner's ATA for THIS definition, checked against the
+        // derivation rather than trusted because it sits in the right slot. Without this the
+        // claim would pay whatever account the caller put here while still spending the
+        // owner's cooldown.
+        let _ata_seed = verify_ata_and_get_seed(ata, owner, definition_id, ata_program_id);
+
         definition_ids.push(definition_id);
 
         let amount = shared::claim_amount(now_ms, &claimant_id, &definition_id);
@@ -208,7 +224,7 @@ fn claim(
         chained_calls.push(
             ChainedCall::new(
                 token_program_id,
-                vec![treasury_auth, recipient.clone()],
+                vec![treasury_auth, ata.clone()],
                 &token_core::Instruction::Transfer {
                     amount_to_transfer: amount,
                 },
@@ -216,18 +232,17 @@ fn claim(
             .with_pda_seeds(vec![t_seed]),
         );
 
-        // Recipient balances move inside the chained token transfer; at faucet level
-        // every account other than the marker is unchanged.
-        post_states.push(AccountPostState::new(recipient.account.clone()));
+        // Balances move inside the chained token transfer; at faucet level every account
+        // other than the marker is unchanged.
+        post_states.push(AccountPostState::new(ata.account.clone()));
     }
 
     // ONE COOLDOWN PAYS FOR THE WHOLE CLAIM, so the claim must not be able to name the same
     // token twice. Every pair above is individually well-formed - each treasury really is its
-    // own definition's PDA - which is exactly why no per-pair assert can see this: repeat the
-    // GOLD pair n times and each iteration legitimately transfers claim_amount out of the one
-    // GOLD treasury, n * claim_amount in total, against the single marker derived from
-    // recipients[0]. n is bounded only by how many accounts fit in a transaction. Distinctness
-    // is a property of the SET, so it is checked once, here, over what the loop derived.
+    // own definition's PDA, and each ATA really is this owner's for that definition - which is
+    // exactly why no per-pair assert can see this: repeat the GOLD pair n times and each
+    // iteration legitimately transfers claim_amount out of the one GOLD treasury, n *
+    // claim_amount in total, against a single marker. Distinctness is a property of the SET.
     if let Some(dup) = shared::duplicate_definition(&definition_ids) {
         panic!("Token definition {dup:?} appears in more than one pair of a single claim");
     }

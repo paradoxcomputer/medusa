@@ -88,7 +88,7 @@ static const QString kForeignRecipient =
 // mixed in. It was deployed under exactly this id to seq-testnet.paradox.computer (block 975)
 // and testnet.lez.logos.co (block 44810) on 2026-07-31.
 static const QString kFaucetId =
-    QStringLiteral("3c56ad0e1d2be3b57582d91187892daa8be2b63d300c2c9d9df318a494dcb885");
+    QStringLiteral("214dc4329f8d260eaa6e91818fc299ed201d366b3d2d235e716cc1672ab2b4b1");
 
 // ── The per-zone faucet token table, transcribed independently of the module ───────────────
 // Same reasoning as kFaucetId: these are chain facts (definitions minted and treasuries funded
@@ -100,9 +100,9 @@ static const QStringList kParadoxDefs{
     QStringLiteral("HUDERmRqyX6swMnuk9FT5vmqNbcdLNbVxDRtLEdzsMXk"),   // SILV
     QStringLiteral("3zS3bGdToZcqPU9jBZC8c1aK9MQvpekse9EJ52nD1wiM") }; // BRNZ
 static const QStringList kParadoxTreasuries{
-    QStringLiteral("Fed1dmPD9aNNyMQrPkSbLznyqVBCJ7Q25bbzQV1rxGnL"),
-    QStringLiteral("CWd7PbmCfebZ9ziK1bvmjj8RiDi5XCXW78H4qYdWCTMP"),
-    QStringLiteral("7HvJ5wqSL3NXf1CmGpoDDLj8nk42S39wULuM2TAtzmXx") };
+    QStringLiteral("7wkFSuBQyUeTaKKfoFAKpKxe3FQTNHqkqK4BPLTvLyb5"),
+    QStringLiteral("38nM3WKHCMpBXxgG3W19V6g3Z2bXs6efekcph3RKfC6Z"),
+    QStringLiteral("ArdHwtFt75239nKcFgaHYUGCh8nHyGi3hbHeJn9svnM9") };
 static const QStringList kLogosDefs{
     QStringLiteral("7ZZGE941fzSGCAfxxdkPWQszSspBhZEcjHUkLqWrrnz6"),   // GOLD
     QStringLiteral("CfuvpaUhbxEzWd6ZtLDiKWVg5DZLiYj14Q8HgtDUwuS6"),   // SILV
@@ -897,7 +897,12 @@ private slots:
     // creates one)", advice that stopped being true the moment the client-side token drop was
     // removed. The on-chain program accepts an uninitialized recipient, so the claim path mints
     // one per definition and records it, and the claim goes ahead.
-    void testAWalletWithNoHoldingHasOneCreatedForItRatherThanBeingRefused()
+    // NOTHING IS MINTED FOR A CLAIM. The faucet pays into the claiming account's own ATAs,
+    // which are DERIVED from (account, definition), so a wallet holding nothing needs no
+    // provisioning: there is no account to create and none appears in the user's list. This
+    // used to mint one holding per definition, and those holdings then showed up as ordinary
+    // accounts a user could select and claim from.
+    void testAClaimMintsNothingEvenWhenTheWalletHoldsNoTokens()
     {
         qputenv("MEDUSA_FAUCET_CLIENT", makeFaucetClient(kFaucetId).toUtf8());
         qputenv("MEDUSA_FAUCET_BIN",    makeFaucetGuestBin().toUtf8());
@@ -905,33 +910,19 @@ private slots:
 
         WalletPlugin p;
         arm(p);
-        // Status stays honest AND stays read-only: it reports the faucet as available (it is),
-        // and it must not mint anything, because the UI calls it on every Tokens-tab open.
         const auto st = parseObj(p.faucetStatus());
         QCOMPARE(st[QStringLiteral("available")].toBool(), true);
-        const QString cliArgv = qEnvironmentVariable("MEDUSA_WALLET_CLI") + QStringLiteral(".argv");
-        QVERIFY2(!slurp(cliArgv).contains(QStringLiteral("new")),
-                 "faucetStatus created an account - a read-only status call must not write");
 
         const auto r = parseObj(p.startTokenFaucet(QStringLiteral("Public/a"), kPw));
         QVERIFY2(r.contains(QStringLiteral("jobId")), qPrintable(QJsonDocument(r).toJson()));
         awaitJob(p, r[QStringLiteral("jobId")].toString());
 
-        // One account per definition, each recorded as that definition's vault BEFORE the
-        // claim: the cooldown marker PDA is derived from the first recipient, so a claim that
-        // minted fresh accounts every time would never bind to a marker at all.
-        const QString argv = slurp(cliArgv);
-        QCOMPARE(argv.count(QStringLiteral("\nnew\n")), kParadoxDefs.size());
-        for (const QString& def : kParadoxDefs)
-            QVERIFY2(argv.contains(QStringLiteral("\nvault\n") + def),
-                     qPrintable(QStringLiteral("no vault was recorded for ") + def));
-
-        const QStringList cargv = slurp(qEnvironmentVariable("MEDUSA_FAUCET_CLIENT")
-                                        + QStringLiteral(".argv"))
-                                      .split(QLatin1Char('\n'), Qt::SkipEmptyParts);
-        const int acct = cargv.indexOf(QStringLiteral("--account"));
-        QVERIFY(acct >= 0);
-        QCOMPARE(cargv.at(acct + 1), QString("minted1,minted2,minted3"));
+        const QString argv = slurp(qEnvironmentVariable("MEDUSA_WALLET_CLI")
+                                   + QStringLiteral(".argv"));
+        QVERIFY2(!argv.contains(QStringLiteral("\nnew\n")),
+                 qPrintable(QStringLiteral("the claim created an account:\n") + argv));
+        QVERIFY2(!argv.contains(QStringLiteral("\nvault\n")),
+                 qPrintable(QStringLiteral("the claim recorded a vault:\n") + argv));
     }
 
     // Vaults belong to ONE account. A holding recorded for account A must never be handed to a
@@ -939,7 +930,12 @@ private slots:
     // faucet always paid the same holding whichever account you claimed from, only that account
     // could shield, and every other account displayed tokens it could not spend. B has no vault
     // of its own here, so it must MINT fresh holdings rather than inherit A's.
-    void testAVaultBelongsToOneAccountAndIsNeverReusedByAnother()
+    // PER-ACCOUNT SEPARATION SURVIVES THE MOVE TO ATAs, and needs no registry to do it: an ATA
+    // is derived from (account, definition), so account B's claim can only ever credit B. The
+    // old shape kept this in the vault map and got it wrong once already, handing one holding
+    // to every account. Now the chain's own derivation enforces it and the module just names
+    // the account.
+    void testAClaimForOneAccountCannotCreditAnother()
     {
         useWorkingFaucet();
         useCli(makeTokenCli(registryWithVaults(kParadoxDefs, QStringLiteral("account-A"))));
@@ -955,18 +951,21 @@ private slots:
                                      .split(QLatin1Char('\n'), Qt::SkipEmptyParts);
         const int acct = argv.indexOf(QStringLiteral("--account"));
         QVERIFY(acct >= 0);
-        const QString recipients = argv.at(acct + 1);
-        // Not A's vaults, and not B's own account either (an account holds one definition).
+        // B's claim names B, and nothing of A's: not A itself, and not a holding recorded to A.
+        QCOMPARE(argv.at(acct + 1), QString("account-B"));
+        QVERIFY2(!argv.at(acct + 1).contains(QStringLiteral("account-A")), "A leaked into B's claim");
         for (const QString& v : vaultIds(kParadoxDefs.size()))
-            QVERIFY2(!recipients.contains(v),
-                     qPrintable(QStringLiteral("B was handed A's vault %1: %2").arg(v, recipients)));
-        QVERIFY2(!recipients.contains(QStringLiteral("account-B")), qPrintable(recipients));
+            QVERIFY2(!argv.at(acct + 1).contains(v),
+                     qPrintable(QStringLiteral("B's claim named A's vault %1").arg(v)));
     }
 
     // A claim never uses the user's own account as a recipient. On rc5 an account holds exactly
     // ONE token definition, so spending the main account here would bind it to one token
     // permanently - the wallet's per-definition holdings are the only correct targets.
-    void testAClaimTargetsThePerTokenHoldingsAndNeverTheUsersAccount()
+    // THE CLAIM NAMES THE USER'S OWN ACCOUNT, exactly one of them. The client derives that
+    // account's ATA per definition, so the account the user selected is the one credited, and
+    // the cooldown marker binds to it rather than to whatever holding happened to be paid.
+    void testAClaimTargetsTheSelectedAccountItself()
     {
         useWorkingFaucet();
         WalletPlugin p;
@@ -983,14 +982,12 @@ private slots:
         const int acct = argv.indexOf(QStringLiteral("--account"));
         const int defs = argv.indexOf(QStringLiteral("--definitions"));
         QVERIFY(acct >= 0 && defs >= 0);
-        QCOMPARE(argv.at(acct + 1), vaultIds(kParadoxDefs.size()).join(QLatin1Char(',')));
+        // The selected account, bare and alone: not a list, and not a minted holding.
+        QCOMPARE(argv.at(acct + 1), QString("my-main-account"));
+        QVERIFY2(!argv.at(acct + 1).contains(QLatin1Char(',')),
+                 "the claim still passes a list of holdings instead of the one account");
         // …and the definitions are the ACTIVE ZONE's, from the module's table.
         QCOMPARE(argv.at(defs + 1), kParadoxDefs.join(QLatin1Char(',')));
-        QVERIFY2(!argv.at(acct + 1).contains(QStringLiteral("my-main-account")),
-                 "the claim used the user's own account as a token holding");
-        // One recipient per definition, in the same order: the client pairs them positionally.
-        QCOMPARE(argv.at(acct + 1).split(QLatin1Char(',')).size(),
-                 argv.at(defs + 1).split(QLatin1Char(',')).size());
     }
 
     // The client is not the wallet wrapper, so nothing defaults LEE_WALLET_HOME_DIR for it. If

@@ -20,6 +20,10 @@ common = { path = "../../.lez-build/lez/common" }
 sequencer_service_rpc = { path = "../../.lez-build/lez/sequencer/service/rpc", features = ["client"] }
 clock_core = { path = "../../.lez-build/lez/programs/clock/core" }
 medusa_faucet_shared = { path = "../shared" }
+# ATA derivation, so the client addresses the SAME accounts the guest verifies.
+associated_token_account_core = { path = "../../.lez-build/lez/programs/associated_token_account/core" }
+# The zone's built-in program registry, for the ATA program id the derivation needs.
+programs = { path = "../../.lez-build/lez/programs" }
 
 anyhow = "1.0.98"
 bytemuck = "1.24.0"

@@ -21,6 +21,8 @@ use common::{HashType, transaction::LeeTransaction};
 use lee::{AccountId, ProgramDeploymentTransaction, program::Program};
 use lee_core::program::{DEFAULT_PROGRAM_ID, ProgramId};
 use medusa_faucet_shared as shared;
+use associated_token_account_core::{compute_ata_seed, get_associated_token_account_id};
+use wallet::program_facades::ata::Ata;
 use sequencer_service_rpc::{RpcClient as _, SequencerClient};
 use wallet::{
     AccountIdentity, WalletCore,
@@ -214,33 +216,45 @@ async fn claim(
 ) -> Result<serde_json::Value> {
     let (_bytes, program_id) = load_program(bin)?;
 
-    let recipients = parse_account_id_list(account).context("invalid --account")?;
-    let definition_ids = parse_account_id_list(definitions).context("invalid --definitions")?;
-    if recipients.len() != definition_ids.len() {
+    // ONE owner, not a list. Tokens land in the claimant's own associated token accounts, and an
+    // ATA is derived from (owner, definition), so the caller no longer supplies a holding per
+    // token: it supplies the account the tokens belong to and the definitions it wants.
+    let owners = parse_account_id_list(account).context("invalid --account")?;
+    if owners.len() != 1 {
         bail!(
-            "got {} recipient account(s) for {} definition(s) - a holding account can hold \
-             exactly one token definition, so pass one comma-separated recipient per definition \
-             (same order)",
-            recipients.len(),
-            definition_ids.len()
+            "--account takes exactly ONE account id, the claimant whose ATAs receive the tokens              (got {})",
+            owners.len()
         );
     }
-    for window in [&recipients, &definition_ids] {
+    let owner_id = owners[0];
+    let definition_ids = parse_account_id_list(definitions).context("invalid --definitions")?;
+    if definition_ids.is_empty() {
+        bail!("--definitions must name at least one token definition");
+    }
+    {
+        // A definition repeated in one claim would be paid twice against a single cooldown.
+        // The guest refuses it too; catching it here saves a round trip and names the argument.
         let mut seen = std::collections::HashSet::new();
-        if !window.iter().all(|id| seen.insert(*id)) {
-            bail!("duplicate account ids are not allowed within --account/--definitions");
+        if !definition_ids.iter().all(|id| seen.insert(*id)) {
+            bail!("duplicate token definitions are not allowed within --definitions");
         }
     }
 
-    // Recipients are the claimant's signatures: the wallet must own their keys.
-    for recipient in &recipients {
-        if wallet.get_account_public_signing_key(*recipient).is_none() {
-            bail!("recipient account {recipient} is not owned by this wallet (no signing key)");
-        }
+    // The owner is the only signature in the claim: it is what proves who is claiming, and the
+    // cooldown binds to it.
+    if wallet.get_account_public_signing_key(owner_id).is_none() {
+        bail!("account {owner_id} is not owned by this wallet (no signing key)");
     }
 
-    let claimant_id = recipients[0];
-    let marker_id = shared::marker_account_id(&program_id, &claimant_id);
+    let ata_program_id = programs::ata().id();   // the zone's built-in ATA program
+    let ata_ids: Vec<AccountId> = definition_ids
+        .iter()
+        .map(|def| {
+            get_associated_token_account_id(&ata_program_id, &compute_ata_seed(owner_id, *def))
+        })
+        .collect();
+
+    let marker_id = shared::marker_account_id(&program_id, &owner_id);
     let treasury_ids: Vec<AccountId> = definition_ids
         .iter()
         .map(|def| shared::treasury_account_id(&program_id, def))
@@ -262,10 +276,38 @@ async fn claim(
     }
     check_cooldown(wallet, marker_id).await?;
 
-    let mut accounts: Vec<AccountIdentity> = recipients
-        .iter()
-        .map(|id| AccountIdentity::Public(*id))
-        .collect();
+    // The ATA must EXIST before the claim: the token program credits a destination without
+    // authorizing it, but it will not conjure one. `ata create` is permissionless and
+    // idempotent, so this is safe to run every time and costs nothing when they are already
+    // there. Doing it here rather than in the guest keeps the claim a single atomic transfer.
+    let mut created = Vec::new();
+    for (ata_id, definition_id) in ata_ids.iter().zip(&definition_ids) {
+        let existing = wallet.get_account_public(*ata_id).await;
+        let needs_create = match existing {
+            Ok(a) => a.program_owner == DEFAULT_PROGRAM_ID,
+            Err(_) => true,
+        };
+        if needs_create {
+            let start = current_block(client).await?;
+            let hash = Ata(wallet)
+                .send_create(AccountIdentity::Public(owner_id), *definition_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to create the ATA for {definition_id}: {e:?}"))?;
+            // WAIT FOR IT TO LAND. send_create only SUBMITS. Firing all three and going straight
+            // to the claim meant the claim executed against ATAs that did not exist yet:
+            // observed live, the first had landed and the other two were still Uninitialized, so
+            // the chained token transfer failed and the sequencer dropped the whole claim with
+            // nothing to say beyond "program execution failed on-chain".
+            poll_inclusion(client, hash, start)
+                .await
+                .with_context(|| format!("the ATA for {definition_id} was not created in time"))?;
+            created.push(ata_id.to_string());
+        }
+    }
+
+    // [owner, atas.., treasuries.., marker, clock] - the order the guest splits on.
+    let mut accounts: Vec<AccountIdentity> = vec![AccountIdentity::Public(owner_id)];
+    accounts.extend(ata_ids.iter().map(|id| AccountIdentity::PublicNoSign(*id)));
     accounts.extend(
         treasury_ids
             .iter()
@@ -276,8 +318,9 @@ async fn claim(
         clock_core::CLOCK_01_PROGRAM_ACCOUNT_ID,
     ));
 
-    let instruction_data = Program::serialize_instruction(shared::Instruction::Claim)
-        .context("Instruction should serialize")?;
+    let instruction_data =
+        Program::serialize_instruction(shared::Instruction::Claim { ata_program_id })
+            .context("Instruction should serialize")?;
 
     let start_block = current_block(client).await?;
     let tx_hash = wallet
@@ -289,10 +332,11 @@ async fn claim(
     Ok(serde_json::json!({
         "ok": true,
         "programId": program_id_hex(&program_id),
-        "claimant": claimant_id.to_string(),
+        "claimant": owner_id.to_string(),
         "marker": marker_id.to_string(),
         "definitions": definition_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        "recipients": recipients.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "atas": ata_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "atasCreated": created,
         "treasuries": treasury_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "txHash": tx_hash.to_string(),
         "includedAtBlock": included_at,

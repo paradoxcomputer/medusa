@@ -4522,6 +4522,7 @@ name = "medusa-faucet-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "associated_token_account_core",
  "bytemuck",
  "clap",
  "clock_core",
@@ -4530,6 +4531,7 @@ dependencies = [
  "lee",
  "lee_core",
  "medusa_faucet_shared",
+ "programs",
  "sequencer_service_rpc",
  "serde_json",
  "tokio",

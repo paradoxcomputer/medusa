@@ -608,7 +608,6 @@ private:
         QStringList tickers;       // display names, same order as definitions
         QStringList recipients;    // this wallet's holding per definition, same order; an entry
                                    // is "" when there is none YET, which is not a failure
-        QStringList provisioned;   // holdings ensureFaucetRecipients() had to create
     };
     FaucetPreflight faucetPreflight(const QString& owner = QString());
     // Does this zone have the on-chain token faucet? Decided by kFaucetZones alone (see the
@@ -618,7 +617,6 @@ private:
     // CLAIM PATH ONLY. Give every definition a recipient this wallet owns, creating and
     // recording one where the registry has none. Returns "" on success, else the refusal.
     // Never called from faucetStatus(): a read-only status call must not mint accounts.
-    QString ensureFaucetRecipients(FaucetPreflight& pf, const QString& owner = QString());
     // Resolve the deployed program's guest .bin (MEDUSA_FAUCET_BIN, then the module bundle,
     // then a dev install). "" when no readable file is there.
     static QString faucetGuestBin();

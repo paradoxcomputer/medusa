@@ -17,6 +17,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The zone's program-id representation, mirrored so the instruction enum can name it without
+/// depending on the `helpers` feature. lee_core defines `ProgramId` as exactly this.
+pub type ProgramId = [u32; 8];
+
 /// Cooldown between claims for a given claimant: 6 hours, in milliseconds.
 pub const COOLDOWN_MS: u64 = 21_600_000;
 
@@ -46,19 +50,36 @@ pub enum Instruction {
     /// `pda_seeds = [treasury_seed(def_id)]`, and the token program claims the PDA.
     InitTreasury,
 
-    /// Dispense a pseudorandom amount of each treasury token to the claimant.
+    /// Dispense a pseudorandom amount of each treasury token into the CLAIMANT'S OWN
+    /// associated token accounts.
     ///
-    /// Pre-states (`2n + 2`), in order:
-    /// `[recipient_1 .. recipient_n, treasury_1 .. treasury_n, marker, CLOCK_01]`
+    /// Pre-states (`2n + 3`), in order:
+    /// `[owner, ata_1 .. ata_n, treasury_1 .. treasury_n, marker, CLOCK_01]`
     ///
-    /// - each `recipient_i` is a claimant-signed token holding (uninitialized is fine;
-    ///   the token program initializes it on transfer),
+    /// - `owner` is the claimant's ordinary account, and must be AUTHORIZED: it is the
+    ///   only thing proving who is claiming, and the cooldown binds to it,
+    /// - each `ata_i` is the associated token account for `(owner, definition_i)`,
+    ///   verified against that derivation rather than trusted positionally. It needs no
+    ///   signature of its own: the token program authorizes the SENDER only, and an ATA
+    ///   is created permissionlessly by the ATA program beforehand,
     /// - each `treasury_i` is the faucet treasury PDA whose holding data names the
     ///   definition it pairs with,
-    /// - `marker` is the faucet-owned cooldown record for the claimant
-    ///   (`recipient_1.account_id`), created on first claim via `Claim::Pda`,
+    /// - `marker` is the faucet-owned cooldown record for `owner`, created on first
+    ///   claim via `Claim::Pda`,
     /// - `CLOCK_01` is the system clock account, read-only.
-    Claim,
+    ///
+    /// `ata_program_id` names the ATA program the addresses are derived from, the same
+    /// way `associated_token_account_core::Instruction` carries it.
+    ///
+    /// WHY THE OWNER'S ATAs AND NOT FRESH HOLDINGS. A LEZ account holds exactly one token
+    /// definition, so a claimant's own account cannot hold three. The previous shape had
+    /// the wallet MINT a holding per definition and claim into those, which put accounts
+    /// in the user's list that were pure plumbing: selecting one and claiming again made
+    /// it the owner of its own vaults, and its cooldown was fresh because the marker bound
+    /// to the holding rather than to the person. An ATA is derived from (owner,
+    /// definition), so it is already "that account's" balance, nothing new appears in the
+    /// account list, and the cooldown binds to the account a user actually has.
+    Claim { ata_program_id: ProgramId },
 }
 
 /// Marker account data encoding: borsh of `last_claim_ms: u64` (8 little-endian bytes).
@@ -248,7 +269,12 @@ mod tests {
     // on, so a reordering of this enum silently turns InitTreasury into Claim.
     #[test]
     fn instruction_encoding_is_stable_across_the_host_guest_boundary() {
-        for (ins, want) in [(Instruction::InitTreasury, 0_u32), (Instruction::Claim, 1)] {
+        // Claim carries the ATA program id now. The variant INDEX is what the guest matches on
+        // and must still be 1: a reordering here would turn a claim into a treasury init.
+        for (ins, want) in [
+            (Instruction::InitTreasury, 0_u32),
+            (Instruction::Claim { ata_program_id: [7_u32; 8] }, 1),
+        ] {
             let words = risc0_zkvm::serde::to_vec(&ins).expect("encodes");
             assert_eq!(words.first().copied(), Some(want), "{ins:?}");
             let back: Instruction = risc0_zkvm::serde::from_slice(&words).expect("decodes");

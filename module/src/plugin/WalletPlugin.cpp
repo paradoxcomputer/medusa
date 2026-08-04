@@ -82,7 +82,7 @@ static QString logosTestnetUrl()
 // the claim at a DIFFERENT program. faucetPreflight() runs `info --bin` (offline: no wallet, no
 // network) and refuses unless the answer is exactly this string.
 static constexpr const char* kFaucetProgramId =
-    "3c56ad0e1d2be3b57582d91187892daa8be2b63d300c2c9d9df318a494dcb885";
+    "214dc4329f8d260eaa6e91818fc299ed201d366b3d2d235e716cc1672ab2b4b1";
 
 // ── WHICH ZONES HAVE THE TOKEN FAUCET, AND WHAT IT DISPENSES ON EACH ──────────────────────────
 // The program ID above is one constant for every zone (see why, above). The TOKENS are not: a
@@ -138,19 +138,19 @@ static constexpr FaucetZoneRow kFaucetZones[] = {
     // Paradox Computer clearnet - https://seq-testnet.paradox.computer/
     { "paradox-clearnet", {
         { "GOLD", "5YEhWdY2edtRFkCruXjtnFH5F62VkCiCxXmNAvHuVkEY",
-                  "Fed1dmPD9aNNyMQrPkSbLznyqVBCJ7Q25bbzQV1rxGnL" },
+                  "7wkFSuBQyUeTaKKfoFAKpKxe3FQTNHqkqK4BPLTvLyb5" },
         { "SILV", "HUDERmRqyX6swMnuk9FT5vmqNbcdLNbVxDRtLEdzsMXk",
-                  "CWd7PbmCfebZ9ziK1bvmjj8RiDi5XCXW78H4qYdWCTMP" },
+                  "38nM3WKHCMpBXxgG3W19V6g3Z2bXs6efekcph3RKfC6Z" },
         { "BRNZ", "3zS3bGdToZcqPU9jBZC8c1aK9MQvpekse9EJ52nD1wiM",
-                  "7HvJ5wqSL3NXf1CmGpoDDLj8nk42S39wULuM2TAtzmXx" } } },
+                  "ArdHwtFt75239nKcFgaHYUGCh8nHyGi3hbHeJn9svnM9" } } },
     // Logos public testnet - https://testnet.lez.logos.co/
     { "logos-testnet", {
         { "GOLD", "7ZZGE941fzSGCAfxxdkPWQszSspBhZEcjHUkLqWrrnz6",
-                  "D8ScxGNvPLtCeLbPphWSKeei36Lj5tbmFxGGgxr66jsV" },
+                  "18Yt1464Q6SBxug5inAwdv4AvKUkMFePysaVi3GhU5V" },
         { "SILV", "CfuvpaUhbxEzWd6ZtLDiKWVg5DZLiYj14Q8HgtDUwuS6",
-                  "DZQnfiJBz9YZkzkmMDFhHjgk2zZEKLM5oSrfX8SmXXdB" },
+                  "DYBTWuGVRiJG4dY5A34aK8gauvZxeTsTriW8WMGKzaUZ" },
         { "BRNZ", "EEMUsdWL1WxrQBi1SmNFUKVcMUjgVcky12NRv2BjBuxp",
-                  "CZxne337Uh7ezNVZcNASN5yN9G7uEkCm1MLpHHdVRPD" } } },
+                  "3ijamAJSkF6cbVZhmyF5Diit3LZXDRtcd6v1N7emtu1a" } } },
 };
 
 // The row for a zone, or nullptr when that zone has no token faucet. The ONE place the
@@ -2873,70 +2873,6 @@ WalletPlugin::FaucetPreflight WalletPlugin::faucetPreflight(const QString& owner
     return pf;
 }
 
-// Give every definition a recipient this wallet owns, creating one where the registry has none.
-//
-// CLAIM PATH ONLY (startTokenFaucet), never the status path: it writes - it mints keys and it
-// records them. Returns "" on success, or the sentence to refuse with.
-//
-// Why a fresh account is a correct recipient: the guest requires `recipient.is_authorized`, i.e.
-// the claimant's signature, and nothing else; an account whose on-chain state is still the
-// default is claimed by the token program during the chained transfer. That is the difference
-// between this and the client-side drop it replaces, where a cross-wallet credit to a pristine
-// account IS rejected (the treasury cannot produce the recipient key's co-signature).
-//
-// Each new account is recorded in the wrapper's registry as that definition's vault before it is
-// used. That matters for more than tidiness: the cooldown marker PDA is derived from the FIRST
-// recipient, so a claim that invented a new account every time would derive a new marker every
-// time and the on-chain 6h cooldown would never bind to anything.
-QString WalletPlugin::ensureFaucetRecipients(FaucetPreflight& pf, const QString& owner)
-{
-    for (int i = 0; i < pf.definitions.size(); ++i) {
-        if (!pf.recipients.at(i).isEmpty())
-            continue;
-        const QString made = createAccount();
-        const QJsonObject o = QJsonDocument::fromJson(made.toUtf8()).object();
-        if (o.contains(QStringLiteral("error")))
-            return QStringLiteral("could not create a holding account for ")
-                 + pf.tickers.value(i) + QStringLiteral(": ")
-                 + o.value(QStringLiteral("error")).toString();
-        // createAccount returns {"id":"Public/<bare>"} (structured CLI) or folds the CLI's
-        // "account_id Public/<bare>" line into the same key. Either way we want the bare id:
-        // the faucet client accepts both, but the registry stores bare.
-        const QString bare = o.value(QStringLiteral("id")).toString().trimmed()
-                                 .section(QLatin1Char('/'), -1).trimmed();
-        if (bare.isEmpty())
-            return QStringLiteral("could not read back the holding account created for ")
-                 + pf.tickers.value(i);
-        // Record it BEFORE the claim: if the claim then fails, the next attempt reuses this
-        // account instead of minting another, and the cooldown marker stays put.
-        // Record it against the CLAIMING account: vaults are per-owner, so a holding minted
-        // for account A must be A's, not a wallet-wide one every other account then displays.
-        const QString ownerBare = owner.trimmed().section(QLatin1Char('/'), -1);
-        QStringList regArgs{ QStringLiteral("token-registry"), QStringLiteral("vault"),
-                             pf.definitions.at(i), bare };
-        if (!ownerBare.isEmpty())
-            regArgs << ownerBare;
-        const QString rec = runWalletCommand(regArgs, 20000);
-        if (QJsonDocument::fromJson(rec.toUtf8()).object().contains(QStringLiteral("error")))
-            appendLog(QStringLiteral("faucet: could not record the vault for %1 (%2) - the claim "
-                                     "still runs, but the next one will create another account")
-                          .arg(pf.tickers.value(i), bare), QStringLiteral("error"));
-        pf.recipients[i] = bare;
-        pf.provisioned << bare;
-    }
-    // The client refuses duplicates (a holding account holds exactly one definition), and so does
-    // the chain. Catch it here where the message can say which registry entry is wrong.
-    QSet<QString> seen;
-    for (const QString& r : std::as_const(pf.recipients)) {
-        if (seen.contains(r))
-            return QStringLiteral("two faucet tokens are pointed at the same holding account (")
-                 + r.left(8) + QStringLiteral("…) - an account can hold only one token "
-                                              "definition, so the token registry needs fixing");
-        seen.insert(r);
-    }
-    return QString();
-}
-
 QString WalletPlugin::faucetStatus()
 {
     const FaucetPreflight pf = faucetPreflight();
@@ -2989,16 +2925,14 @@ QString WalletPlugin::startTokenFaucet(const QString& accountId, const QString& 
     if (!pf.ok)
         return errorJson(pf.message, pf.reason);
 
-    // Every definition needs a recipient this wallet owns; mint the missing ones. This is the
-    // one write the status path never performs, which is why it is here and not in the preflight.
-    const QString provErr = ensureFaucetRecipients(pf, accountId);
-    if (!provErr.isEmpty())
-        return errorJson(provErr, QStringLiteral("no-holding"));
-    if (!pf.provisioned.isEmpty())
-        appendLog(QStringLiteral("faucet: created %1 token holding(s) for this claim: %2")
-                      .arg(pf.provisioned.size())
-                      .arg(pf.provisioned.join(QStringLiteral(", "))));
-
+    // NOTHING IS MINTED HERE ANY MORE. The faucet pays into the claiming account's own
+    // associated token accounts, which are DERIVED from (account, definition) rather than
+    // created as accounts of their own, so there is nothing to provision and nothing new for
+    // the user to see. This used to mint one holding per definition, and those holdings showed
+    // up in the account list as ordinary accounts: selecting one and clicking the faucet made a
+    // holding the owner of its own vaults and gave it a fresh cooldown, because the marker bound
+    // to whatever was paid rather than to the person. The client creates any missing ATA (that
+    // call is permissionless and idempotent) and waits for it before claiming.
     QString id = accountId.trimmed();
     const QString attribute =
         (id.startsWith(QStringLiteral("Public/")) || id.startsWith(QStringLiteral("Private/")))
@@ -3029,9 +2963,11 @@ QString WalletPlugin::startTokenFaucet(const QString& accountId, const QString& 
     // from the block clock, and the client's reply does not carry the figures either. Reporting a
     // made-up number in the history would be worse than reporting none.
     return startPrivacyJob(QStringLiteral("tokenfaucet"), QStringLiteral("token"),
+                           // --account is now the ONE claiming account, not a holding per token:
+                           // the client derives that account's ATAs from the definitions.
                            { QStringLiteral("claim"),
                              QStringLiteral("--bin"),         pf.bin,
-                             QStringLiteral("--account"),     pf.recipients.join(QLatin1Char(',')),
+                             QStringLiteral("--account"),     id.section(QLatin1Char('/'), -1),
                              QStringLiteral("--definitions"), pf.definitions.join(QLatin1Char(',')) },
                            attribute, QString(), QString(), pf.client, waitFor);
 }

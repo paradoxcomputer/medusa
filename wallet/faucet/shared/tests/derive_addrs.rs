@@ -31,23 +31,23 @@ fn program_id_from_hex(hex: &str) -> ProgramId {
 }
 
 /// Must equal kFaucetProgramId in module/src/plugin/WalletPlugin.cpp.
-const PROGRAM_ID: &str = "3c56ad0e1d2be3b57582d91187892daa8be2b63d300c2c9d9df318a494dcb885";
+const PROGRAM_ID: &str = "214dc4329f8d260eaa6e91818fc299ed201d366b3d2d235e716cc1672ab2b4b1";
 
 /// Must equal kFaucetZones in module/src/plugin/WalletPlugin.cpp: (zone, ticker, definition,
 /// treasury).
 const SHIPPED: &[(&str, &str, &str, &str)] = &[
     ("paradox-clearnet", "GOLD", "5YEhWdY2edtRFkCruXjtnFH5F62VkCiCxXmNAvHuVkEY",
-                                 "Fed1dmPD9aNNyMQrPkSbLznyqVBCJ7Q25bbzQV1rxGnL"),
+                                 "7wkFSuBQyUeTaKKfoFAKpKxe3FQTNHqkqK4BPLTvLyb5"),
     ("paradox-clearnet", "SILV", "HUDERmRqyX6swMnuk9FT5vmqNbcdLNbVxDRtLEdzsMXk",
-                                 "CWd7PbmCfebZ9ziK1bvmjj8RiDi5XCXW78H4qYdWCTMP"),
+                                 "38nM3WKHCMpBXxgG3W19V6g3Z2bXs6efekcph3RKfC6Z"),
     ("paradox-clearnet", "BRNZ", "3zS3bGdToZcqPU9jBZC8c1aK9MQvpekse9EJ52nD1wiM",
-                                 "7HvJ5wqSL3NXf1CmGpoDDLj8nk42S39wULuM2TAtzmXx"),
+                                 "ArdHwtFt75239nKcFgaHYUGCh8nHyGi3hbHeJn9svnM9"),
     ("logos-testnet",    "GOLD", "7ZZGE941fzSGCAfxxdkPWQszSspBhZEcjHUkLqWrrnz6",
-                                 "D8ScxGNvPLtCeLbPphWSKeei36Lj5tbmFxGGgxr66jsV"),
+                                 "18Yt1464Q6SBxug5inAwdv4AvKUkMFePysaVi3GhU5V"),
     ("logos-testnet",    "SILV", "CfuvpaUhbxEzWd6ZtLDiKWVg5DZLiYj14Q8HgtDUwuS6",
-                                 "DZQnfiJBz9YZkzkmMDFhHjgk2zZEKLM5oSrfX8SmXXdB"),
+                                 "DYBTWuGVRiJG4dY5A34aK8gauvZxeTsTriW8WMGKzaUZ"),
     ("logos-testnet",    "BRNZ", "EEMUsdWL1WxrQBi1SmNFUKVcMUjgVcky12NRv2BjBuxp",
-                                 "CZxne337Uh7ezNVZcNASN5yN9G7uEkCm1MLpHHdVRPD"),
+                                 "3ijamAJSkF6cbVZhmyF5Diit3LZXDRtcd6v1N7emtu1a"),
 ];
 
 #[test]
