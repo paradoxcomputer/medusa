@@ -593,6 +593,31 @@ def vault_for(defb, owner=None):
     return pristine
 
 
+# `shielded-tokens` → [{definitionId, ticker, balance}] totalled across the wallet's PRIVATE
+# accounts, i.e. what has actually been shielded.
+#
+# A shielded token does not live "in" the public account it came from: shielding moves it into
+# a private account's note, and the Tokens tab (public ATA + vault) cannot see it at all. So a
+# user who shields watches the balance leave and has nowhere to watch it arrive. Private token
+# notes ARE readable one account at a time (`account get Private/<id>` reports the definition
+# and balance), so this walks the wallet's own private accounts and sums per definition.
+if args and args[0] == "shielded-tokens":
+    reg = load_reg()
+    listing = run(["account", "list"], timeout=20)
+    totals = {}
+    for line in (listing.stdout or "").splitlines():
+        m = re.search(r"Private/([1-9A-HJ-NP-Za-km-z]{32,44})", line)
+        if not m:
+            continue
+        g = run(["account", "get", "--account-id", m.group(0)], timeout=45)
+        d = re.search(r'"definition_id"\s*:\s*"([^"]+)"\s*,\s*"balance"\s*:\s*(\d+)', g.stdout or "")
+        if d and int(d.group(2)) > 0:
+            totals[d.group(1)] = totals.get(d.group(1), 0) + int(d.group(2))
+    print(json.dumps([{"definitionId": k, "ticker": token_name(reg, k), "balance": str(v)}
+                      for k, v in sorted(totals.items())]))
+    sys.exit(0)
+
+
 # `unlock-probe` → does the password open the store? NOTHING ELSE.
 #
 # The module's unlock only needs to know whether storage.json decrypted, and it used to ask

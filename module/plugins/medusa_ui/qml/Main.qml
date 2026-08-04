@@ -214,7 +214,8 @@ Rectangle {
     property string privTokenDef:  ""         // chosen token definition id (token asset)
     property string privTokenTicker: ""       // display name of the chosen token
     // Shield sources: DIRECT-owned holdings only (rc5: ATAs can't sign a private send).
-    property var    shieldableTokens: []      // [{definitionId,ticker,balance,account}]
+    property var    shieldableTokens: []      // [{definitionId,ticker,balance,...}] public, this account
+    property var    shieldedTokens:   []      // [{definitionId,ticker,balance}] already shielded
     // Deshield choices: every known definition (the def only picks the recipient ATA -
     // the private note itself carries the asset).
     property var    registryTokens:   []      // [{definitionId,ticker}]
@@ -1159,6 +1160,7 @@ Rectangle {
             if (!r.jobId) { logActivity("No jobId from token send", true); return }
             logActivity("Sending " + amount + " " + root.sendTokenName + "…", false)
             root.trackJob({ jobId: r.jobId, op: "tokensend", asset: "token",
+                            ticker: root.sendTokenName,
                             from: root.selectedFromId, to: to, amount: amount, state: "running", elapsedMs: 0, txId: "", error: "" })
             root.screen = "main"
         }
@@ -1228,6 +1230,8 @@ Rectangle {
                     return t.balance && t.balance !== "0"
                 })
         }
+        var sh = callModuleParse(logos.callModule("medusa_core", "getShieldedTokens", []))
+        root.shieldedTokens = Array.isArray(sh) ? sh : []
         var tr = callModuleParse(logos.callModule("medusa_core", "getTokenRegistry", []))
         if (tr && tr.names) {
             var arr = []
@@ -1235,6 +1239,15 @@ Rectangle {
             root.registryTokens = arr
         }
         if (tr && Array.isArray(tr.privateDests)) root.usedPrivateDests = tr.privateDests
+    }
+
+    // How much of `defId` is already shielded, "" when none. Kept as a function so the chip
+    // and the summary line cannot disagree.
+    function shieldedOf(defId) {
+        for (var i = 0; i < root.shieldedTokens.length; i++)
+            if (root.shieldedTokens[i].definitionId === defId)
+                return root.shieldedTokens[i].balance
+        return ""
     }
 
     function refreshWhitelist() {
@@ -1551,6 +1564,9 @@ Rectangle {
                 state:     j.state || "running",
                 phase:     j.phase || ((j.state === "done" || j.state === "error") ? "" : "processing"),
                 amount:    j.amount || "",
+                // The token's SYMBOL, so a row can say "30 SILV" instead of "30 tok". Recorded
+                // when the job is tracked, because getJob does not report the definition.
+                ticker:    j.ticker || "",
                 txId:      j.txId  || "",
                 error:     j.error || "",
                 elapsedMs: j.elapsedMs || 0
@@ -1753,7 +1769,7 @@ Rectangle {
         var op = (root.privMode === "transfer") ? "private" : root.privMode
         root.logActivity(opLabel(op) + " started - proving (may take minutes)…", false)
         trackJob({
-            jobId: r.jobId, op: op, asset: root.privAsset,
+            jobId: r.jobId, op: op, asset: root.privAsset, ticker: root.privTokenTicker,
             from: from, to: (root.privToMode === "foreign" && root.privMode === "transfer")
                             ? "(foreign)" : root.privToId,
             amount: amt, state: "running", elapsedMs: 0, txId: "", error: ""
@@ -1846,6 +1862,7 @@ Rectangle {
             op:      j.op    || "",
             asset:   j.asset || "native",
             amount:  j.amount || "",
+            ticker:  j.ticker || "",   // the symbol, so the sheet says SILV rather than "tok"
             state:   st,
             txId:    j.txId  || "",
             error:   j.error || "",
@@ -4709,7 +4726,12 @@ Rectangle {
                                     MouseArea {
                                         anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                                         onClicked: { root.privMode = modelData.k; root.privToId = ""; root.deshieldAck = false
-                                                     root.privAsset = "native"; root.privTokenDef = ""; root.privTokenTicker = "" }
+                                                     root.privAsset = "native"; root.privTokenDef = ""; root.privTokenTicker = ""
+                                                     // The shieldable list is per-account and was
+                                                     // only built when the screen opened, so
+                                                     // switching into Shield showed an empty
+                                                     // asset row until you left and came back.
+                                                     root.runBusy("Loading assets", function () { root.refreshPrivAssets() }) }
                                     }
                                 }
                             }
@@ -4740,9 +4762,16 @@ Rectangle {
                                         Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                             id: assetChipText
                                             anchors.centerIn: parent
-                                            // No "unshielded" split any more: the whole balance
-                                            // can be shielded, the wrapper creates the holding.
-                                            text: modelData.ticker + (modelData.balance ? " · " + modelData.balance : "")
+                                            // ticker · <public balance> · shielded <n>
+                                            // In shield mode the balance is what THIS account
+                                            // holds publicly (all of it shieldable, the wrapper
+                                            // creates the holding); "shielded" is what already
+                                            // left the public side, which no other view shows.
+                                            text: modelData.ticker
+                                                  + (modelData.balance ? " · " + modelData.balance : "")
+                                                  + (root.shieldedOf(modelData.definitionId).length > 0
+                                                     ? "  · shielded " + root.shieldedOf(modelData.definitionId)
+                                                     : "")
                                             color: root.privTokenDef === modelData.definitionId ? root.accentOrange : root.textSecondary
                                             font.pixelSize: 9
                                         }
@@ -5205,7 +5234,8 @@ Rectangle {
                             // reads as a zero payout that never happened.
                             visible: text.length > 0
                             text: amount.length > 0
-                                  ? (amount + " " + (asset === "token" ? "tok" : "LEZ")) : ""
+                                  ? (amount + " " + (asset === "token"
+                                                     ? (ticker.length > 0 ? ticker : "tokens") : "LEZ")) : ""
                             color: root.textSecondary; font.pixelSize: 10
                         }
                         Item { Layout.fillWidth: true }
@@ -6501,7 +6531,10 @@ Rectangle {
                             visible: text.length > 0
                             text: (jobDoneSheet.head && jobDoneSheet.head.amount.length > 0)
                                   ? (jobDoneSheet.head.amount + " "
-                                     + (jobDoneSheet.head.asset === "token" ? "tok" : "LEZ"))
+                                     + (jobDoneSheet.head.asset === "token"
+                                        ? ((jobDoneSheet.head.ticker && jobDoneSheet.head.ticker.length > 0)
+                                           ? jobDoneSheet.head.ticker : "tokens")
+                                        : "LEZ"))
                                   : ""
                             color: root.textSecondary; font.family: root.faceFont; font.pixelSize: 11
                         }

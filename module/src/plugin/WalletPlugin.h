@@ -204,6 +204,12 @@ public:
     // DIRECT-owned token holdings (keytree-signable - the only valid token-shield sources
     // on rc5): [{definitionId,ticker,balance,account}]. Feeds the shield asset picker.
     Q_INVOKABLE QString getDirectHoldings();
+    // What has actually been SHIELDED, per definition, totalled across this wallet's private
+    // accounts: [{definitionId,ticker,balance}]. A shielded token leaves the public balance
+    // entirely (it becomes a private account's note), so without this the Privacy screen can
+    // show what a user is about to shield but never what they already shielded. Read-only, so
+    // ungated like the other balance reads. Walks one account-get per private account.
+    Q_INVOKABLE QString getShieldedTokens();
     // Known token definitions ({definitions:[…], names:{def:ticker}}) - deshield picker.
     Q_INVOKABLE QString getTokenRegistry();
     // Move an owner's ATA balance of a token into the wallet's direct vault holding

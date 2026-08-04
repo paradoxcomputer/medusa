@@ -2403,6 +2403,13 @@ QString WalletPlugin::getTokens(const QString& accountId)
     return runWalletCommand({ QStringLiteral("tokens"), accountId.trimmed() }, 45000);
 }
 
+QString WalletPlugin::getShieldedTokens()
+{
+    // One account-get per private account, so allow for a slow zone the same way
+    // getDirectHoldings does. The wrapper returns [] on any failure: best-effort.
+    return runWalletCommand({ QStringLiteral("shielded-tokens") }, 120000);
+}
+
 QString WalletPlugin::getDirectHoldings()
 {
     // Scans every owned public account on-chain (one account-get each) - allow for a slow
