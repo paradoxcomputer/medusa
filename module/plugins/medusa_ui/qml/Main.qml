@@ -1208,12 +1208,26 @@ Rectangle {
         root.heroTotal        = String(pubT + privT)
     }
 
-    // Token choices for the privacy screen (shield: direct holdings; deshield: registry).
+    // Token choices for the privacy screen (shield: this account's tokens; deshield: registry).
+    //
+    // SHIELDABLE IS NOW "WHAT THIS ACCOUNT HOLDS", not "what is already in a direct holding".
+    // The faucet pays into the account's ATAs and mints nothing, so getDirectHoldings() is
+    // empty for a wallet that has only ever claimed - and this screen offered nothing to
+    // shield, which is exactly the dead end a user hits after their first claim. The wrapper
+    // now bootstraps the direct holding it needs at shield time (token-shield ->
+    // bootstrap_holding -> init-holding), so an ATA balance IS shieldable; it just costs one
+    // extra on-chain step the user never sees.
     function refreshPrivAssets() {
         root.shieldableTokens = []; root.registryTokens = []
         if (typeof logos === "undefined" || !logos.callModule) return
-        var dh = callModuleParse(logos.callModule("medusa_core", "getDirectHoldings", []))
-        if (Array.isArray(dh)) root.shieldableTokens = dh
+        if (root.selectedFromId && root.selectedFromId.length > 0) {
+            var mine = callModuleParse(logos.callModule("medusa_core", "getTokens",
+                                                        [root.selectedFromId]))
+            if (Array.isArray(mine))
+                root.shieldableTokens = mine.filter(function (t) {
+                    return t.balance && t.balance !== "0"
+                })
+        }
         var tr = callModuleParse(logos.callModule("medusa_core", "getTokenRegistry", []))
         if (tr && tr.names) {
             var arr = []
@@ -4645,9 +4659,11 @@ Rectangle {
                     height: visible ? privCol.implicitHeight + 20 : 0
                     color: root.panelColor; border.color: root.borderColor; border.width: 1; radius: 12
                     // Token choices are chain state - refresh them each time the screen opens.
-                    // refreshPrivAssets() BLOCKS: direct-holdings does one on-chain account-get
-                    // per owned public account (120s ceiling) and token-registry shells out
-                    // again. Running it in the tick that makes this screen visible meant the UI
+                    // refreshPrivAssets() BLOCKS: it probes this account's tokens on chain and
+                    // token-registry shells out again. (It used to call direct-holdings, one
+                    // account-get per owned public account with a 120s ceiling; sourcing the
+                    // selected account's tokens instead is both correct and cheaper.)
+                    // Running it in the tick that makes this screen visible meant the UI
                     // thread could not paint the new screen until it returned, so clicking
                     // Privacy left the PREVIOUS view up for seconds while Send and Receive
                     // switched instantly. runBusy() lets a frame land first (the 0.2.1 loading-
@@ -4724,9 +4740,9 @@ Rectangle {
                                         Text { textFormat: Text.PlainText; font.family: root.faceFont;
                                             id: assetChipText
                                             anchors.centerIn: parent
+                                            // No "unshielded" split any more: the whole balance
+                                            // can be shielded, the wrapper creates the holding.
                                             text: modelData.ticker + (modelData.balance ? " · " + modelData.balance : "")
-                                                  + (modelData.ataTotal && modelData.ataTotal !== "0"
-                                                     ? "  (+" + modelData.ataTotal + " unshielded)" : "")
                                             color: root.privTokenDef === modelData.definitionId ? root.accentOrange : root.textSecondary
                                             font.pixelSize: 9
                                         }
@@ -4744,7 +4760,7 @@ Rectangle {
                         }
                         Text { textFormat: Text.PlainText; font.family: root.faceFont;
                             visible: root.privMode === "shield" && root.shieldableTokens.length === 0
-                            text: "Tokens in regular (ATA) balances can't be shielded on this chain version - only direct-owned holdings (e.g. a token you minted). LEZ shielding is unaffected."
+                            text: "No tokens in this account yet. Claim from the faucet on the Tokens tab, then come back - the balance will be shieldable."
                             wrapMode: Text.WordWrap; Layout.fillWidth: true
                             color: root.textDisabled; font.pixelSize: 9
                         }
