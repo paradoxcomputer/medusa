@@ -4334,12 +4334,18 @@ QString WalletPlugin::establishSession(const QString& candidate)
         return QJsonDocument(o).toJson(QJsonDocument::Compact);
     }
 
-    // Probe with a LOCAL account list (no `-l` → no chain/balance fetch), so this is fast and
-    // works even when the active zone's sequencer is slow/unreachable (e.g. diaphani over Tor).
+    // Probe with `unlock-probe`, which opens the store and touches NO chain. This asked with
+    // `account list` before, on the assumption that omitting `-l` kept it local. It does not:
+    // the wrapper renders that as `account list --json` and the engine fetches from the
+    // sequencer for it. Measured on logos-testnet: 89ms for the plain list the probe actually
+    // wants, 1.7s for --json warm, and 61s under load against this call's 30s budget - so a
+    // correct password reported "unlock timed out", and the busier the machine the likelier it
+    // got. The probe needs one bit (did it decrypt), and now pays for one bit.
+    //
     // A decryption failure still means the password was wrong. The candidate goes on the CLI's
     // stdin EXPLICITLY: m_password is not touched until the store has opened, so a wrong guess
     // cannot disturb a session that is already working.
-    const QString result = runWalletCommandInput({ QStringLiteral("account"), QStringLiteral("list") },
+    const QString result = runWalletCommandInput({ QStringLiteral("unlock-probe") },
                                                  candidate + QStringLiteral("\n"));
     const QJsonObject o = QJsonDocument::fromJson(result.toUtf8()).object();
     if (o.contains(QStringLiteral("error"))) {
