@@ -2362,6 +2362,11 @@ QString WalletPlugin::listAccounts()
             const QJsonObject c = byId.value(id);
             o[QStringLiteral("balance")]     = c.value(QStringLiteral("balance"));
             o[QStringLiteral("initialized")] = c.value(QStringLiteral("initialized"));
+            // …and the engine's own label. The local list cannot see it (it prints paths and
+            // ids only), so without this an account labelled through the CLI would lose its
+            // name here the moment the list stopped coming from the chain.
+            if (c.contains(QStringLiteral("label")))
+                o[QStringLiteral("label")] = c.value(QStringLiteral("label"));
         } else {
             o[QStringLiteral("balance")] = QStringLiteral("…");   // not fetched yet
         }

@@ -613,8 +613,26 @@ if args and args[0] == "unlock-probe":
 
 # `account list [-l]` → rc5's native --json array [{id,type,balance,initialized,label}].
 if len(args) >= 2 and args[0] == "account" and args[1] in ("list", "ls"):
-    # rc5 emits the clean JSON array directly with --json (balances fetched from the chain).
-    # Over a slow zone (diaphani/Tor) give it a generous window; the module calls this async.
+    # WITHOUT -l: a LOCAL list, which is what the module asks for and what it was NOT getting.
+    # `--json` reaches the sequencer for balances (measured on logos-testnet, same wallet: 74ms
+    # against a dead endpoint, 1702ms warm, 61398ms under load), and the module polls this every
+    # 10s with a 30s budget. So on a busy machine every poll timed out and raised an error
+    # toast, which is why dismissing one appeared not to work: another arrived seconds later.
+    # The plain list opens the store and touches no chain. The module only needs id + type from
+    # it - it merges balances and labels from its own background `-l` cache - so parse that.
+    if "-l" not in args and "--long" not in args:
+        res = run(["account", "list"], timeout=20)
+        if res.returncode != 0:
+            emit(res)
+        out = []
+        for line in (res.stdout or "").splitlines():
+            m = re.search(r"(Public|Private)/([1-9A-HJ-NP-Za-km-z]{32,44})", line)
+            if m:
+                out.append({"id": m.group(0), "type": m.group(1).lower(),
+                            "balance": "", "initialized": None, "label": None})
+        print(json.dumps(out))
+        sys.exit(0)
+    # WITH -l: the caller wants live balances, so pay for the chain.
     res = run(["account", "list", "--json"], timeout=(45 if zone_key() == "diaphani" else 20))
     out = (res.stdout or "").strip()
     try:
