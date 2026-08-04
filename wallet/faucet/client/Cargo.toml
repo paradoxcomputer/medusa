@@ -19,6 +19,8 @@ lee_core = { path = "../../.lez-build/lee/state_machine/core" }
 common = { path = "../../.lez-build/lez/common" }
 sequencer_service_rpc = { path = "../../.lez-build/lez/sequencer/service/rpc", features = ["client"] }
 clock_core = { path = "../../.lez-build/lez/programs/clock/core" }
+# token::InitializeAccount, to bootstrap a shieldable holding from ATA-only funds.
+token_core = { path = "../../.lez-build/lez/programs/token/core" }
 medusa_faucet_shared = { path = "../shared" }
 # ATA derivation, so the client addresses the SAME accounts the guest verifies.
 associated_token_account_core = { path = "../../.lez-build/lez/programs/associated_token_account/core" }

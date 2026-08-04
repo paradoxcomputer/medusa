@@ -68,6 +68,23 @@ enum Command {
         #[arg(long)]
         definition: String,
     },
+    /// Initialize an owned account as a token holding, so it can be shielded from.
+    ///
+    /// A shield proves spend authority from a signing key, so its source must be a keytree
+    /// account; an ATA is a PDA and can never be one. But nothing else can BOOTSTRAP such a
+    /// holding from ATA funds: crediting an uninitialized account only works when that account
+    /// is authorized, and `ata send` passes its recipient unauthorized. This does the one thing
+    /// that closes the gap, and it needs no faucet program at all: the token program's own
+    /// InitializeAccount, with the holding signed because the wallet owns it.
+    InitHolding {
+        /// Token definition the holding will be for.
+        #[arg(long)]
+        definition: String,
+        /// An account this wallet owns, not yet initialized as a holding.
+        #[arg(long)]
+        holding: String,
+    },
+
     /// Claim a pseudorandom amount of each listed token from the faucet.
     Claim {
         /// Path to the guest .bin (used to recompute the program id).
@@ -117,6 +134,9 @@ async fn run(args: Args) -> Result<serde_json::Value> {
         Command::Deploy { bin } => deploy(&client, &bin).await,
         Command::InitTreasury { bin, definition } => {
             init_treasury(&wallet, &client, &bin, &definition).await
+        }
+        Command::InitHolding { definition, holding } => {
+            init_holding(&wallet, &client, &definition, &holding).await
         }
         Command::Claim {
             bin,
@@ -202,6 +222,71 @@ async fn init_treasury(
         "programId": program_id_hex(&program_id),
         "definition": definition_id.to_string(),
         "treasury": treasury_id.to_string(),
+        "txHash": tx_hash.to_string(),
+        "includedAtBlock": included_at,
+    }))
+}
+
+async fn init_holding(
+    wallet: &WalletCore,
+    client: &SequencerClient,
+    definition: &str,
+    holding: &str,
+) -> Result<serde_json::Value> {
+    let definition_id = parse_account_id(definition).context("invalid --definition")?;
+    let holding_id = parse_account_id(holding).context("invalid --holding")?;
+
+    // The holding is SIGNED, which is the whole point: the token program initializes an
+    // uninitialized recipient only when it is authorized, and that signature is what an
+    // `ata send` cannot provide.
+    if wallet.get_account_public_signing_key(holding_id).is_none() {
+        bail!("holding {holding_id} is not owned by this wallet (no signing key)");
+    }
+
+    // Token program id from the DEFINITION's owner, never hardcoded (mirrors the guest).
+    let definition_account = wallet
+        .get_account_public(definition_id)
+        .await
+        .context("Failed to fetch the token definition")?;
+    let token_program_id = definition_account.program_owner;
+    if token_program_id == DEFAULT_PROGRAM_ID {
+        bail!("definition {definition_id} is not initialized");
+    }
+
+    // Idempotent, like init-treasury: an account that is already a holding is left alone.
+    if let Ok(existing) = wallet.get_account_public(holding_id).await {
+        if existing.program_owner != DEFAULT_PROGRAM_ID {
+            return Ok(serde_json::json!({
+                "ok": true,
+                "alreadyInitialized": true,
+                "definition": definition_id.to_string(),
+                "holding": holding_id.to_string(),
+            }));
+        }
+    }
+
+    let instruction_data =
+        Program::serialize_instruction(token_core::Instruction::InitializeAccount)
+            .context("Instruction should serialize")?;
+
+    let start_block = current_block(client).await?;
+    let tx_hash = wallet
+        .send_pub_tx(
+            vec![
+                AccountIdentity::PublicNoSign(definition_id),
+                AccountIdentity::Public(holding_id),
+            ],
+            instruction_data,
+            token_program_id,
+        )
+        .await
+        .context("Failed to send InitializeAccount transaction")?;
+
+    let included_at = poll_inclusion(client, tx_hash, start_block).await?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "definition": definition_id.to_string(),
+        "holding": holding_id.to_string(),
         "txHash": tx_hash.to_string(),
         "includedAtBlock": included_at,
     }))

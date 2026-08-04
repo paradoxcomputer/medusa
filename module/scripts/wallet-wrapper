@@ -437,6 +437,57 @@ def private_dest_block(dest):
     return None
 
 
+def _faucet_client():
+    """medusa-faucet-client, beside the engine on a bundled install, else the dev-staged one."""
+    env = os.environ.get("MEDUSA_FAUCET_CLIENT")
+    if env:
+        return env
+    beside = os.path.join(os.path.dirname(os.path.realpath(WALLET)), "medusa-faucet-client")
+    if os.path.isfile(beside) and os.access(beside, os.X_OK):
+        return beside
+    return os.path.expanduser("~/.local/bin/medusa-faucet-client")
+
+
+def run_faucet_client(cmd, timeout=300):
+    """Same stdin-password convention as the engine, so `run`'s contract carries over."""
+    try:
+        return subprocess.run([_faucet_client(), *cmd], capture_output=True, text=True,
+                              input=pw, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        return subprocess.CompletedProcess(cmd, 124, e.stdout or "", "timed out")
+    except OSError as e:
+        return subprocess.CompletedProcess(cmd, 127, "", "faucet client cannot be run: %s" % e)
+
+
+def bootstrap_holding(owner, defb):
+    """Create and INITIALIZE a keytree holding of `defb` for `owner`, returning its bare id.
+
+    A shield proves spend authority from a signing key, so its source must be a keytree
+    account. An ATA is a PDA and never qualifies, and nothing can bootstrap a holding from
+    ATA funds on its own: the token program initializes an uninitialized recipient only when
+    that recipient is AUTHORIZED, and `ata send` passes its recipient unauthorized (verified
+    in the wallet's own ata facade). So the account is minted here and initialized through
+    medusa-faucet-client's `init-holding`, which sends token::InitializeAccount with the
+    holding signed. Returns None if anything fails, and the caller reports the usual error.
+    """
+    made = run(["account", "new", "public"])
+    m = re.search(r"account_id\s+(?:Public/)?([1-9A-HJ-NP-Za-km-z]{32,44})", made.stdout or "")
+    if not m:
+        return None
+    bare = m.group(1)
+    res = run_faucet_client(["init-holding", "--definition", defb, "--holding", bare])
+    try:
+        out = json.loads((res.stdout or "").strip())
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not out.get("ok"):
+        return None
+    reg = load_reg()
+    reg.setdefault("vaults", {}).setdefault(owner, {})[defb] = bare
+    save_reg(reg)
+    return bare
+
+
 def direct_holding_for(defb, need):
     """Find a direct-owned PUBLIC token-holding account of `defb` with balance >= need.
     (A holding whose key IS in the keytree - e.g. a supply account from `token new`.
@@ -718,6 +769,14 @@ if args and args[0] == "token-shield" and len(args) >= 5:
         owner = args[1].split("/")[-1]
         vault = vault_for(defb, owner)   # this owner's own holding, not the wallet's
         vd, vb = holding_state(vault) if vault else (None, None)
+        if vd != defb and (ata_balance(owner, defb) or 0) >= amt:
+            # No holding yet, but the ATA covers it. The faucet pays into ATAs and mints
+            # nothing, so this is the ordinary case for a user who claimed and then shielded:
+            # create the holding ON DEMAND, here, rather than leaving three of them in the
+            # account list on the chance somebody eventually shields.
+            made = bootstrap_holding(owner, defb)
+            if made:
+                vault, vd, vb = made, defb, 0
         if vd == defb:
             need = amt - (vb or 0)
             ata_b = ata_balance(owner, defb) or 0
