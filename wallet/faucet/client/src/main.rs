@@ -73,10 +73,10 @@ enum Command {
         /// Path to the guest .bin (used to recompute the program id).
         #[arg(long)]
         bin: PathBuf,
-        /// Recipient token-holding account id(s), comma-separated, one per definition,
-        /// in the same order as --definitions. All must be owned by this wallet (they
-        /// are signed as the claimant); the FIRST one is the claimant the cooldown
-        /// marker is bound to. A single account can hold only one token definition.
+        /// The ONE account claiming, which must be owned by this wallet: it is signed, it
+        /// is what proves who is claiming, and the cooldown marker binds to it. Tokens are
+        /// paid into that account's associated token accounts, derived per definition and
+        /// created here if missing, so no holding account is passed or minted.
         #[arg(long)]
         account: String,
         /// Token definition account id(s), comma-separated.
