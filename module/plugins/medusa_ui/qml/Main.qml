@@ -174,6 +174,8 @@ Rectangle {
     property string selectedFromType:    ""
     property string selectedFromBalance: ""
     property var    selectedTokens:      []      // [{definitionId,ticker,balance}] of the selected account
+    // Why the token list may be stale: set when a refresh fails, cleared when one succeeds.
+    property string tokensError:         ""
     property var    whitelistTokens:     []      // [{name,def}] curated tokens to add
 
     // ── The faucet: ONE press, up to TWO halves ────────────────────────────────
@@ -1266,11 +1268,17 @@ Rectangle {
     }
 
     function refreshTokens() {
-        root.selectedTokens = []
-        if (typeof logos === "undefined" || !logos.callModule) return
-        if (!root.selectedFromId || root.selectedFromId.length === 0) return
+        if (typeof logos === "undefined" || !logos.callModule) { root.selectedTokens = []; return }
+        if (!root.selectedFromId || root.selectedFromId.length === 0) { root.selectedTokens = []; return }
         var r = callModuleParse(logos.callModule("medusa_core", "getTokens", [root.selectedFromId]))
-        if (Array.isArray(r)) root.selectedTokens = r
+        if (Array.isArray(r)) { root.selectedTokens = r; root.tokensError = ""; return }
+        // A FAILURE IS NOT AN EMPTY WALLET. getTokens shells out to `ata list`, which reaches
+        // the chain, so on a slow or wobbly zone it can time out - and this used to clear the
+        // list first and repopulate only on success, so the failure was indistinguishable from
+        // "you own no tokens". That is the worst possible way to be wrong about a balance.
+        // Keep whatever was last known and say what happened.
+        root.tokensError = (r && r.error) ? String(r.error) : "could not read this account's tokens"
+        root.logActivity("Tokens: " + root.tokensError, true)
     }
 
     function doAddToken(defId) {
@@ -1816,6 +1824,31 @@ Rectangle {
             if (arr[k].state === "running") live.push(arr[k])
         root.privJobs = live
         rebuildJobsModel()
+
+        // NEVER LEAVE A CLAIM UNREPORTED. settleFaucetClaim() waits for BOTH halves to reach a
+        // terminal state, and finished jobs are dropped from the list just above. So if one half
+        // never reported - it was never started, its job id went unknown, the module restarted
+        // under it - the other half completed, vanished from the box, and the user was shown
+        // nothing at all. Observed exactly that: a claim that had already landed on chain looked
+        // like it had evaporated. If a claim is open and NO half is still running, the wait can
+        // never end on its own, so close it out with what is known.
+        if (root.faucetClaim !== null) {
+            var stillRunning = false
+            for (var q = 0; q < live.length; q++)
+                if (live[q].claim === "lez" || live[q].claim === "tok") stillRunning = true
+            if (!stillRunning) {
+                var c = root.faucetClaim
+                if (c.lez.state === "pending") {
+                    c.lez.state = "error"
+                    c.lez.error = c.lez.error || "the LEZ half stopped reporting"
+                }
+                if (c.tok.state === "pending") {
+                    c.tok.state = "error"
+                    c.tok.error = c.tok.error || "the token half stopped reporting"
+                }
+                root.settleFaucetClaim()
+            }
+        }
         if (!anyRunning) privJobsTimer.stop()
     }
 
@@ -4494,6 +4527,18 @@ Rectangle {
                             onClicked: { root.refreshWhitelist(); root.screen = "addtoken" } }
                     }
 
+                    // WHY THE LIST MAY BE SHORT. getTokens reaches the chain, so a slow zone can
+                    // fail the refresh; showing nothing with no explanation reads as "you own no
+                    // tokens", which is the one conclusion a wallet must never invite by accident.
+                    Text { textFormat: Text.PlainText;
+                        visible: root.tokensError.length > 0
+                        Layout.fillWidth: true
+                        text: "Token balances could not be refreshed (" + root.tokensError
+                              + "). Showing the last known values."
+                        color: root.errorRed; font.pixelSize: 9; font.family: root.faceFont
+                        wrapMode: Text.WordWrap
+                    }
+
                     // ── Token faucet status ─────────────────────────────────────────────
                     // No separate control: the ⛲ chip on the hero card claims BOTH halves, so a
                     // second button was one more thing to explain for no capability the chip
@@ -5702,22 +5747,36 @@ Rectangle {
                     Layout.fillWidth: true; spacing: 5
                     Repeater {
                         model: accountModel
-                        RowLayout {
+                        // An ITEM, not a RowLayout, because the whole row has to be clickable.
+                        // The tap target used to be a MouseArea anchored inside the RowLayout,
+                        // and a direct child of a layout is SIZED BY that layout: anchoring it
+                        // is undefined behaviour and Qt says so on every render
+                        // ("Detected anchors on an item that is managed by a layout"). Selecting
+                        // which accounts a dApp may see is not a place for undefined behaviour.
+                        // The row and the tap target now both anchor to this plain Item, which
+                        // the ColumnLayout sizes normally.
+                        Item {
                             id: connAcctRow
-                            Layout.fillWidth: true; spacing: 8
+                            Layout.fillWidth: true
+                            implicitHeight: connAcctInner.implicitHeight
                             property bool picked: root.connAccountSel[model.id] === true
-                            Rectangle {
-                                Layout.preferredWidth: 18; Layout.preferredHeight: 18; radius: 5
-                                color: connAcctRow.picked ? root.accentOrange : root.inputBg
-                                border.color: connAcctRow.picked ? root.accentOrange : root.borderColor
-                                Text { textFormat: Text.PlainText; anchors.centerIn: parent; visible: connAcctRow.picked
-                                       text: "✓"; color: root.bgColor; font.pixelSize: 11 }
-                            }
-                            Text { textFormat: Text.PlainText;
-                                Layout.fillWidth: true
-                                text: root.displayId(model.id) + "  ·  " + (model.type || "public")
-                                color: root.textPrimary; font.family: root.faceFont
-                                font.pixelSize: 12; elide: Text.ElideRight
+                            RowLayout {
+                                id: connAcctInner
+                                anchors.fill: parent
+                                spacing: 8
+                                Rectangle {
+                                    Layout.preferredWidth: 18; Layout.preferredHeight: 18; radius: 5
+                                    color: connAcctRow.picked ? root.accentOrange : root.inputBg
+                                    border.color: connAcctRow.picked ? root.accentOrange : root.borderColor
+                                    Text { textFormat: Text.PlainText; anchors.centerIn: parent; visible: connAcctRow.picked
+                                           text: "✓"; color: root.bgColor; font.pixelSize: 11 }
+                                }
+                                Text { textFormat: Text.PlainText;
+                                    Layout.fillWidth: true
+                                    text: root.displayId(model.id) + "  ·  " + (model.type || "public")
+                                    color: root.textPrimary; font.family: root.faceFont
+                                    font.pixelSize: 12; elide: Text.ElideRight
+                                }
                             }
                             MouseArea {
                                 anchors.fill: parent; cursorShape: Qt.PointingHandCursor

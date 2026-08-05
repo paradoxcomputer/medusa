@@ -2400,7 +2400,14 @@ QString WalletPlugin::getTokens(const QString& accountId)
         return QStringLiteral("[]");
     // Wrapper verb: probes every registered token definition with `ata list` and
     // returns [{definitionId, ticker, balance}] for the holdings this account has.
-    return runWalletCommand({ QStringLiteral("tokens"), accountId.trimmed() }, 45000);
+    //
+    // 120s, not 45. That is one chain read per registered definition, and on logos-testnet
+    // those measured ~20s each: three tokens came to 61-71s, so the read timed out before it
+    // could answer and the UI showed an empty token list - indistinguishable from owning
+    // nothing, while the balances sat on chain the whole time. Matches getDirectHoldings, which
+    // is the same shape of call and already allowed for a slow zone. The caller runs this
+    // behind a busy veil, so the cost is visible rather than silent.
+    return runWalletCommand({ QStringLiteral("tokens"), accountId.trimmed() }, 120000);
 }
 
 QString WalletPlugin::getShieldedTokens()
