@@ -27,18 +27,26 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # check, because the hashes are computed over the compromised build. The tags are kept as
 # comments only, for readability.
 REPO="${LEZ_REPO:-https://github.com/logos-blockchain/logos-execution-zone.git}"
-BASE_REV="${LEZ_BASE_REV:-a58fbce2ff48c58b7bb5001b1a27e64b9596ee3a}"   # == tag v0.2.0
+BASE_REV="${LEZ_BASE_REV:-d6e4ae694e7419f5906b340c232704466a1917b7}"   # == tag v0.2.2
 # What the checkout MUST resolve to; asserted in step 2, so a mismatch fails loudly instead of
 # building something else. Overriding LEZ_BASE_REV for development therefore also means stating
 # the SHA you expect, deliberately.
 BASE_SHA="${LEZ_EXPECTED_SHA:-$BASE_REV}"
-# The patch series must match the base commit. v0.2.0 is the default; the superseded rc5 series
-# is kept alongside it and can still be built explicitly:
+# The patch series must match the base commit. v0.2.2 is the default; the superseded series are
+# kept alongside it and can still be built explicitly:
+#   LEZ_BASE_REV=a58fbce2ff48c58b7bb5001b1a27e64b9596ee3a \
+#     LEZ_PATCH_DIR=patches-v020 bash wallet/build.sh   # == tag v0.2.0
 #   LEZ_BASE_REV=27360cb7d6ccb2bfbcca7d171bab8a3938490264 \
-#     LEZ_PATCH_DIR=patches-rc5 bash wallet/build.sh    # == tag v0.2.0-rc5, the old engine
-# v0.2.0 is what the official public testnet (testnet.lez.logos.co) runs; rc5 is what the Paradox
-# zone runs. Wallet and zone must move together - the risc0 program ImageIDs differ between them.
-PATCH_DIR="${LEZ_PATCH_DIR:-patches-v020}"
+#     LEZ_PATCH_DIR=patches-rc5 bash wallet/build.sh    # == tag v0.2.0-rc5, the oldest engine
+#
+# WALLET AND ZONE MUST MOVE TOGETHER. Every built-in program is a risc0 guest, so its id IS the
+# ImageID of its binary, and v0.2.2 rebuilt all of them: the token program is c5d50f88... on
+# v0.2.0 and ccc4713e... on v0.2.2. A wallet built against the wrong base does not fail cleanly,
+# it addresses programs the zone has never heard of. The live id is checkable without guessing:
+#   curl -sX POST -H 'Content-Type: application/json' \
+#     -d '{"jsonrpc":"2.0","id":1,"method":"getProgramIds","params":[]}' <sequencer>
+# and each u32 word is little-endian, so the hex is the concatenation of their LE bytes.
+PATCH_DIR="${LEZ_PATCH_DIR:-patches-v022}"
 SRC="${LEZ_SRC:-$HERE/.lez-build}"              # default: a repo-local (gitignored) clone
 
 # diaphani-forward - the Tor TCP-forwarder built in step 5. Same rule: full commit id, asserted.

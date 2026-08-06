@@ -27,7 +27,7 @@ use sequencer_service_rpc::{RpcClient as _, SequencerClient};
 use wallet::{
     AccountIdentity, WalletCore,
     cli::read_password_from_stdin,
-    helperfunctions::{fetch_config_path, fetch_persistent_storage_path},
+    helperfunctions::{fetch_config_path, fetch_persistent_storage_path, fetch_statistics_path},
 };
 
 /// Default number of blocks to wait for inclusion before declaring the tx silently
@@ -126,8 +126,10 @@ async fn run(args: Args) -> Result<serde_json::Value> {
     }
 
     // Password arrives on stdin exactly like the wallet CLI; unlock the same storage.
-    let wallet = open_wallet()?;
-    let client = wallet.sequencer_client.clone();
+    let wallet = open_wallet().await?;
+    // v0.2.2 replaced the single `sequencer_client` field with a MultiSequencerClient; the
+    // one currently in charge is helm_owned().
+    let client = wallet.helm_owned();
 
     match args.command {
         Command::Info { .. } => unreachable!("handled before wallet unlock"),
@@ -146,10 +148,12 @@ async fn run(args: Args) -> Result<serde_json::Value> {
     }
 }
 
-fn open_wallet() -> Result<WalletCore> {
+async fn open_wallet() -> Result<WalletCore> {
     let config_path = fetch_config_path().context("Could not fetch config path")?;
     let storage_path =
         fetch_persistent_storage_path().context("Could not fetch persistent storage path")?;
+    // v0.2.2 keeps per-sequencer statistics beside the storage and the constructor needs the path.
+    let statistics_path = fetch_statistics_path().context("Could not fetch statistics path")?;
     if !storage_path.exists() {
         bail!(
             "wallet storage not found at {} - initialize the wallet with the wallet CLI first",
@@ -157,7 +161,8 @@ fn open_wallet() -> Result<WalletCore> {
         );
     }
     let password = read_password_from_stdin().context("Could not read password from stdin")?;
-    WalletCore::open_encrypted(config_path, storage_path, None, &password)
+    WalletCore::open_encrypted(config_path, storage_path, statistics_path, None, &password)
+        .await
         .context("Failed to unlock wallet storage")
 }
 

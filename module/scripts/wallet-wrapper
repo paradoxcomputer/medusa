@@ -58,6 +58,16 @@ if not os.path.exists(cfg):
     with open(cfg, "w") as f:
         json.dump(
             {
+                # LEZ v0.2.2 takes a LIST of sequencers. The flat "sequencer_addr" it used to
+                # take is now an unknown field and the engine refuses the whole config, so a
+                # seeded config in the old shape produced "Failed to deserialize wallet config"
+                # on every command. Both are written: the flat one is what this wrapper and the
+                # module read back to decide the active zone.
+                "sequencers": [
+                    {"sequencer_addr": os.environ.get("LOGOS_SEQUENCER", "http://127.0.0.1:3071/")}
+                ],
+                "multi_sequencer_client_config": {"distribution_limit": 1,
+                                                  "calibration_limit": 100},
                 "sequencer_addr": os.environ.get("LOGOS_SEQUENCER", "http://127.0.0.1:3071/"),
                 # Confirm window must cover a 60s-block zone (seq-testnet), not just the 15s
                 # devnet, or the CLI reports "Transaction not found in preconfigured amount
@@ -348,7 +358,12 @@ def active_seq():
     """The sequencer the user wallet is currently pointed at (per the active network)."""
     try:
         with open(os.path.join(home, "wallet_config.json")) as f:
-            return json.load(f).get("sequencer_addr", "http://127.0.0.1:3071/")
+            cfg = json.load(f)
+            # v0.2.2 shape first, then the flat key an older Medusa left on disk.
+            seqs = cfg.get("sequencers") or []
+            if seqs and seqs[0].get("sequencer_addr"):
+                return seqs[0]["sequencer_addr"]
+            return cfg.get("sequencer_addr", "http://127.0.0.1:3071/")
     except (OSError, ValueError):
         return os.environ.get("LOGOS_SEQUENCER", "http://127.0.0.1:3071/")
 

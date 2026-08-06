@@ -155,6 +155,21 @@ static constexpr FaucetZoneRow kFaucetZones[] = {
 
 // The row for a zone, or nullptr when that zone has no token faucet. The ONE place the
 // capability is decided.
+// The active sequencer address out of a wallet_config.json, whichever shape it is in. v0.2.2
+// takes `sequencers: [{sequencer_addr}]`; everything before it took a flat `sequencer_addr`, and
+// a wallet home written by an older Medusa still has one on disk. Reading both means an upgrade
+// does not silently lose track of which zone a wallet is pointed at.
+static QString seqAddrOf(const QJsonObject& cfg)
+{
+    const QJsonArray seqs = cfg.value(QStringLiteral("sequencers")).toArray();
+    if (!seqs.isEmpty()) {
+        const QString a = seqs.at(0).toObject().value(QStringLiteral("sequencer_addr")).toString();
+        if (!a.isEmpty())
+            return a;
+    }
+    return cfg.value(QStringLiteral("sequencer_addr")).toString();
+}
+
 static const FaucetZoneRow* faucetZoneRow(const QString& zoneId)
 {
     const QString z = zoneId.trimmed();
@@ -1831,7 +1846,24 @@ QString WalletPlugin::applySequencer()
         cfg[QStringLiteral("seq_poll_max_retries")]      = 8;
         cfg[QStringLiteral("seq_block_poll_max_amount")] = 200;
     }
+    // LEZ v0.2.2 takes a LIST of sequencers, not one address: `sequencers: [{sequencer_addr}]`.
+    // The flat `sequencer_addr` this used to write is now an unknown field and the engine
+    // refuses the whole config ("Failed to deserialize wallet config"), so every zone switch
+    // would have produced a config the wallet could not open. The flat key is still written
+    // alongside it, because the value is read back by this module and by the wrapper to decide
+    // the active zone, and an older engine still understands it.
+    QJsonObject one;
+    one[QStringLiteral("sequencer_addr")] = addr;
+    QJsonArray seqs;
+    seqs.append(one);
+    cfg[QStringLiteral("sequencers")] = seqs;
     cfg[QStringLiteral("sequencer_addr")] = addr;
+    if (!cfg.contains(QStringLiteral("multi_sequencer_client_config"))) {
+        QJsonObject msc;
+        msc[QStringLiteral("distribution_limit")] = 1;    // one zone at a time, as the UI models it
+        msc[QStringLiteral("calibration_limit")]  = 100;
+        cfg[QStringLiteral("multi_sequencer_client_config")] = msc;
+    }
     cfg[QStringLiteral("zone")] = id;   // lets the wrapper scope tokens/registry per zone
     QDir().mkpath(walletHome());
     { QFile f(cfgp); if (f.open(QIODevice::WriteOnly)) f.write(QJsonDocument(cfg).toJson(QJsonDocument::Compact)); }
@@ -2049,7 +2081,7 @@ QString WalletPlugin::getSequencerConfig() const
     QFile f(walletHome() + QStringLiteral("/wallet_config.json"));
     if (f.open(QIODevice::ReadOnly))
         o[QStringLiteral("effectiveAddr")] =
-            QJsonDocument::fromJson(f.readAll()).object().value(QStringLiteral("sequencer_addr")).toString();
+            seqAddrOf(QJsonDocument::fromJson(f.readAll()).object());
     return QJsonDocument(o).toJson(QJsonDocument::Compact);
 }
 
@@ -2189,7 +2221,7 @@ QString WalletPlugin::getSequencerStatus()
     QString eff;
     { QFile f(walletHome() + QStringLiteral("/wallet_config.json"));
       if (f.open(QIODevice::ReadOnly))
-          eff = QJsonDocument::fromJson(f.readAll()).object().value(QStringLiteral("sequencer_addr")).toString(); }
+          eff = seqAddrOf(QJsonDocument::fromJson(f.readAll()).object()); }
 
     const bool torZone = (kind == QStringLiteral("local-l1-tor"))
                       || (kind == QStringLiteral("remote") && zoneObj(id).value(QStringLiteral("tor")).toBool());
