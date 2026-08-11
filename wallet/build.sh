@@ -3,16 +3,25 @@
 # upstream logos-execution-zone at a PINNED commit + our patches - no machine-local checkout
 # needed.
 #
-#   deployed source  ==  logos-execution-zone @ a58fbce2ff48c58b7bb5001b1a27e64b9596ee3a
-#                        (upstream tag v0.2.0)         +  wallet/patches-v020/*.patch
+#   deployed source  ==  logos-execution-zone @ 47eba256479f6f785acbd138834340703cd03401
+#                        (upstream tag v0.2.4)         +  wallet/patches-v022/*.patch
 #
-# Patch (rc5 series) reconstructs the deployed wallet customisations:
-#   0001 encrypted storage (Argon2id + AES-256-GCM) + account list --json + mnemonic/key export
-#   0002 pyo3/keycard_wallet behind an opt-in "keycard" feature, so the wallet no longer links
-#        the build host's libpython (medusa#1). The feature is OFF by default, so the plain
-#        `cargo build` below already builds it out - no extra flags needed here.
-# (rc4's 0003/0006 are obsolete on rc5 - logos-blockchain is already pinned and token ops
-#  already print hashes; 0004/0005 demand-driven sequencer are deferred.)
+# ONE patch reconstructs the deployed wallet customisations, not the two the v0.2.0 series
+# carried. Upstream v0.2.2 rewrote enough of lez/wallet that the encrypted-storage work and the
+# keycard gating stopped sitting on disjoint hunks - both touch lez/wallet/Cargo.toml and
+# lez/wallet/src/cli/mod.rs - so splitting them again would mean maintaining a hunk-level split
+# that breaks on every rebase for no benefit. What it contains:
+#   • encrypted storage (Argon2id + AES-256-GCM) + account list --json + mnemonic/key export
+#     + top-level restore-keys, intercepted before any storage load so recovery works when the
+#     existing wallet is unopenable
+#   • pyo3/keycard_wallet behind an opt-in "keycard" feature, so the wallet no longer links the
+#     build host's libpython (medusa#1). OFF by default, so the plain `cargo build` below
+#     already builds it out - no extra flags needed here. v0.2.2 deleted lez/wallet/src/signing.rs
+#     and dropped pyo3 from the workspace, so the wallet crate must NOT declare pyo3: it is no
+#     longer in workspace.dependencies and declaring it fails the workspace manifest load.
+#   • the signing key on stdin rather than --private-key <hex>, because /proc/<pid>/cmdline is
+#     world-readable.
+# See wallet/patches-v022/README.md for what each part changed in the rebase.
 #
 # Override the source via env if you already have a checkout:
 #   LEZ_SRC=~/some/logos-execution-zone bash wallet/build.sh
@@ -27,17 +36,30 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # check, because the hashes are computed over the compromised build. The tags are kept as
 # comments only, for readability.
 REPO="${LEZ_REPO:-https://github.com/logos-blockchain/logos-execution-zone.git}"
-BASE_REV="${LEZ_BASE_REV:-d6e4ae694e7419f5906b340c232704466a1917b7}"   # == tag v0.2.2
+BASE_REV="${LEZ_BASE_REV:-47eba256479f6f785acbd138834340703cd03401}"   # == tag v0.2.4
 # What the checkout MUST resolve to; asserted in step 2, so a mismatch fails loudly instead of
 # building something else. Overriding LEZ_BASE_REV for development therefore also means stating
 # the SHA you expect, deliberately.
 BASE_SHA="${LEZ_EXPECTED_SHA:-$BASE_REV}"
-# The patch series must match the base commit. v0.2.2 is the default; the superseded series are
-# kept alongside it and can still be built explicitly:
+# The patch series must match the base commit. The series is still called patches-v022 because
+# that is the release it was rebased onto, and it applies UNCHANGED at v0.2.4: v0.2.2..v0.2.4
+# touches lez/sequencer, lez/storage, lez/indexer and the workspace manifests, and does not touch
+# lez/wallet at all (verified with `git diff --name-only v0.2.2 v0.2.4`). Renaming it per release
+# would imply a rebase that never happened. The superseded series are kept alongside it and can
+# still be built explicitly:
+#   LEZ_BASE_REV=d6e4ae694e7419f5906b340c232704466a1917b7 \
+#     bash wallet/build.sh                              # == tag v0.2.2, same patch series
 #   LEZ_BASE_REV=a58fbce2ff48c58b7bb5001b1a27e64b9596ee3a \
 #     LEZ_PATCH_DIR=patches-v020 bash wallet/build.sh   # == tag v0.2.0
 #   LEZ_BASE_REV=27360cb7d6ccb2bfbcca7d171bab8a3938490264 \
 #     LEZ_PATCH_DIR=patches-rc5 bash wallet/build.sh    # == tag v0.2.0-rc5, the oldest engine
+#
+# WHY v0.2.4 WHEN THE WALLET SOURCE IS IDENTICAL TO v0.2.2. The engine binary this produces is
+# unchanged, and so are the built-in program ids, because v0.2.4 rebuilt no guest. What it does
+# change is the two SEQUENCERS this script also builds and the module bundles: v0.2.4 carries L1
+# reorg fixes (adopting/orphaning blocks on a false positive from L1, and only delivering from a
+# peer block on its verified chain). The paradox zone already runs a v0.2.4 sequencer, so pinning
+# here keeps the bundled devnet/diaphani sequencers on the same code as the live one.
 #
 # WALLET AND ZONE MUST MOVE TOGETHER. Every built-in program is a risc0 guest, so its id IS the
 # ImageID of its binary, and v0.2.2 rebuilt all of them: the token program is c5d50f88... on

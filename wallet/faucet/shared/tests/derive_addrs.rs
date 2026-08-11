@@ -31,23 +31,23 @@ fn program_id_from_hex(hex: &str) -> ProgramId {
 }
 
 /// Must equal kFaucetProgramId in module/src/plugin/WalletPlugin.cpp.
-const PROGRAM_ID: &str = "214dc4329f8d260eaa6e91818fc299ed201d366b3d2d235e716cc1672ab2b4b1";
+const PROGRAM_ID: &str = "fe68ee1535e3a97c05c44c9d5f3e36337474de98014f46e5b26476b990c568e6";
 
 /// Must equal kFaucetZones in module/src/plugin/WalletPlugin.cpp: (zone, ticker, definition,
 /// treasury).
 const SHIPPED: &[(&str, &str, &str, &str)] = &[
-    ("paradox-clearnet", "GOLD", "5YEhWdY2edtRFkCruXjtnFH5F62VkCiCxXmNAvHuVkEY",
-                                 "7wkFSuBQyUeTaKKfoFAKpKxe3FQTNHqkqK4BPLTvLyb5"),
-    ("paradox-clearnet", "SILV", "HUDERmRqyX6swMnuk9FT5vmqNbcdLNbVxDRtLEdzsMXk",
-                                 "38nM3WKHCMpBXxgG3W19V6g3Z2bXs6efekcph3RKfC6Z"),
-    ("paradox-clearnet", "BRNZ", "3zS3bGdToZcqPU9jBZC8c1aK9MQvpekse9EJ52nD1wiM",
-                                 "ArdHwtFt75239nKcFgaHYUGCh8nHyGi3hbHeJn9svnM9"),
-    ("logos-testnet",    "GOLD", "7ZZGE941fzSGCAfxxdkPWQszSspBhZEcjHUkLqWrrnz6",
-                                 "18Yt1464Q6SBxug5inAwdv4AvKUkMFePysaVi3GhU5V"),
-    ("logos-testnet",    "SILV", "CfuvpaUhbxEzWd6ZtLDiKWVg5DZLiYj14Q8HgtDUwuS6",
-                                 "DYBTWuGVRiJG4dY5A34aK8gauvZxeTsTriW8WMGKzaUZ"),
-    ("logos-testnet",    "BRNZ", "EEMUsdWL1WxrQBi1SmNFUKVcMUjgVcky12NRv2BjBuxp",
-                                 "3ijamAJSkF6cbVZhmyF5Diit3LZXDRtcd6v1N7emtu1a"),
+    ("paradox-clearnet", "GOLD", "8s3is166TjLLnnW2ark7P8EaXd6JctmB8TdFyQjfcXcC",
+                                 "Ecsr89CYDJ9cnB4E8tVdvVM3xUjqexUGh6fGAKFHmYgJ"),
+    ("paradox-clearnet", "SILV", "ESzFSiGDHffJBxrTR9bRUsbDf6AyqXX5oCL3QJszJNWy",
+                                 "HadizEAxcniTjwrxfX5fmjHTRdSYQ8ZAa1FyBKb4H4s1"),
+    ("paradox-clearnet", "BRNZ", "87F1T6q5F5aRasjRsrMcrhS7MXzxH6QwMAUSDWBtErLn",
+                                 "ERuQAMcL3ZJb9FXXvmh9dw7vN2pnmeaLYuZKdc9DQLtP"),
+    ("logos-testnet",    "GOLD", "CbFY4JMzmbUQXCgRDCTB2RjEfZsC3RWdyjqU3cUYhbhW",
+                                 "BReTgMo9KZaE4cZQT4uSEZdhsiEgaSaUD1EvbqNuPZQG"),
+    ("logos-testnet",    "SILV", "6g6uu2qY8UmUkxGFDuv66LfuJhx51eS3SGjKpY6oMK66",
+                                 "EhhtUHWLeniaDwGZynToX2GPUygZmSmWuuMHtzLtw8U9"),
+    ("logos-testnet",    "BRNZ", "6SEMCjTX5Zkkf5R1b8hWLmfUhy9WVBsDPHtU8ponF4w1",
+                                 "Hbkh6N9wk1PKwTeZPqUgs9nL3kXhd99byT3f9Lq2qWqe"),
 ];
 
 #[test]
@@ -73,6 +73,12 @@ fn shipped_table_matches_the_program_id() {
 /// The derivation itself, pinned against the previously DEPLOYED program and the treasuries it
 /// really had on chain. If this ever fails, the helper above is wrong and the addresses it
 /// produces cannot be trusted, whatever the table says.
+///
+/// These are DEAD ADDRESSES ON PURPOSE and must not be refreshed to match the table above. The
+/// v0.2.2 upgrade reset both chains, so neither this program nor these definitions exist on any
+/// live zone any more. That is the point: a known-answer vector is only worth something if it
+/// stays frozen, and freezing it is what makes it independent of whatever the shipped table says
+/// today. `treasury_account_id` is a pure function, so a chain reset cannot invalidate it.
 #[test]
 fn the_derivation_reproduces_the_previously_deployed_addresses() {
     let old = program_id_from_hex("523320bdfff97cdbec1f01fdb5de9c37b4555abb7585cd123d77e9d09756e571");

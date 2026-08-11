@@ -57,7 +57,7 @@ write_core_manifest() {
   "icon": "",
   "main": { "linux-amd64": "medusa_core_plugin.so", "linux-amd64-dev": "medusa_core_plugin.so",
             "linux-x86_64-dev": "medusa_core_plugin.so", "darwin-arm64": "medusa_core_plugin.dylib" },
-  "manifestVersion": "0.2.0", "name": "medusa_core", "type": "core", "version": "0.3.0"
+  "manifestVersion": "0.2.0", "name": "medusa_core", "type": "core", "version": "0.4.0"
 }
 MANIFEST
 }
@@ -66,7 +66,7 @@ write_ui_manifest() {
 {
   "author": "Paradox Computer", "category": "blockchain", "dependencies": ["medusa_core"],
   "description": "Medusa wallet UI", "icon": "icons/medusa-icon.png", "main": {},
-  "manifestVersion": "0.2.0", "name": "medusa_ui", "type": "ui_qml", "version": "0.3.0",
+  "manifestVersion": "0.2.0", "name": "medusa_ui", "type": "ui_qml", "version": "0.4.0",
   "view": "qml/Main.qml"
 }
 MANIFEST
@@ -154,8 +154,16 @@ if [[ $QML_ONLY -eq 0 ]]; then
     # "the on-chain faucet helper is not installed with this wallet" while the LEZ half still works.
     FAUCET_SRC="${FAUCET_SRC:-$REPO/../wallet/faucet/client/target/release/medusa-faucet-client}"
     if [[ -x "$FAUCET_SRC" ]]; then
-        install -m755 "$FAUCET_SRC" "$HOME/.local/bin/medusa-faucet-client"
-        echo "  staged faucet client → ~/.local/bin/medusa-faucet-client"
+        # Copying a file onto itself is an `install` ERROR, and under `set -e` that aborts the
+        # whole script - silently skipping every step BELOW this one, the guest binary included.
+        # Pointing $FAUCET_SRC straight at the staged path is the obvious thing to do when the
+        # client was built somewhere else, so treat it as already-staged rather than as failure.
+        if [[ "$FAUCET_SRC" -ef "$HOME/.local/bin/medusa-faucet-client" ]]; then
+            echo "  faucet client already at ~/.local/bin/medusa-faucet-client (source is the destination)"
+        else
+            install -m755 "$FAUCET_SRC" "$HOME/.local/bin/medusa-faucet-client"
+            echo "  staged faucet client → ~/.local/bin/medusa-faucet-client"
+        fi
     else
         echo "  !! medusa-faucet-client not found at \$FAUCET_SRC ($FAUCET_SRC)"
         echo "     the token faucet will be unavailable; build it: bash $REPO/../wallet/build.sh"

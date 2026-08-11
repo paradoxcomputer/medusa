@@ -89,16 +89,16 @@ jobs:
           # by build_utils::include_artifacts, so nothing compiles a guest on this runner.
           cargo risczero install --version "$RISC0_VERSION" || true
 
-      - name: Build the LEZ engine (patched v0.2.0 source)
+      - name: Build the LEZ engine (patched v0.2.4 source, v0.2.2 program generation)
         run: |
           # wallet/build.sh replays the patch series with `git am`, which refuses to run without a
           # committer identity. GitHub's ubuntu image ships none, so set one for this checkout.
           git config --global user.name  "medusa build"
           git config --global user.email "build@medusa.local"
-          # clones logos-execution-zone@v0.2.0, applies wallet/patches-v020/*, builds:
+          # clones the pinned logos-execution-zone commit (tag v0.2.4), applies wallet/patches-v022/*, builds:
           #   wallet (→ wallet-lez), sequencer_service (standalone), sequencer_service_l1 (L1),
           #   diaphani-forward (Tor forwarder).
-          # patches-v020/0002 keeps the `keycard` cargo feature OFF, so the wallet links no
+          # the patch series keeps the `keycard` cargo feature OFF, so the wallet links no
           # libpython - see the linkage assertion below.
           bash wallet/build.sh
           echo "LEZ=$PWD/wallet/.lez-build/target/release"     >> "$GITHUB_ENV"
@@ -193,6 +193,21 @@ jobs:
             install -m755 "$DIA/diaphani-forward"            "$stg/bin/diaphani-forward"
             install -m755 module/scripts/medusa-tor-monitor  "$stg/bin/medusa-tor-monitor"
             install -m755 "$tor_bin"                         "$stg/bin/medusa-tor"
+            # medusa-faucet-client, built by the same wallet/build.sh run as the engine above. It
+            # is required by TWO paths, not one: the on-chain token faucet, and the wrapper's
+            # `init-holding` bootstrap, which is the only way to shield a token held in an ATA (a
+            # PDA cannot sign a private send). Every release before 0.4.0 shipped without it, so
+            # Shield failed on every claimed token.
+            install -m755 wallet/faucet/client/target/release/medusa-faucet-client \
+                                                             "$stg/bin/medusa-faucet-client"
+            # The risc0 guest is NOT built on this runner (it needs the docker risc0 toolchain);
+            # bundle the committed artifact when there is one. Without it only the on-chain faucet
+            # CLAIM is affected, and it reports the absence rather than failing obscurely.
+            if [ -f wallet/faucet/guest/medusa_faucet.bin ]; then
+              install -m644 wallet/faucet/guest/medusa_faucet.bin "$stg/bin/medusa_faucet.bin"
+            else
+              echo "::warning::medusa_faucet.bin not in the tree - the on-chain token faucet will report it missing"
+            fi
             mainfile=$(basename "$(ls "$stg"/*.so 2>/dev/null || ls "$stg"/*plugin* | head -1)")
             "$LGX" add medusa_core-selfcontained.lgx -v "$v" -f "$stg" --main "$mainfile" -y
           done

@@ -8,6 +8,102 @@ them as a pair, never one alone.
 
 Releases before 0.3.0 predate this file. See the git history for those.
 
+## 0.4.0 - 2026-08-11
+
+The engine moved again, the token faucet became real, and the zone gate that 0.3.0 introduced
+turned out to be bypassable. **A 0.4 wallet talks to a v0.2.2 zone and cannot talk to a v0.2.0 or
+rc5 one**, for the same reason 0.3 could not talk to rc5: program ImageIDs are a hash of the
+program binaries and the wallet proves against the ids it was compiled with.
+
+### the LEZ v0.2.2 cutover
+
+- the engine is pinned to upstream commit `47eba256479f6f785acbd138834340703cd03401` (tag v0.2.4,
+  which rebuilt no guest program, so it is the v0.2.2 program generation) plus
+  `wallet/patches-v022/`. Both public zones reset their chains for this on 2026-08-07.
+- **`kEngineEpoch` is now `"v022"`.** It was left at `"v020"` when the engine moved, which is the
+  exact silent crossover the constant exists to prevent: `SequencerCore::start_from_config` reuses
+  an existing rocksdb with no version check, so a local devnet started on a chain whose accounts
+  are owned by program ids the binary no longer knows. **A local devnet therefore starts from a
+  fresh genesis on upgrade**; the old directory is left on disk and is not read.
+- the v0.2.2 CLI rejects the old flat `sequencer_addr` wallet config with
+  `missing field 'sequencers'`; the wrapper writes the new list shape and reads either.
+- the built-in **Logos public testnet** zone was verified against this build on 2026-08-11: it
+  serves the same v0.2.2 program ids. It is a third-party zone and can move, which is what the
+  per-zone compatibility probe and the "Zone build mismatch" modal exist to catch.
+
+### the on-chain token faucet
+
+- the `medusa_faucet` LEZ program is deployed and funded on both public zones, and the faucet now
+  **pays into the claimant's own ATAs** instead of minting holdings it kept. Claims are rejected if
+  they name the same token twice.
+- **`medusa-faucet-client` is now bundled in the release.** It never was before, and it is needed
+  by two paths, not one: the on-chain claim, and the wrapper's `init-holding` bootstrap.
+- a claim reports progress from the moment the job is created rather than trusting a one-shot push,
+  so a queued job no longer vanishes from the UI.
+
+### tokens and privacy
+
+- **token shielding works from an ATA-only balance again.** A shield proves spend authority from a
+  signing key and an ATA is a PDA, so it can never be the sender; the wrapper now mints and
+  initialises a keytree holding for the account and shields from that. Previously a user could
+  claim a token and then never shield it. The "issuer-only" limitation in the 0.3 notes is gone.
+- **every account has its own token vault**, instead of one holding shared by the whole wallet.
+- the Shield screen offers the account's whole token balance rather than only its direct holdings,
+  shows shielded balances, refreshes the list after a shield, and names the token.
+- the token registry survives a torn write and a concurrent writer.
+- tokens are shown again after a claim, and the UI distinguishes "balance is zero" from "balance is
+  still loading" instead of rendering an unknown as 0.
+
+### security
+
+- **the zone gate is keyed on the store, not on the session.** 0.3.0 gated the zone verbs with
+  `!m_password.isEmpty() && !authorize(password)`, and `clearSessionPassword()` is ungated by
+  design: three calls with no secret (lock, `addZone(attacker url)`, `setActiveZone`) left the
+  wallet talking to an attacker's sequencer, and the next ordinary Send from the wallet's own UI
+  went there. The gate now asks whether the STORE ON DISK can prove a password, which no caller can
+  flip. Consequence for users: **adding, editing, removing or switching a zone needs the wallet
+  unlocked**; the zone list stays readable while locked and the controls say why they are absent.
+  Onboarding is unaffected: a fresh install has no store, so the verbs are free there.
+- **`removeZone` is gated too.** It was the ungated member of the same class: it mutates the zone
+  list and moves the wallet off the zone it deletes.
+- **`importKey` is gated**: planting a signing key the caller chooses is a capability.
+- `curl` is launched with `-q`, so a planted `~/.curlrc` cannot steer the zone health probe that
+  paints the connection indicator.
+- the plugin's restore timeout was raised from 300s to 900s to match the wrapper's budget. A
+  measured restore takes ~353s, so the plugin was killing the restore from above while the wrapper
+  waited below it, leaving a half-synced store.
+- the UI renders every string as plain text and refuses a remote dApp icon.
+- the Connect SDK never returns a non-object and never brands the caller's action as its own.
+- unlock probes the store **without touching the chain**, so a dead or mismatched zone no longer
+  blocks unlocking (and a wrong password is no longer reported as a timeout under load).
+
+### zones, connect and the UI
+
+- **the Paradox · Tor zone works out of the box.** Its `.onion` was never baked into the build, so
+  every released install listed a zone that could not connect and only a machine with a
+  hand-written `~/.config/medusa-sequencer.onion` could use it. The address is now compiled in
+  (`paradoxj4xy6orxue7y7qsk4rxutzme6patcpo65liw22jlmlpxlncyd.onion`), still overridable by
+  `MEDUSA_SEQ_ONION` or that config file, and an override is taken verbatim: append `:<port>` for
+  a hidden service that does not publish on 80.
+- the Tor zone now publishes its address like the other two, so the UI can show it next to the zone
+  name. That display is what a user checks against a wallet that has been repointed, and it was the
+  one zone row with nothing to show.
+
+- a transport tag is shown wherever a zone is named, and built-in names no longer carry a transport
+  suffix. The add-zone form's Transport toggle is **gone**: the address decides (a `.onion` is a Tor
+  zone), so the toggle changed nothing while still allowing "Tor" next to an `https://` URL.
+- a Tor connect that fails says why, instead of showing "Connecting" forever, and can be stopped.
+- every approval that comes from a dApp shows the operating network and the endpoint.
+- the 10s account poll no longer hits the chain, which used to spam error toasts on a slow zone.
+- fixed: an account row that could not be clicked, and balances that never arrived.
+
+### packaging and tests
+
+- the wallet CLI is named `medusa-wallet`, and `version()` tracks the manifest.
+- every Q_INVOKABLE stays under the bridge's five-argument limit, with a connect abort added.
+- the wrapper validates amounts before touching the chain.
+- suites at this release: **C++ 155, wrapper 28, SDK 48, Rust 2**, all green.
+
 ## 0.3.0 - 2026-07-31
 
 Two things happened in this release: the wallet moved to the LEZ v0.2.0 engine, and the

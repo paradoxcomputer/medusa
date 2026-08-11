@@ -18,7 +18,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"      # module/
 ROOT="$(cd "$REPO/.." && pwd)"                # medusa/
 NIX="${NIX:-/nix/var/nix/profiles/default/bin/nix}"
-VERSION="${VERSION:-0.3.0}"
+VERSION="${VERSION:-0.4.0}"
 PLATFORM="${PLATFORM:-linux-amd64}"
 WB="${WALLET_BUILD:-$ROOT/wallet/.lez-build/target/release}"
 FWD_BUILD="${FWD_BUILD:-$ROOT/wallet/.diaphani-build/target/release}"
@@ -50,6 +50,19 @@ need "$WB/wallet" "wallet binary";               install -m755 "$WB/wallet"     
 need "$WB/sequencer_service" "sequencer";        install -m755 "$WB/sequencer_service"    "$BINDIR/sequencer_service"
 need "$WB/sequencer_service_l1" "L1 sequencer";  install -m755 "$WB/sequencer_service_l1" "$BINDIR/sequencer_service_l1"
 install -m755 "$REPO/scripts/medusa-tor-monitor" "$BINDIR/medusa-tor-monitor"
+# medusa-faucet-client is NOT optional decoration: besides the on-chain token faucet, the wrapper
+# calls its `init-holding` to bootstrap a keytree holding, which is the only way to shield a token
+# that lives in an ATA (an ATA is a PDA and can never sign a private send). Leaving it out ships a
+# wallet whose Shield button fails on every token a user claimed. Built by wallet/build.sh step 4.
+FAUCET_CLIENT="${FAUCET_CLIENT:-$ROOT/wallet/faucet/client/target/release/medusa-faucet-client}"
+if [ -x "$FAUCET_CLIENT" ]; then install -m755 "$FAUCET_CLIENT" "$BINDIR/medusa-faucet-client"
+else echo "      (!) medusa-faucet-client NOT bundled - token faucet AND token shielding will fail"; fi
+# The risc0 guest. Only the on-chain faucet CLAIM needs it (faucetPreflight proves its ImageID
+# against the program id compiled into the module, so a swapped copy is caught, not trusted). It is
+# not built by build.sh: see wallet/faucet/README.md for the docker `cargo risczero build`.
+FAUCET_GUEST="${FAUCET_GUEST:-$ROOT/wallet/target/riscv32im-risc0-zkvm-elf/docker/medusa_faucet.bin}"
+if [ -f "$FAUCET_GUEST" ]; then install -m644 "$FAUCET_GUEST" "$BINDIR/medusa_faucet.bin"
+else echo "      (i) medusa_faucet.bin not bundled - the on-chain token faucet will report it missing"; fi
 TOR="${TOR_SRC:-$(command -v tor || true)}"
 if [ -n "$TOR" ] && [ -x "$TOR" ]; then install -m755 "$(readlink -f "$TOR")" "$BINDIR/medusa-tor"
 else echo "      (i) no tor to bundle (set TOR_SRC) - the Paradox·Tor zone won't work"; fi

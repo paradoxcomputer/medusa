@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 
 STATE = os.environ["FAKE_CHAIN"]
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -62,6 +63,20 @@ def main():
         sys.stdin.read()
     st = load()
 
+    # Optional argv trace, so a test can assert WHICH engine calls the wrapper made (e.g. that
+    # a private spend was preceded by a sync). Append-only, one command per line.
+    _tr = os.environ.get("FAKE_TRACE")
+    if _tr:
+        with open(_tr, "a") as _f:
+            _f.write(" ".join(a) + "\n")
+
+    # restore-keys: the real one runs a full chain sync. $FAKE_SLOW_RESTORE_MS makes it take
+    # long enough for a caller's timeout budget to be the thing under test.
+    if a[:1] == ["restore-keys"]:
+        time.sleep(int(os.environ.get("FAKE_SLOW_RESTORE_MS", "0")) / 1000.0)
+        print("Restored keys and synced to latest block")
+        return 0
+
     # The real CLI compares its compiled program ImageIDs against the sequencer's
     # getProgramIds and asserts. The wrapper gates its token verbs on this, so the fake
     # must answer it; $FAKE_ZONE_MISMATCH=1 simulates a wallet pointed at a foreign zone.
@@ -69,6 +84,12 @@ def main():
         if os.environ.get("FAKE_ZONE_MISMATCH") == "1":
             print("Local ID for token program is different from remote", file=sys.stderr)
             return 1
+        # The OTHER way check-health exits nonzero, and the one that matters: fetching the
+        # remote program ids is an .expect(), so an unreachable/flapping sequencer panics too
+        # - same exit status, completely different meaning.
+        if os.environ.get("FAKE_ZONE_FETCH_FAIL") == "1":
+            print("thread 'main' panicked: Error fetching program ids", file=sys.stderr)
+            return 101
         print("All looks good")
         return 0
 
@@ -147,6 +168,15 @@ def main():
         return 0
 
     if a[:2] == ["token", "send"]:
+        # A real `token send` to a private destination proves a STARK and prints progress
+        # while it works. $FAKE_TOKEN_SEND_STALL_MS reproduces that shape - output first,
+        # then a stall past the caller's deadline - which is the only way a timeout carries
+        # a NON-EMPTY stdout buffer, and an empty one never triggered the bytes/str bug.
+        _stall = int(os.environ.get("FAKE_TOKEN_SEND_STALL_MS", "0"))
+        if _stall:
+            sys.stdout.write("proving... 12%\n")
+            sys.stdout.flush()
+            time.sleep(_stall / 1000.0)
         frm, to = bare(arg("--from", "")), arg("--to", "")
         amt = int(arg("--amount", "0"))
         src = st["chain"].get(frm)

@@ -307,6 +307,14 @@ Rectangle {
     // a blocked verb are disabled and say why, instead of being offered and then refused. Setting
     // a password (encryptPlaintextWallet, ungated) is what clears it.
     readonly property bool signingBlocked: root.storeUnprotected
+    // The same idea for the zone verbs, which are gated on the STORE rather than on the session:
+    // an encrypted wallet with no live session (walletState "locked") cannot add, edit, remove or
+    // switch a zone, because proving the password is the whole gate and the UI is not holding one.
+    // "new" (no store yet) and a plaintext store are NOT blocked: the core is free there, which is
+    // exactly the onboarding case the gate was written to preserve. Keyed on walletState for the
+    // same reason the Security section is: walletLocked is a second variable saying the same
+    // thing, and the two drifting apart is how a control shows in a state it cannot work in.
+    readonly property bool zoneEditBlocked: root.walletState === "locked"
     property int    plaintextSeen:    0       // consecutive polls reporting an unencrypted store
     // A seal (create / migrate) just succeeded and granted NO session, so the very next screen is
     // the lock screen. Without this it greets a user who created their wallet ten seconds ago
@@ -543,7 +551,6 @@ Rectangle {
         root.editingZoneId = z.id
         root.addZoneOpen = true
         zNameF.text = z.name || ""
-        zTorTog.checked = !!z.tor
         zEndF.text = z.endpoint || ""
     }
     // Abort a connect in flight. UNGATED in the core (it only stops things and spends nothing),
@@ -582,7 +589,7 @@ Rectangle {
 
     function switchZone(id) {
         runBusy("Switching zone", function() {
-            var r = callModuleParse(logos.callModule("medusa_core", "setActiveZone", [id]))
+            var r = callGated("setActiveZone", [id])
             if (r && r.error) { root.logActivity("Zone switch failed: " + r.error, true); return }
             root.network = id
             root.zoneCompat = "unknown"       // the build-compat verdict is per-zone
@@ -2017,12 +2024,19 @@ Rectangle {
     // makes the round-2 regression structurally impossible instead of merely fixed: approveZone
     // was gated in the core while its single call site kept passing one argument, so every
     // dApp-initiated zone switch failed with "wallet password required for this operation". A
-    // call site cannot forget an argument it does not write. gatedVerbs mirrors the core's
-    // authorize() sites (WalletPlugin.cpp: consolidateToken, startTokenFaucet, sendTransfer,
-    // startSendToken, startSendTransfer, startShield, startDeshield, startPrivateTransfer,
-    // approveAction, approveZone, exportMnemonic, exportKey, and conditionally resetWallet +
-    // restoreWallet); when the core gates one more verb, listing it here is the only change any
-    // call site needs. 15 names here, 15 authorize() sites there.
+    // call site cannot forget an argument it does not write. gatedVerbs mirrors the core's gate
+    // sites; when the core gates one more verb, listing it here is the only change any call site
+    // needs. The two lists are checked by grepping the core, not by memory:
+    //
+    //     grep -c "if (!authorize(" WalletPlugin.cpp            -> 15 direct sites
+    //     grep -c "zoneChangeRefusal(password)" WalletPlugin.cpp -> 5 zone sites (one shared gate)
+    //
+    // 15 direct: consolidateToken, startTokenFaucet, sendTransfer, startSendToken,
+    // startSendTransfer, startShield, startDeshield, startPrivateTransfer, approveAction,
+    // approveZone, exportMnemonic, exportKey, importKey, and conditionally resetWallet +
+    // restoreWallet. 5 zone: addZone, editZone, removeZone, setActiveZone, setNetwork.
+    // That is 20 core sites against 19 names here, and the difference is deliberate: setNetwork
+    // is the back-compat alias of setActiveZone and this UI calls only the latter.
     //
     // startPrivateTransferForeign is DELETED, not merely unused: it folded into
     // startPrivateTransfer when the recipient became a spec string. Leaving the name here would
@@ -2033,6 +2047,13 @@ Rectangle {
         "sendTransfer", "startSendTransfer", "startSendToken",
         "startShield", "startDeshield", "startPrivateTransfer",
         "consolidateToken", "approveAction", "approveZone",
+        // Zone selection. addZone+setActiveZone repoints the wallet at any endpoint - the same
+        // harm approveZone is gated for, reachable without a request or an approval sheet. The
+        // core gates all four on the STORE, not on the session: free only while no password can
+        // be proved against storage.json (onboarding), and otherwise requiring the live session's
+        // password. That is why zoneEditBlocked exists: on a LOCKED encrypted wallet these are
+        // refused, so the UI must not offer them (the signingBlocked pattern).
+        "addZone", "editZone", "setActiveZone", "removeZone",
         "exportMnemonic", "exportKey",
         // importKey is gated from the other direction: it PLANTS a signing key the caller
         // chooses, so an ungated one let a co-resident module add an account it owns to the
@@ -3773,6 +3794,18 @@ Rectangle {
                     Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Zones"; color: root.textPrimary; font.pixelSize: 13; font.bold: true }
                     Item { Layout.fillWidth: true }
                 }
+                // Say it once, at the top, rather than letting each control fail on its own. The
+                // list itself stays readable while locked: seeing which zone the wallet is on is
+                // not a capability, changing it is.
+                Rectangle {
+                    visible: root.zoneEditBlocked
+                    Layout.fillWidth: true; implicitHeight: 34; radius: 10
+                    color: "transparent"; border.color: root.borderColor; border.width: 1
+                    Text { textFormat: Text.PlainText; anchors { fill: parent; leftMargin: 10; rightMargin: 10 }
+                        verticalAlignment: Text.AlignVCenter; wrapMode: Text.WordWrap
+                        font.family: root.faceFont; font.pixelSize: 9; color: root.textSecondary
+                        text: "🔒 Unlock the wallet to add, edit or switch zones." }
+                }
                 Repeater {
                     model: root.zones
                     delegate: Rectangle {
@@ -3783,8 +3816,12 @@ Rectangle {
                         // Row switch - direct child of the Rectangle (anchors.fill works here),
                         // declared first so it sits behind the content; the remove ✕'s own
                         // MouseArea intercepts ✕ clicks (MouseArea doesn't propagate by default).
-                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
-                            onClicked: root.switchZone(modelData.id) }
+                        MouseArea { anchors.fill: parent
+                            cursorShape: root.zoneEditBlocked ? Qt.ArrowCursor : Qt.PointingHandCursor
+                            onClicked: {
+                                if (root.zoneEditBlocked) { root.logActivity("Unlock the wallet to switch zones", true); return }
+                                root.switchZone(modelData.id)
+                            } }
                         RowLayout {
                             anchors { fill: parent; leftMargin: 12; rightMargin: 10 }
                             spacing: 10
@@ -3803,19 +3840,19 @@ Rectangle {
                                     elide: Text.ElideRight; Layout.fillWidth: true } }
                             Text { textFormat: Text.PlainText; visible: root.network === modelData.id; font.family: root.faceFont; text: "✓"; color: root.accentOrange; font.pixelSize: 14 }
                             // edit (user zones only) - visible "Edit" chip
-                            Rectangle { visible: !modelData.builtin; Layout.preferredWidth: 40; height: 24; radius: 8
+                            Rectangle { visible: !modelData.builtin && !root.zoneEditBlocked; Layout.preferredWidth: 40; height: 24; radius: 8
                                 color: root.selectBg; border.color: root.borderColor; border.width: 1
                                 Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "Edit"; color: root.silver; font.pixelSize: 9; font.family: root.faceFont }
                                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                                     onClicked: root.beginEditZone(modelData) } }
                             // remove (user zones only)
-                            Rectangle { visible: !modelData.builtin; Layout.preferredWidth: 24; height: 24; radius: 8
+                            Rectangle { visible: !modelData.builtin && !root.zoneEditBlocked; Layout.preferredWidth: 24; height: 24; radius: 8
                                 color: root.selectBg; border.color: root.borderColor; border.width: 1
                                 Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "✕"; color: root.errorRed; font.pixelSize: 11; font.family: root.faceFont }
                                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                                     onClicked: {
                                         var wasActive = (root.network === modelData.id)
-                                        var rr = root.callModuleParse(logos.callModule("medusa_core", "removeZone", [modelData.id]))
+                                        var rr = root.callGated("removeZone", [modelData.id])
                                         if (rr && rr.error) { root.logActivity("Remove zone: " + rr.error, true); return }
                                         root.refreshZones()
                                         if (wasActive) {
@@ -3830,56 +3867,62 @@ Rectangle {
 
                 // + Add zone (remote sequencer) / Cancel
                 Rectangle {
+                    visible: !root.zoneEditBlocked   // the core refuses addZone on a locked store
                     Layout.fillWidth: true; height: 36; radius: 12
                     color: "transparent"; border.color: root.accentOrange
                     Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: root.addZoneOpen ? "Cancel" : "+ Add zone"; color: root.accentOrange; font.pixelSize: 11; font.family: root.faceFont }
                     MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                         onClicked: {
                             if (root.addZoneOpen) { root.addZoneOpen = false; root.editingZoneId = ""; zNameF.text = ""; zEndF.text = "" }
-                            else { root.editingZoneId = ""; zNameF.text = ""; zEndF.text = ""; zTorTog.checked = false; root.addZoneOpen = true }
+                            else { root.editingZoneId = ""; zNameF.text = ""; zEndF.text = ""; root.addZoneOpen = true }
                         } }
                 }
                 ColumnLayout {
-                    visible: root.addZoneOpen
+                    // Also folds away if the wallet auto-locks with the form open: submitting it
+                    // then would be refused by the core, and a form that cannot submit is a trap.
+                    visible: root.addZoneOpen && !root.zoneEditBlocked
                     Layout.fillWidth: true; spacing: 6
                     Text { textFormat: Text.PlainText; font.family: root.faceFont; Layout.fillWidth: true; wrapMode: Text.WordWrap; font.pixelSize: 9; color: root.textDisabled
-                        text: root.editingZoneId !== "" ? "Edit this zone's name, endpoint, or transport."
+                        text: root.editingZoneId !== "" ? "Edit this zone's name or endpoint."
                                                         : "Connect to a shared LEZ zone (someone's sequencer)." }
                     Rectangle { Layout.fillWidth: true; height: 28; radius: 8; color: root.inputBg; border.color: zNameF.activeFocus ? root.accentOrange : root.borderColor
                         TextInput { id: zNameF; anchors { fill: parent; leftMargin: 8; rightMargin: 8 }
                             verticalAlignment: TextInput.AlignVCenter
                             font.family: root.faceFont; font.pixelSize: 11; color: root.textPrimary; clip: true
                             Text { textFormat: Text.PlainText; anchors.fill: parent; verticalAlignment: Text.AlignVCenter; text: parent.text.length === 0 ? "name (e.g. Logos DEX)" : ""; color: root.textDisabled; font.pixelSize: 11; font.family: root.faceFont } } }
-                    RowLayout { Layout.fillWidth: true; spacing: 8
-                        Text { textFormat: Text.PlainText; font.family: root.faceFont; text: "Transport"; color: root.textSecondary; font.pixelSize: 10 }
-                        Rectangle { id: zTorTog; property bool checked: false   // default: clearnet
-                            Layout.preferredWidth: 80; height: 24; radius: 12; color: root.inputBg; border.color: root.borderColor
-                            Text { textFormat: Text.PlainText; font.family: root.faceFont; anchors.centerIn: parent; text: parent.checked ? "Tor" : "Direct"; font.pixelSize: 10; color: root.textPrimary }
-                            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: parent.checked = !parent.checked } }
-                        Item { Layout.fillWidth: true } }
+                    // No Transport toggle: THE ADDRESS DECIDES. It used to be a real argument, and
+                    // the core now derives the transport from the endpoint, so the toggle became a
+                    // control that changed nothing except this hint - while still letting the user
+                    // set "Tor" next to an https:// URL, a contradiction the core used to refuse
+                    // and now cannot see. Saying the rule is honest; offering a dead switch is not.
+                    Text { textFormat: Text.PlainText; font.family: root.faceFont; Layout.fillWidth: true
+                        wrapMode: Text.WordWrap; font.pixelSize: 9; color: root.textDisabled
+                        text: "A .onion address is routed over Tor. Anything else connects directly." }
                     Rectangle { Layout.fillWidth: true; height: 28; radius: 8; color: root.inputBg; border.color: zEndF.activeFocus ? root.accentOrange : root.borderColor
                         TextInput { id: zEndF; anchors { fill: parent; leftMargin: 8; rightMargin: 8 }
                             verticalAlignment: TextInput.AlignVCenter
                             font.family: root.faceFont; font.pixelSize: 10; color: root.textPrimary; clip: true
                             Text { textFormat: Text.PlainText; anchors.fill: parent; verticalAlignment: Text.AlignVCenter
-                                text: parent.text.length === 0 ? (zTorTog.checked ? "sequencer .onion address" : "https://sequencer.example:3072/") : ""
+                                text: parent.text.length === 0 ? "https://sequencer.example:3072/ or a .onion address" : ""
                                 color: root.textDisabled; font.pixelSize: 10; font.family: root.faceFont } } }
                     Rectangle { Layout.fillWidth: true; height: 32; radius: 10
                         color: root.accentTint14; border.color: root.accentOrange
                         Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: root.editingZoneId !== "" ? "Save changes" : "Add zone"; color: root.accentOrange; font.pixelSize: 11; font.bold: true; font.family: root.faceFont }
                         MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor
                             onClicked: {
-                                var tor = zTorTog.checked
                                 var editing = root.editingZoneId !== ""
                                 // ONE endpoint argument. This screen has always had a single
                                 // endpoint box and split it here into (url, onion) with `tor`
                                 // saying which half was real; the core takes the box verbatim
                                 // now, which is what got editZone off the 5-argument ceiling.
+                                // No `tor` argument any more: the endpoint decides the
+                                // transport (a .onion is a Tor zone, anything else is not), so
+                                // the toggle can no longer contradict the address the user typed.
                                 var r = editing
-                                    ? root.callModuleParse(logos.callModule("medusa_core", "editZone",
-                                        [root.editingZoneId, zNameF.text, zEndF.text, tor]))
-                                    : root.callModuleParse(logos.callModule("medusa_core", "addZone",
-                                        [zNameF.text, zEndF.text, tor]))
+                                    ? root.callGated("editZone",
+                                        [root.editingZoneId, zNameF.text, zEndF.text])
+                                    : root.callGated("addZone",
+                                        [zNameF.text, zEndF.text])
                                 if (r && r.error) { root.logActivity((editing ? "Edit" : "Add") + " zone: " + r.error, true); return }
                                 var editedId = root.editingZoneId
                                 zNameF.text = ""; zEndF.text = ""; root.addZoneOpen = false; root.editingZoneId = ""
@@ -5487,9 +5530,13 @@ Rectangle {
         RowLayout {
             anchors.fill: parent; anchors.leftMargin: 14; anchors.rightMargin: 10; spacing: 10
             Rectangle {
+                id: updateBusyDot
                 Layout.alignment: Qt.AlignVCenter; width: 8; height: 8; radius: 4; color: root.accentOrange
                 visible: root.updState === "downloading" || root.updState === "installing"
-                SequentialAnimation on opacity { running: parent.visible; loops: Animation.Infinite
+                // `parent` is null inside a property-value source: the animation is a
+                // QObject, not an Item, so it never gets the Rectangle as a parent.
+                // Referencing the id is the only way to reach it from here.
+                SequentialAnimation on opacity { running: updateBusyDot.visible; loops: Animation.Infinite
                     NumberAnimation { to: 0.25; duration: 500 }
                     NumberAnimation { to: 1.0; duration: 500 } }
             }

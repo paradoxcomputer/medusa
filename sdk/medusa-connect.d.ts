@@ -1,4 +1,4 @@
-// Type declarations for @paradoxcomputer/medusa-connect (v0.2.2, the shipped synchronous wrapper).
+// Type declarations for @paradoxcomputer/medusa-connect (v0.2.3, the shipped synchronous wrapper).
 // Mirrors medusa-connect.js: a thin, QML-importable wrapper over Basecamp's `logos.callModule` bridge.
 // Connect + writes are user-approved IN THE WALLET, so they are 2-phase: a *Request returns
 // { requestId }, then you poll status(requestId) (drive it from a QML Timer) until it resolves.
@@ -80,9 +80,10 @@ export interface TokenHolding {
   ticker: string;
   /** ATA balance + vault balance combined (what the wallet can actually spend). */
   balance: string;
-  /** Portion in the owner's associated token account, NOT shieldable on LEZ v0.2.0. */
+  /** Portion in the owner's associated token account. An ATA is a PDA and cannot itself sign a
+   *  shield, but the wallet bootstraps a signable holding for it, so this IS shieldable. */
   ataBalance?: string;
-  /** Portion in the wallet's direct vault holding, the shieldable part. */
+  /** Portion already in the account's own vault holding. */
   vaultBalance?: string;
 }
 export interface JobResult {
@@ -144,8 +145,8 @@ export declare class Medusa {
   /** Submit a transfer for approval. Op auto-derived from the from/to prefixes when omitted. */
   send(sessionId: string, action: Action): ActionRequestResult;
   /** send() with op pinned to "shield" (public → private). Token asset: requires
-   *  definitionId, and on LEZ v0.2.0 only DIRECT-owned holdings (e.g. a token the
-   *  user minted, or the wallet's vault) can source it, ATA balances cannot shield. */
+   *  definitionId. The whole balance is shieldable, ATA included: the wallet mints and
+   *  initialises a signable holding when the tokens are only in an ATA. */
   shield(sessionId: string, action: Action): ActionRequestResult;
   /** send() with op pinned to "deshield" (private → public). Token asset: requires
    *  definitionId (routes the tokens into the recipient owner's ATA). */

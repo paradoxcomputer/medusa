@@ -35,7 +35,9 @@ static constexpr const char* kZonesKey   = "medusa-wallet/zones";     // user-ad
 // Operator endpoints for the built-in "Paradox Computer" zones, resolved at runtime:
 //   • "Paradox Computer · Tor"      sequencer .onion: env MEDUSA_SEQ_ONION     | ~/.config/medusa-sequencer.onion
 //   • "Paradox Computer · clearnet" sequencer URL:    env MEDUSA_CLEARNET_URL  | ~/.config/medusa-clearnet.url
-// The .onion is never baked in - when unset, the Tor zone is simply unavailable.
+// BOTH are now baked in (below), overridable by env / ~/.config. The onion used not to be, which
+// meant the Tor zone shipped listed-but-inert: every released install offered a zone that could
+// never connect, and only this machine (which had the ~/.config file) could tell.
 // The clearnet sequencer IS baked in (below): it is public infrastructure, already published in
 // examples/tip-jar (preferredZone) and sdk/medusa-connect.test.js, and without it the built-in
 // clearnet zone was selectable but resolved to an empty URL, which wrote "sequencer_addr":"" into
@@ -56,8 +58,22 @@ static QString clearnetUrl()
     const QString u = endpointFromConfig("MEDUSA_CLEARNET_URL", QStringLiteral("medusa-clearnet.url"));
     return u.isEmpty() ? QString::fromLatin1(kDefaultClearnetUrl) : u;
 }
-// The official Logos public testnet (logos-co). Runs LEZ v0.2.0, the same engine this build is
-// compiled against, so the program ImageIDs match and the wallet can transact there. Kept as a
+// Default sequencer .onion for the "Paradox Computer · Tor" zone, overridden by env / ~/.config
+// as above. Bare host, no port: ensureForward() then tunnels to the hidden service's port 80,
+// which is what a v3 address without a port means. An override is taken VERBATIM, so a service
+// published on another port is reached by writing it that way ("host.onion:3077").
+static constexpr const char* kDefaultSequencerOnion =
+    "paradoxj4xy6orxue7y7qsk4rxutzme6patcpo65liw22jlmlpxlncyd.onion";
+static QString sequencerOnion()
+{
+    const QString o = endpointFromConfig("MEDUSA_SEQ_ONION",
+                                         QStringLiteral("medusa-sequencer.onion"));
+    return o.isEmpty() ? QString::fromLatin1(kDefaultSequencerOnion) : o;
+}
+// The official Logos public testnet (logos-co). Verified 2026-08-11 to serve the same v0.2.2
+// program ImageIDs this build is compiled against (`wallet check-health` returns ok against it),
+// so the wallet can transact there. It is a THIRD-PARTY zone and can move without notice, which is
+// what probeZoneCompatAsync + the "Zone build mismatch" modal exist to catch user-side. Kept as a
 // separate preset zone: accounts/keys are shared across zones but balances are per-zone.
 static constexpr const char* kDefaultLogosTestnetUrl = "https://testnet.lez.logos.co/";
 static QString logosTestnetUrl()
@@ -82,7 +98,7 @@ static QString logosTestnetUrl()
 // the claim at a DIFFERENT program. faucetPreflight() runs `info --bin` (offline: no wallet, no
 // network) and refuses unless the answer is exactly this string.
 static constexpr const char* kFaucetProgramId =
-    "214dc4329f8d260eaa6e91818fc299ed201d366b3d2d235e716cc1672ab2b4b1";
+    "fe68ee1535e3a97c05c44c9d5f3e36337474de98014f46e5b26476b990c568e6";
 
 // ── WHICH ZONES HAVE THE TOKEN FAUCET, AND WHAT IT DISPENSES ON EACH ──────────────────────────
 // The program ID above is one constant for every zone (see why, above). The TOKENS are not: a
@@ -118,13 +134,19 @@ static constexpr const char* kFaucetProgramId =
 // `shipped_table_matches_the_program_id` test derives these six from kFaucetProgramId and fails
 // if anyone updates one without the other.
 //
-// Re-derived 2026-08-03 for the guest build that rejects a claim naming the same token twice
-// (the previous build let one claim drain n * claim_amount from a treasury against a single
-// cooldown). DEPLOYED AND FUNDED the same day on both zones: program at paradox-clearnet block
-// 4637 and on logos-testnet, every treasury below initialized and minted to 1000000 / 5000000 /
-// 20000000, and a live claim on logos-testnet (block 48541) dispensed 295 / 331 / 195, each
-// inside the advertised 10..500 band. The addresses were derived offline first and the chain
-// then reported the same ones back from init-treasury.
+// Re-derived 2026-08-07 for the ATA-shaped guest: a claim now names the claimant's OWNER account
+// and the faucet pays into the owner's ATA for each definition, so tokens land in the account the
+// user selected and are shieldable. That guest also keeps the earlier duplicate-definition
+// rejection (one claim naming the same token twice used to drain n * claim_amount against a
+// single cooldown).
+//
+// BOTH ZONES WERE REBUILT FROM EMPTY. The v0.2.2 upgrade reset the paradox and logos-testnet
+// chains: every definition and treasury this table used to name came back "Account is
+// Uninitialized". So the DEFINITIONS below are new accounts too, not just the treasuries -
+// re-minted, the program redeployed, and each treasury initialized and funded to
+// 1000000 / 5000000 / 20000000. On paradox-clearnet the definitions landed first and the program
+// went in at block 211, with the three treasuries at blocks 211-213; the chain reported back the
+// same PDAs that were derived offline.
 struct FaucetToken {
     const char* ticker;      // display name, e.g. "GOLD"
     const char* definition;  // token definition account id (base58)
@@ -137,20 +159,20 @@ struct FaucetZoneRow {
 static constexpr FaucetZoneRow kFaucetZones[] = {
     // Paradox Computer clearnet - https://seq-testnet.paradox.computer/
     { "paradox-clearnet", {
-        { "GOLD", "5YEhWdY2edtRFkCruXjtnFH5F62VkCiCxXmNAvHuVkEY",
-                  "7wkFSuBQyUeTaKKfoFAKpKxe3FQTNHqkqK4BPLTvLyb5" },
-        { "SILV", "HUDERmRqyX6swMnuk9FT5vmqNbcdLNbVxDRtLEdzsMXk",
-                  "38nM3WKHCMpBXxgG3W19V6g3Z2bXs6efekcph3RKfC6Z" },
-        { "BRNZ", "3zS3bGdToZcqPU9jBZC8c1aK9MQvpekse9EJ52nD1wiM",
-                  "ArdHwtFt75239nKcFgaHYUGCh8nHyGi3hbHeJn9svnM9" } } },
+        { "GOLD", "8s3is166TjLLnnW2ark7P8EaXd6JctmB8TdFyQjfcXcC",
+                  "Ecsr89CYDJ9cnB4E8tVdvVM3xUjqexUGh6fGAKFHmYgJ" },
+        { "SILV", "ESzFSiGDHffJBxrTR9bRUsbDf6AyqXX5oCL3QJszJNWy",
+                  "HadizEAxcniTjwrxfX5fmjHTRdSYQ8ZAa1FyBKb4H4s1" },
+        { "BRNZ", "87F1T6q5F5aRasjRsrMcrhS7MXzxH6QwMAUSDWBtErLn",
+                  "ERuQAMcL3ZJb9FXXvmh9dw7vN2pnmeaLYuZKdc9DQLtP" } } },
     // Logos public testnet - https://testnet.lez.logos.co/
     { "logos-testnet", {
-        { "GOLD", "7ZZGE941fzSGCAfxxdkPWQszSspBhZEcjHUkLqWrrnz6",
-                  "18Yt1464Q6SBxug5inAwdv4AvKUkMFePysaVi3GhU5V" },
-        { "SILV", "CfuvpaUhbxEzWd6ZtLDiKWVg5DZLiYj14Q8HgtDUwuS6",
-                  "DYBTWuGVRiJG4dY5A34aK8gauvZxeTsTriW8WMGKzaUZ" },
-        { "BRNZ", "EEMUsdWL1WxrQBi1SmNFUKVcMUjgVcky12NRv2BjBuxp",
-                  "3ijamAJSkF6cbVZhmyF5Diit3LZXDRtcd6v1N7emtu1a" } } },
+        { "GOLD", "CbFY4JMzmbUQXCgRDCTB2RjEfZsC3RWdyjqU3cUYhbhW",
+                  "BReTgMo9KZaE4cZQT4uSEZdhsiEgaSaUD1EvbqNuPZQG" },
+        { "SILV", "6g6uu2qY8UmUkxGFDuv66LfuJhx51eS3SGjKpY6oMK66",
+                  "EhhtUHWLeniaDwGZynToX2GPUygZmSmWuuMHtzLtw8U9" },
+        { "BRNZ", "6SEMCjTX5Zkkf5R1b8hWLmfUhy9WVBsDPHtU8ponF4w1",
+                  "Hbkh6N9wk1PKwTeZPqUgs9nL3kXhd99byT3f9Lq2qWqe" } } },
 };
 
 // The row for a zone, or nullptr when that zone has no token faucet. The ONE place the
@@ -283,19 +305,104 @@ bool WalletPlugin::constantTimeEquals(const QString& a, const QString& b)
 // The plaintext user is NOT stranded by this, and is not served by the gate either. See
 // authRefusal() below for the route they get instead (migration, which needs no session), and
 // the class-by-class walk in the WalletPlugin.h comment on this function.
+// Is the shared unlock/gate backoff currently closed? Read-only, so authRefusal() can use it.
+bool WalletPlugin::authThrottled() const
+{
+    return m_unlockRetryAtMs > QDateTime::currentMSecsSinceEpoch();
+}
+
+// ONE implementation of the anti-guessing arithmetic, shared by unlock() and the password gate.
+// It lived inline in establishSession(); a second copy would drift, and drift here is silent.
+void WalletPlugin::noteAuthFailure()
+{
+    if (++m_unlockFails > kUnlockFreeAttempts) {
+        const int shift = qMin(m_unlockFails - kUnlockFreeAttempts - 1, 20);
+        const qint64 wait = qMin<qint64>(qint64(kUnlockBackoffBaseMs) << shift,
+                                         kUnlockBackoffMaxMs);
+        m_unlockRetryAtMs = QDateTime::currentMSecsSinceEpoch() + wait;
+    }
+}
+
 bool WalletPlugin::authorize(const QString& password)
 {
     // Locked: there is no established password to compare against, so nothing can be proved.
     // Fail closed - never treat "no password set" as "no password needed".
     if (m_password.isEmpty())
         return false;
-    if (!constantTimeEquals(m_password, password))
+    // THROTTLED, on the same counters as establishSession(). That function's own comment says
+    // "every verb that can ask 'does this password open the store?' is an unlock oracle by
+    // another name" - and this is that question, asked by the other fifteen gated verbs. It
+    // used to carry no counter at all, and it is far cheaper to grind than unlock(): no disk,
+    // no CLI, no Argon2id, just one constant-time compare per guess. So a caller refused by
+    // unlock() after four tries could sit in a loop on exportMnemonic() instead and get
+    // unlimited free guesses at the one secret the whole trust model rests on.
+    //
+    // Sharing the counters (rather than adding a second set) is what closes the mix-and-match
+    // variant, where an attacker alternates unlock() and a gated verb to keep either counter
+    // below its own threshold.
+    if (authThrottled())
         return false;
+    if (!constantTimeEquals(m_password, password)) {
+        noteAuthFailure();
+        return false;
+    }
+    m_unlockFails = 0;          // a correct password clears the debt, exactly as unlock does
+    m_unlockRetryAtMs = 0;
     // Passing the gate IS the definition of user activity here, and it is the only honest one
     // available: the module has no view of the UI, and the UI polls listAccounts every 10s, so
     // treating any CLI call as activity would mean the idle lock never fired at all.
     touchActivity();
     return true;
+}
+
+// ── The zone gate ─────────────────────────────────────────────────────────────────────────────
+// Round 6 wrote `if (!m_password.isEmpty() && !authorize(password))` on the four zone verbs. That
+// is round 2's defeated shape with a different verb list, and resetWallet's comment already names
+// the rule it breaks: keying a gate on a fact the caller controls is not a gate.
+// clearSessionPassword() is ungated by design (needing a password to lock would be absurd) and it
+// empties m_password in one call, so the whole condition evaluates to false for everybody. The
+// attack was three calls and no secret:
+//
+//     clearSessionPassword();  addZone("Node", "http://attacker/");  setActiveZone("z-node");
+//
+// after which the user's next ordinary Send, from the wallet's own UI, goes to the attacker's
+// sequencer - which sees every public transaction, can censor them, and controls every balance the
+// UI shows.
+//
+// So the decision is taken on the STORE, which no caller can flip:
+//
+//   - a store no password can be proved against (none at all, or a plaintext one) -> FREE. That is
+//     ONBOARDING, and a fresh install has no storage.json, so the case that justified leaving
+//     these verbs open is served exactly and nothing else is.
+//   - otherwise -> a live session AND the correct password. authorize() fails closed while locked,
+//     so a locked encrypted wallet cannot change zones at all.
+//
+// Losing zone selection on the LOCK SCREEN is the deliberate cost. It is small and it is paid
+// once: unlock() stopped touching the chain in 1ec879d, so a user sitting on a dead or mismatched
+// zone can still unlock, and change zone immediately after. The UI disables those controls while
+// locked and says why, rather than offering them and being refused (the signingBlocked pattern).
+//
+// Note which verbs are NOT in this class, having been checked rather than assumed:
+//   - setSequencerConfig writes kSeqModeKey/kSeqUrlKey, and both are inert: applySequencer()
+//     derives the endpoint from the active zone alone and neither key is read on any execution
+//     path (see their declarations). It cannot steer anything.
+//   - cancelConnect can only land on defaultZoneId(), a built-in. An attacker who calls it moves
+//     the wallet toward the safe default, and gating it would strand a locked wallet on a hung
+//     Tor bootstrap, which is exactly when a user needs it.
+QString WalletPlugin::zoneChangeRefusal(const QString& password)
+{
+    if (!storeCanProvePassword())
+        return QString();          // onboarding, or a plaintext store with no secret to protect
+    if (authorize(password))
+        return QString();
+    // authRefusal()'s last branch reads "no session" as "no crypto envelope", which is true for
+    // every other gated verb but not for this one: this gate is reachable on a LOCKED ENCRYPTED
+    // wallet, where that message ("set a password on it first") would be a lie. Say what is
+    // actually true, with the reason code the UI already routes to the lock screen.
+    if (m_password.isEmpty())
+        return errorJson(QStringLiteral("unlock the wallet to change zones"),
+                         QStringLiteral("locked"));
+    return authRefusal();
 }
 
 // Can a password be proved against the store on disk at all? Note what this is NOT: it is not
@@ -315,6 +422,18 @@ bool WalletPlugin::storeCanProvePassword()
 // since been made to look like something else.
 QString WalletPlugin::authRefusal() const
 {
+    // While the shared backoff is closed, say so - and say it in the SAME shape unlock()
+    // already emits, so the UI's existing rate-limited handling covers both paths. Reporting
+    // plain "unauthorized" here would hide the throttle from an honest user who mistyped, and
+    // would tell a grinder its guesses were still being evaluated when they were not.
+    if (!m_password.isEmpty() && authThrottled()) {
+        QJsonObject o;
+        o[QStringLiteral("error")]  = QStringLiteral("too many failed password attempts - wait a moment");
+        o[QStringLiteral("reason")] = QStringLiteral("rate-limited");
+        o[QStringLiteral("retryAfterMs")] =
+            m_unlockRetryAtMs - QDateTime::currentMSecsSinceEpoch();
+        return QJsonDocument(o).toJson(QJsonDocument::Compact);
+    }
     if (!m_password.isEmpty())
         return errorJson(QStringLiteral("wallet password required for this operation"),
                          QStringLiteral("unauthorized"));
@@ -1249,7 +1368,7 @@ QJsonObject WalletPlugin::zoneObj(const QString& id) const
         o[QStringLiteral("tokenFaucet")] = (faucetZoneRow(id) != nullptr);
         return o;
     }
-    // Built-in remote zone: the official Logos public testnet (logos-co, LEZ v0.2.0).
+    // Built-in remote zone: the official Logos public testnet (logos-co, LEZ v0.2.2).
     if (id == QStringLiteral("logos-testnet")) {
         QJsonObject o;
         o[QStringLiteral("id")]    = id;
@@ -1308,14 +1427,17 @@ int WalletPlugin::netPort() const
 
 // Bumped whenever the LEZ engine changes in a way that makes an existing chain db unusable.
 // v0.2.0 rebuilt every risc0 program, so the ImageIDs, the derived faucet/bridge system account
-// ids, and the genesis commitment tree all differ from rc5. SequencerCore::start_from_config
-// reuses an existing rocksdb with NO version check, and writeSeqConfig() below deliberately keeps
-// the old home across runs, so without this suffix a v0.2.0 binary would silently start on an
-// rc5 chain whose accounts are owned by program ids it no longer knows.
-// EMPTY for the rc5 engine so existing homes keep their current path and their chain state.
-// Set this to "v020" in the SAME commit that flips wallet/build.sh to LEZ_BASE_REV=v0.2.0 +
-// PATCH_DIR=patches-v020; the two must move together or the epoch stops describing the engine.
-static constexpr const char* kEngineEpoch = "v020";
+// ids, and the genesis commitment tree all differ from rc5; v0.2.2 rebuilt them again, and both
+// public zones reset their chains for it on 2026-08-07. SequencerCore::start_from_config reuses an
+// existing rocksdb with NO version check, and writeSeqConfig() below deliberately keeps the old
+// home across runs, so without this suffix a v0.2.2 binary silently starts on a chain whose
+// accounts are owned by program ids it no longer knows.
+// EMPTY for the rc5 engine so those homes keep their current path and their chain state.
+// This must move in the SAME commit that flips wallet/build.sh to a new LEZ_BASE_REV + PATCH_DIR,
+// or the epoch stops describing the engine. It did not move for v0.2.2 (the wallet shipped as
+// "v020" against a v0.2.2 binary, which is the exact silent-crossover this constant exists to
+// prevent); "v022" covers v0.2.4 too, which rebuilt no guest program.
+static constexpr const char* kEngineEpoch = "v022";
 
 QString WalletPlugin::seqHome() const
 {
@@ -1347,6 +1469,11 @@ bool WalletPlugin::seqHealthyUrl(const QString& url, int timeoutMs)
     }
     QProcess p;
     if (!startChild(p, curl, {
+        // -q FIRST, always: without it curl reads ~/.curlrc, which is writable at this uid, and a
+        // planted `url = http://attacker/` or `proxy =` steers the health probe that paints the
+        // green dot next to the zone name. Resolving curl to a trusted absolute path (above) does
+        // not help, because the config file is read by the trusted binary itself.
+        QStringLiteral("-q"),
         // curl's own --max-time must track timeoutMs - a hardcoded "1" ignored the argument and
         // timed out on any real over-the-internet HTTPS round-trip (~2s incl. the TLS handshake).
         QStringLiteral("-s"), QStringLiteral("--max-time"), QString::number(qMax(1, timeoutMs / 1000)),
@@ -1427,10 +1554,15 @@ void WalletPlugin::ensureTor()
     QFile::remove(dataDir + QStringLiteral("/onion-stage.json"));   // clear stale onion stage
     m_torProc = new QProcess(this);
     m_torProc->setProcessChannelMode(QProcess::SeparateChannels);
-    appendLog(QStringLiteral("launching bundled Tor (SOCKS 127.0.0.1:%1)").arg(kTorSocksPort));
+    // torSocksPort()/torControlPort(), not the raw constants. Every READER here honours the
+    // MEDUSA_TOR_*_PORT overrides (the reuse probe at the top of this function, isTorUp(), the
+    // proxy argv), but the launch and the log used the compiled-in defaults - so with either
+    // variable set, Tor was started on one port, every probe looked at another, the log line
+    // contradicted the request, and the wallet concluded Tor was down.
+    appendLog(QStringLiteral("launching bundled Tor (SOCKS 127.0.0.1:%1)").arg(torSocksPort()));
     startChild(*m_torProc, torBin, {
-        QStringLiteral("--SocksPort"),       QStringLiteral("127.0.0.1:%1").arg(kTorSocksPort),
-        QStringLiteral("--ControlPort"),     QStringLiteral("127.0.0.1:%1").arg(kTorControlPort),
+        QStringLiteral("--SocksPort"),       QStringLiteral("127.0.0.1:%1").arg(torSocksPort()),
+        QStringLiteral("--ControlPort"),     QStringLiteral("127.0.0.1:%1").arg(torControlPort()),
         QStringLiteral("--CookieAuthentication"), QStringLiteral("1"),
         QStringLiteral("--DataDirectory"),   dataDir,
         QStringLiteral("--ClientOnly"),      QStringLiteral("1"),
@@ -1477,7 +1609,7 @@ void WalletPlugin::ensureTor()
         m_torMonProc = new QProcess(this);
         m_torMonProc->setProcessChannelMode(QProcess::SeparateChannels);
         startChild(*m_torMonProc, py, { QStringLiteral("-I"), mon, dataDir,
-                                        QString::number(kTorControlPort) });
+                                        QString::number(torControlPort()) });
     } else if (QFileInfo::exists(mon)) {
         appendLog(QStringLiteral("no python3 in a trusted system directory - the Tor onion-stage "
                                  "monitor will not run (connection progress stays coarse)"));
@@ -1636,7 +1768,7 @@ void WalletPlugin::ensureForward(int listenPort, const QString& onion)
     QStringList fargs{ QStringLiteral("--onion"), onionHost,
                        QStringLiteral("--listen"), listen,
                        QStringLiteral("--socks"),
-                       QStringLiteral("127.0.0.1:%1").arg(kTorSocksPort) };
+                       QStringLiteral("127.0.0.1:%1").arg(torSocksPort()) };
     if (!onionPort.isEmpty())
         fargs << QStringLiteral("--onion-port") << onionPort;
     startChild(*m_fwdProc, fwd, fargs);
@@ -1681,8 +1813,10 @@ void WalletPlugin::ensureSequencer()
     // the L1 on prod - so no local sequencer, no backfill-over-Tor). Bundled Tor + a tunnel
     // to the sequencer .onion; the wallet talks to that. Onion: ~/.config override else baked.
     if (kind == QStringLiteral("local-l1-tor")) {
-        const QString onion = endpointFromConfig("MEDUSA_SEQ_ONION",
-                                                  QStringLiteral("medusa-sequencer.onion"));
+        // Baked default (kDefaultSequencerOnion), overridable by env / ~/.config. The guard below
+        // now only fires on a deliberately EMPTY override, which is still worth reporting rather
+        // than tunnelling to nowhere.
+        const QString onion = sequencerOnion();
         if (onion.isEmpty()) {
             appendLog(QStringLiteral("Paradox · Tor zone needs a sequencer .onion - set "
                 "MEDUSA_SEQ_ONION or ~/.config/medusa-sequencer.onion"), QStringLiteral("error"));
@@ -1872,6 +2006,18 @@ QString WalletPlugin::applySequencer()
     stopSequencer();
     m_lastSeqOk = false;   // drop the previous zone's cached health → next poll shows "Connecting" until reconfirmed
     m_zoneCompat = QStringLiteral("unknown");   // the build-compat verdict is per-zone - re-probe
+    // The BALANCE cache is per-zone too, and it was the one per-zone cache this function did
+    // not drop. Accounts and keys are shared across zones but balances are not, and
+    // listAccounts() merges this array into the local account list BY ACCOUNT ID - so after a
+    // switch it copied the previous chain's balance AND its `initialized` flag onto the same
+    // ids, and the UI renders that as a confirmed figure (Main.qml only shows the loading
+    // state for "…"/""). Worst on a zone that cannot answer: nothing overwrites the cache
+    // then, so the other chain's number stands indefinitely and the user can start a send
+    // against funds that do not exist here.
+    m_balanceCacheJson.clear();
+    // ...and kill any fetch still in flight, or its reply lands AFTER the switch and refills
+    // the cache with the old zone's numbers - re-creating exactly what the clear just fixed.
+    if (m_acctFetchProc) m_acctFetchProc->kill();
     ensureSequencer();
     appendLog(QStringLiteral("zone: %1 (%2) -> %3").arg(id, kind, addr));
     return addr;
@@ -1883,9 +2029,13 @@ QString WalletPlugin::getNetwork() const
     return QJsonDocument(o).toJson(QJsonDocument::Compact);
 }
 
-QString WalletPlugin::setNetwork(const QString& network)
+QString WalletPlugin::setNetwork(const QString& network, const QString& password)
 {
-    return setActiveZone(network);   // back-compat alias
+    // Gated on the STORE, not on the session: see zoneChangeRefusal().
+    const QString refusal = zoneChangeRefusal(password);
+    if (!refusal.isEmpty())
+        return refusal;
+    return applyActiveZone(network);   // back-compat alias (this verb ran the gate itself above)
 }
 
 // ── Zone API ───────────────────────────────────────────────────────────────────
@@ -1906,7 +2056,16 @@ QString WalletPlugin::getZones() const
         return o;
     };
     out.append(builtin(QStringLiteral("devnet"),   QStringLiteral("Devnet"),                  QStringLiteral("local-standalone")));
-    out.append(builtin(QStringLiteral("diaphani"), QStringLiteral("Paradox Computer"),  QStringLiteral("local-l1-tor")));
+    // The Tor zone's endpoint IS its .onion, and now that one is baked in it can finally be
+    // published like the other two. The UI renders this next to the zone name, which is the one
+    // check a user has against a wallet that has been repointed - a zone with no address to show
+    // was the one row on that screen they could not check.
+    {
+        QJsonObject o = builtin(QStringLiteral("diaphani"), QStringLiteral("Paradox Computer"),
+                                QStringLiteral("local-l1-tor"));
+        o[QStringLiteral("endpoint")] = sequencerOnion();
+        out.append(o);
+    }
     // Same prod sequencer as the Tor zone, reached over clearnet (TLS) - a thin remote client.
     {
         QJsonObject o = builtin(QStringLiteral("paradox-clearnet"),
@@ -1915,7 +2074,7 @@ QString WalletPlugin::getZones() const
         o[QStringLiteral("endpoint")] = clearnetUrl();
         out.append(o);
     }
-    // The official Logos public testnet (logos-co). Same LEZ v0.2.0 engine as this build.
+    // The official Logos public testnet (logos-co). Same LEZ v0.2.2 engine as this build.
     {
         QJsonObject o = builtin(QStringLiteral("logos-testnet"),
                                 QStringLiteral("Logos public testnet"),
@@ -1949,8 +2108,8 @@ QString WalletPlugin::getZones() const
 
 // One endpoint argument in, the (url, onion) pair the zone record stores out. Shared by
 // addZone and editZone, which had this validation twice and now cannot drift.
-bool WalletPlugin::normalizeZoneEndpoint(const QString& endpoint, bool tor, QString* url,
-                                         QString* onion, QString* error)
+bool WalletPlugin::normalizeZoneEndpoint(const QString& endpoint, QString* url,
+                                         QString* onion, bool* tor, QString* error)
 {
     const auto fail = [&](const QString& msg) {
         if (error) *error = msg;
@@ -1961,9 +2120,16 @@ bool WalletPlugin::normalizeZoneEndpoint(const QString& endpoint, bool tor, QStr
     if (error) error->clear();
 
     const QString ep = endpoint.trimmed();
-    if (tor) {
-        if (ep.isEmpty() || !ep.contains(QStringLiteral(".onion")))
-            return fail(QStringLiteral("a Tor zone needs a valid .onion address"));
+    // THE ENDPOINT DECIDES THE TRANSPORT. `tor` used to be a separate argument, and the only
+    // thing it could add was a CONTRADICTION: this function rejected tor=true with a clearnet
+    // URL and tor=false with a .onion host, so the two valid combinations were exactly the two
+    // the address already implies. Deriving it deletes that invalid-state pair outright (which
+    // is what the addZone comment set out to do), guarantees the stored record is always
+    // self-consistent, and gives the verbs back an argument of bridge headroom - the house rule
+    // in testEveryInvokableKeepsBridgeHeadroom is 4, and the password gate needed the room.
+    const bool isOnion = ep.contains(QStringLiteral(".onion"));
+    if (tor) *tor = isOnion;
+    if (isOnion) {
         if (onion) *onion = ep;
         return true;
     }
@@ -1977,18 +2143,31 @@ bool WalletPlugin::normalizeZoneEndpoint(const QString& endpoint, bool tor, QStr
     if (!qu.isValid() || qu.host().isEmpty()
         || (sch != QStringLiteral("http") && sch != QStringLiteral("https")))
         return fail(QStringLiteral("enter a full sequencer URL, e.g. https://host:3072/"));
-    if (qu.host().endsWith(QStringLiteral(".onion")))
-        return fail(QStringLiteral("a .onion address requires the Tor transport"));
     if (url) *url = u;
     return true;
 }
 
-QString WalletPlugin::addZone(const QString& name, const QString& endpoint, bool tor)
+QString WalletPlugin::addZone(const QString& name, const QString& endpoint,
+                             const QString& password)
+{
+    // Gated on the STORE, not on the session: see zoneChangeRefusal(). This verb and
+    // setActiveZone are the pair the whole gate exists for - together they point the wallet at
+    // an endpoint of the caller's choosing.
+    const QString refusal = zoneChangeRefusal(password);
+    if (!refusal.isEmpty())
+        return refusal;
+    return applyAddZone(name, endpoint);
+}
+
+// The MECHANISM, ungated - see applyActiveZone for why the pair exists. approveZone uses
+// this after running its own password gate on the request the user approved.
+QString WalletPlugin::applyAddZone(const QString& name, const QString& endpoint)
 {
     const QString nm = name.trimmed();
     if (nm.isEmpty()) return errorJson(QStringLiteral("name is required"));
     QString cleanUrl, cleanOnion, epErr;
-    if (!normalizeZoneEndpoint(endpoint, tor, &cleanUrl, &cleanOnion, &epErr))
+    bool tor = false;
+    if (!normalizeZoneEndpoint(endpoint, &cleanUrl, &cleanOnion, &tor, &epErr))
         return errorJson(epErr);
     QSettings s;
     QJsonArray arr = userZones();
@@ -2010,14 +2189,21 @@ QString WalletPlugin::addZone(const QString& name, const QString& endpoint, bool
 }
 
 QString WalletPlugin::editZone(const QString& id, const QString& name,
-                               const QString& endpoint, bool tor)
+                               const QString& endpoint, const QString& password)
 {
+    // Same gate as addZone/setActiveZone, and the most important of the three: this one
+    // repoints a zone the user has ALREADY chosen and trusts, keeping its name, so there is
+    // nothing new in the zone list for them to notice.
+    const QString refusal = zoneChangeRefusal(password);
+    if (!refusal.isEmpty())
+        return refusal;
     if (!isUserZone(id))
         return errorJson(QStringLiteral("only user-added zones can be edited"));
     const QString nm = name.trimmed();
     if (nm.isEmpty()) return errorJson(QStringLiteral("name is required"));
     QString cleanUrl, cleanOnion, epErr;
-    if (!normalizeZoneEndpoint(endpoint, tor, &cleanUrl, &cleanOnion, &epErr))
+    bool tor = false;
+    if (!normalizeZoneEndpoint(endpoint, &cleanUrl, &cleanOnion, &tor, &epErr))
         return errorJson(epErr);
     QSettings s;
     QJsonArray arr = userZones(), out;
@@ -2037,8 +2223,16 @@ QString WalletPlugin::editZone(const QString& id, const QString& name,
     return okJson();
 }
 
-QString WalletPlugin::removeZone(const QString& id)
+QString WalletPlugin::removeZone(const QString& id, const QString& password)
 {
+    // The fourth member of the class, and it was the ungated one. It cannot choose an endpoint,
+    // but it does two things this gate is for: it mutates the user's zone list, and if the zone
+    // it deletes is the active one it moves the wallet off it (applyActiveZone below). Gating the
+    // three verbs that add or select a zone while leaving the one that deletes them open is the
+    // "fix the reviewer's PoC, not the class" mistake that cost rounds 1 to 5.
+    const QString refusal = zoneChangeRefusal(password);
+    if (!refusal.isEmpty())
+        return refusal;
     if (!isUserZone(id))
         return errorJson(QStringLiteral("not a removable (user) zone"));
     QSettings s;
@@ -2047,11 +2241,15 @@ QString WalletPlugin::removeZone(const QString& id)
         if (v.toObject().value(QStringLiteral("id")).toString() != id) keep.append(v);
     s.setValue(QLatin1String(kZonesKey), QString::fromUtf8(QJsonDocument(keep).toJson(QJsonDocument::Compact)));
     s.sync();
-    if (netId() == id) setActiveZone(QStringLiteral("devnet"));   // fall back if the active one was removed
+    if (netId() == id) applyActiveZone(QStringLiteral("devnet"));   // fall back if the active one was removed
     return okJson();
 }
 
-QString WalletPlugin::setActiveZone(const QString& id)
+// The MECHANISM, with no gate. Callers that have already established the user's intent by some
+// other means use this: approveZone (which ran its own password gate on the request the user
+// approved) and removeZone (falling back off a zone it just deleted). Keeping it separate is
+// what lets setActiveZone gate without those two having to fabricate a password.
+QString WalletPlugin::applyActiveZone(const QString& id)
 {
     const QString z = id.trimmed();
     const bool known = (z == QStringLiteral("devnet") || z == QStringLiteral("diaphani"))
@@ -2060,6 +2258,15 @@ QString WalletPlugin::setActiveZone(const QString& id)
     QSettings s; s.setValue(QLatin1String(kNetworkKey), z); s.sync();
     applySequencer();   // repoint + relaunch/stop for the new zone
     return okJson();
+}
+
+QString WalletPlugin::setActiveZone(const QString& id, const QString& password)
+{
+    // Gated on the STORE, not on the session: see zoneChangeRefusal().
+    const QString refusal = zoneChangeRefusal(password);
+    if (!refusal.isEmpty())
+        return refusal;
+    return applyActiveZone(id);
 }
 
 QString WalletPlugin::getSequencerConfig() const
@@ -2152,6 +2359,7 @@ void WalletPlugin::probeSeqHealthAsync(const QString& url)
             if (m_healthProbe == p) m_healthProbe = nullptr;
         });
     startChild(*p, curl, {
+        QStringLiteral("-q"),   // ~/.curlrc is writable at this uid - see the sync probe above
         QStringLiteral("-s"), QStringLiteral("--max-time"), QStringLiteral("8"),
         QStringLiteral("-X"), QStringLiteral("POST"),
         QStringLiteral("-H"), QStringLiteral("content-type: application/json"),
@@ -3369,6 +3577,12 @@ QString WalletPlugin::startPrivacyJob(const QString& op, const QString& asset,
     j->amount = amount;
     j->state  = QStringLiteral("running");
     j->phase  = QStringLiteral("processing");
+    // Was a password proved to start this? Every verb that reaches here is gated EXCEPT
+    // startFaucet ("faucet"), which runs `pinata claim`, takes no password and is ungated by
+    // design - Main.qml's own gatedVerbs comment says so. Only gated work may defer the idle
+    // auto-lock; see the deferral in touchActivity(). Spelled as an explicit exception rather
+    // than a parameter so that adding another ungated job verb has to be a conscious edit here.
+    j->gated  = (op != QStringLiteral("faucet"));
     j->timer.start();
     m_jobs.insert(jobId, j);
 
@@ -3773,7 +3987,11 @@ QJsonObject WalletPlugin::pendingRequestJson(const ConnectRequest* r) const
         o[QStringLiteral("appName")]   = zs ? zs->appName : QString();
         o[QStringLiteral("sequencer")] = r->zoneSeq;
         o[QStringLiteral("label")]     = r->zoneLabel;
-        o[QStringLiteral("tor")]       = r->zoneTor;
+        // DERIVED from the address, not copied from r->zoneTor (which is whatever the dApp
+        // claimed). The approval sheet renders this as "Routed over Tor" / "Clearnet (not over
+        // Tor)", so echoing the claim let a dApp show the Tor badge over an https endpoint: the
+        // one line on that sheet a user would rely on, written by the party being approved.
+        o[QStringLiteral("tor")]       = r->zoneSeq.contains(QStringLiteral(".onion"));
     } else {
         o[QStringLiteral("sessionId")]    = r->sessionId;
         o[QStringLiteral("op")]           = r->op;
@@ -4184,34 +4402,43 @@ QString WalletPlugin::approveZone(const QString& requestId, const QString& passw
 
     // Resolve the zone: reuse an existing zone with the SAME transport whose endpoint matches
     // the requested sequencer (getZones exposes each zone's reachable endpoint), else add a
-    // new remote zone. The tor flag must match too - a tor request must never silently reuse
-    // a clearnet zone the approval sheet didn't show. Compare QUrl-normalized clearnet forms
-    // (addZone stores scheme-less as "http://…"; slash/case variants are the same sequencer),
-    // so a repeat approval reuses the zone instead of accreting z-<slug>-2/-3 duplicates.
-    const auto epKey = [](const QString& ep, bool tor) {
+    // new remote zone. Compare QUrl-normalized clearnet forms (addZone stores scheme-less as
+    // "http://…"; slash/case variants are the same sequencer), so a repeat approval reuses the
+    // zone instead of accreting z-<slug>-2/-3 duplicates.
+    //
+    // THE TRANSPORT IS DERIVED FROM THE ADDRESS, on both sides of the comparison, exactly as
+    // applyAddZone derives it. It used to be taken from the request's own `tor` flag while the
+    // zone this function CREATES derived it from the endpoint, so a dApp whose flag disagreed
+    // with its URL never matched the zone it had just made: every approval added another
+    // duplicate, forever. A dApp cannot make an https endpoint Tor by asserting it, so there is
+    // nothing left for the flag to say and it is no longer consulted here.
+    const auto isTor  = [](const QString& ep) { return ep.contains(QStringLiteral(".onion")); };
+    const auto epKey = [&isTor](const QString& ep) {
         const QString t = ep.trimmed();
-        if (tor) return t;
+        if (isTor(t)) return t;
         const QString u = t.contains(QStringLiteral("://")) ? t : QStringLiteral("http://") + t;
         return QUrl(u).adjusted(QUrl::StripTrailingSlash).toString();
     };
-    const QString wantEp = epKey(r->zoneSeq, r->zoneTor);
+    const QString wantEp = epKey(r->zoneSeq);
     QString zoneId;
     const QJsonObject zonesRes = QJsonDocument::fromJson(getZones().toUtf8()).object();
     for (const auto& v : zonesRes.value(QStringLiteral("zones")).toArray()) {
         const QJsonObject zo = v.toObject();
         const QString stored = zo.value(QStringLiteral("endpoint")).toString();
-        if (stored.isEmpty() || zo.value(QStringLiteral("tor")).toBool() != r->zoneTor)
+        if (stored.isEmpty() || isTor(stored) != isTor(r->zoneSeq))
             continue;
-        if (epKey(stored, r->zoneTor) == wantEp) {
+        if (epKey(stored) == wantEp) {
             zoneId = zo.value(QStringLiteral("id")).toString();
             break;
         }
     }
 
     if (zoneId.isEmpty()) {
-        // addZone(name, endpoint, tor): one endpoint, whichever transport it is reached over.
+        // One endpoint, whichever transport it is reached over - the address decides, so the
+        // request's separate tor flag is no longer passed (or trusted). Ungated mechanism: the
+        // password for this approval was already proved at the top of approveZone.
         const QString name = r->zoneLabel.isEmpty() ? r->zoneSeq : r->zoneLabel;
-        const QString added = addZone(name, r->zoneSeq, r->zoneTor);
+        const QString added = applyAddZone(name, r->zoneSeq);
         const QJsonObject ao = QJsonDocument::fromJson(added.toUtf8()).object();
         if (ao.contains(QStringLiteral("error"))) {
             const QString msg = ao.value(QStringLiteral("error")).toString();
@@ -4226,7 +4453,10 @@ QString WalletPlugin::approveZone(const QString& requestId, const QString& passw
         zoneId = ao.value(QStringLiteral("id")).toString();
     }
 
-    const QString switched = setActiveZone(zoneId);
+    // approveZone has already gated on the password for the request the user approved, so it
+    // uses the mechanism directly rather than gating a second time with a password it does
+    // not have to hand.
+    const QString switched = applyActiveZone(zoneId);
     const QJsonObject sw = QJsonDocument::fromJson(switched.toUtf8()).object();
     if (sw.contains(QStringLiteral("error"))) {
         const QString msg = sw.value(QStringLiteral("error")).toString();
@@ -4327,6 +4557,7 @@ int WalletPlugin::idleLockMs()
 void WalletPlugin::touchActivity()
 {
     m_lastActivityMs = QDateTime::currentMSecsSinceEpoch();
+    m_lockDeferrals = 0;   // real activity refills the deferral budget spent by long jobs
     if (m_password.isEmpty()) {          // nothing is being held - no timer needs to run
         if (m_idleLock) m_idleLock->stop();
         return;
@@ -4338,12 +4569,30 @@ void WalletPlugin::touchActivity()
         QObject::connect(m_idleLock, &QTimer::timeout, this, [this]() {
             // A real proof runs 20-40 minutes and the user is waiting on it, not away from the
             // machine; locking underneath it would also leave the UI unable to refresh when it
-            // lands. An in-flight job therefore counts as activity.
+            // lands. An in-flight job therefore counts as activity - but ONLY a job the user
+            // actually authorised.
+            //
+            // startFaucet is ungated by design (it runs `pinata claim` and takes no password),
+            // so before this check any co-resident module could hold the session open forever
+            // by starting a faucet job on a loop: the deferral fires, restarts the timer, and
+            // the idle lock never lands. That turns the one bound on how long a cached password
+            // lives into something the attacker chooses. A gated job means a human proved the
+            // password to start it, which is exactly the evidence the deferral needs.
+            //
+            // The deferral is also capped: a job that never terminates must not hold the
+            // session open indefinitely, so it may only push the lock out kMaxLockDeferrals
+            // times before the wallet locks anyway. touchActivity() resets the count, so real
+            // user activity keeps the session alive on its own merits.
+            bool userWork = false;
             for (auto it = m_jobs.constBegin(); it != m_jobs.constEnd(); ++it) {
-                if (it.value()->state == QStringLiteral("running")) {
-                    m_idleLock->start(idleLockMs());
-                    return;
+                if (it.value()->state == QStringLiteral("running") && it.value()->gated) {
+                    userWork = true;
+                    break;
                 }
+            }
+            if (userWork && ++m_lockDeferrals <= kMaxLockDeferrals) {
+                m_idleLock->start(idleLockMs());
+                return;
             }
             if (m_password.isEmpty())
                 return;
@@ -4420,12 +4669,7 @@ QString WalletPlugin::establishSession(const QString& candidate)
         const QString err = o.value(QStringLiteral("error")).toString();
         if (err.contains(QStringLiteral("decrypt"), Qt::CaseInsensitive)
             || err.contains(QStringLiteral("invalid password"), Qt::CaseInsensitive)) {
-            if (++m_unlockFails > kUnlockFreeAttempts) {
-                const int shift = qMin(m_unlockFails - kUnlockFreeAttempts - 1, 20);
-                const qint64 wait = qMin<qint64>(qint64(kUnlockBackoffBaseMs) << shift,
-                                                 kUnlockBackoffMaxMs);
-                m_unlockRetryAtMs = QDateTime::currentMSecsSinceEpoch() + wait;
-            }
+            noteAuthFailure();
             return errorJson(QStringLiteral("invalid password"), QStringLiteral("unauthorized"));
         }
         return result;   // an unrelated failure (zone down, CLI missing) - not a wrong guess
@@ -4451,6 +4695,10 @@ QString WalletPlugin::clearSessionPassword()
     // recovered from a core dump or a swapped-out page after a lock. Closing that needs a
     // wiping string type end to end, not a clear() here.
     m_log.clear();
+    // The balance cache is a snapshot of a chain taken while a session was open. Keeping it
+    // past the lock means the locked wallet still renders the last balances it saw, which is
+    // both a small disclosure and a lie once the chain moves on.
+    m_balanceCacheJson.clear();
     appendLog(QStringLiteral("session locked"));
     return okJson();
 }
@@ -4904,7 +5152,11 @@ QString WalletPlugin::restoreWallet(const QString& phrase, const QString& passwo
                             QStringLiteral("--depth"), QString::number(depth) };
     // restore-keys reads the mnemonic line, then the password line, from stdin.
     const QString stdinData = phrase.trimmed() + QStringLiteral("\n") + password + QStringLiteral("\n");
-    const QString result = runWalletCommandInput(args, stdinData, 300000);  // derives + syncs
+    // 900s, tracking MEDUSA_RESTORE_TIMEOUT_S in the wrapper (wallet-wrapper: `_tmo`). A measured
+    // restore takes ~353s, so the old 300000 here killed the child from ABOVE while the wrapper
+    // was still waiting below it, leaving exactly the half-synced store the wrapper's own budget
+    // was raised to prevent. Whichever number is lower is the real timeout, so they must agree.
+    const QString result = runWalletCommandInput(args, stdinData, 900000);  // derives + syncs
 
     const QJsonDocument doc = QJsonDocument::fromJson(result.toUtf8());
     const QJsonObject o = doc.object();
@@ -5018,7 +5270,10 @@ QString WalletPlugin::importKey(const QString& privateKey, const QString& label,
     out[QStringLiteral("ok")] = true;
     enrichFromOutput(result, out);   // parses the imported "account_id Public/<id>"
 
-    const QString id = out.value(QStringLiteral("accountId")).toString();
+    // "id", not "accountId": enrichFromOutput() publishes it under "id" and always has, so
+    // this lookup returned an empty string every time and the label branch below it was dead
+    // code - the caller's label was accepted and silently dropped.
+    const QString id = out.value(QStringLiteral("id")).toString();
     if (!label.trimmed().isEmpty() && !id.isEmpty())
         runWalletCommand({ QStringLiteral("account"), QStringLiteral("label"),
                            QStringLiteral("--account-id"), id,

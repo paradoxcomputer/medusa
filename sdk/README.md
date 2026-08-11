@@ -100,12 +100,14 @@ Actions are pinned to the session's zone: if the wallet's active zone changed si
 wallet rejects the action ("reconnect"), unless the change came from *your* approved
 `requestZone`, which re-pins the session.
 
-**Token privacy on LEZ v0.2.0 (protocol limits, verified on-chain):** a token *shield* can
-only be sourced from a **direct-owned holding** (e.g. a token the user minted, or the wallet's
-vault), balances in regular associated token accounts (ATAs) cannot shield; `getTokens` splits
-the two as `ataBalance`/`vaultBalance`. Private accounts are **one-shot recipients**: a second
-private output to the same private account is rejected on-chain, always shield/transfer to a
-fresh private account.
+**Token privacy on LEZ v0.2.2 (verified on-chain):** a token *shield* must be signed by a keytree
+account, and an associated token account (ATA) is a PDA with no signable key. Since 0.4.0 the
+wallet handles that for you: it mints and initialises a holding for the account and shields from
+there, so **the whole balance is shieldable**, whether it sits in the ATA or in a vault
+(`getTokens` still splits the two as `ataBalance`/`vaultBalance`). This needs the wallet's bundled
+`medusa-faucet-client`; a wallet installed without it reports the helper as missing. Private
+accounts are **one-shot recipients**: a second private output to the same private account is
+rejected on-chain, always shield/transfer to a fresh private account.
 
 See `examples/tip-jar/` in the Medusa repo for a complete, runnable module (branded connect
 button, connect → align zone → tip).

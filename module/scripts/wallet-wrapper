@@ -26,6 +26,8 @@ Point $WALLET_LEZ at the real wallet binary; $LOGOS_SEQUENCER at the sequencer.
 import json
 import os
 import re
+import contextlib
+import fcntl
 import subprocess
 import sys
 import tempfile
@@ -130,13 +132,40 @@ if _is_privacy:
     os.environ.setdefault("RAYON_NUM_THREADS", str(max(2, _ncpu - 4)))
 
 
+def _timeout_text(x):
+    """Decode what subprocess.TimeoutExpired hands back.
+
+    TimeoutExpired carries the RAW, UNDECODED buffers even when the call was made with
+    text=True: CPython builds the exception straight from the byte chunks it had collected
+    when the deadline hit and never runs them through the stream decoder (verified on 3.10).
+    So `e.stdout` is bytes while the stdout of every other CompletedProcess in this file is
+    str, and the mismatch does not blow up here - it blows up far away, in whatever touches
+    the result:
+
+        submitted()  -> (proc.stdout or "") + (proc.stderr or "")  -> can't concat str to bytes
+        first_json() -> raw_decode(bytes)                          -> TypeError
+
+    Neither is caught (first_json only excepts JSONDecodeError/ValueError), so the wrapper
+    dies with a Python traceback and prints NO JSON AT ALL. The module parses stdout, so a
+    proof that merely ran long surfaces in the UI as "Invalid response" or as a job that
+    processes forever - the two symptoms the owner reported for shield and for token
+    transfer. It needs a non-empty stdout to trigger, which a real proof always has (the
+    engine prints progress while proving) and a fast unit test never did.
+
+    Normalise once, here, so a timeout is just another failure with str output.
+    """
+    if isinstance(x, bytes):
+        return x.decode("utf-8", "replace")
+    return x or ""
+
+
 def run(cmd, timeout=90):
     # A hard timeout so a stuck wallet-lez call (e.g. a token op polling a failed tx)
     # can never hang the whole wrapper command.
     try:
         return subprocess.run([WALLET, *cmd], capture_output=True, text=True, input=pw, timeout=timeout)
     except subprocess.TimeoutExpired as e:
-        return subprocess.CompletedProcess(cmd, 124, e.stdout or "", "timed out")
+        return subprocess.CompletedProcess(cmd, 124, _timeout_text(e.stdout), "timed out")
     except OSError as e:
         # The engine is missing, not executable, or its interpreter is gone. This escaped as an
         # unhandled FileNotFoundError, so the caller got a Python traceback on stderr and NO
@@ -246,12 +275,43 @@ def save_reg(r):
         raise
 
 
+@contextlib.contextmanager
+def reg_lock():
+    """Serialise a registry READ-MODIFY-WRITE across processes.
+
+    save_reg() publishes atomically, so the file on disk is never torn - but an atomic publish
+    does not prevent a LOST UPDATE, and that is the failure that costs real state here. Two
+    wrappers run concurrently all the time (the 10s UI account poll, a background faucet claim,
+    a shield recording its one-shot destination); each calls load_reg(), mutates its own copy,
+    and the second os.replace silently discards the first one's change. What gets discarded is
+    not cosmetic: a dropped privateDests entry is the ONLY signal that catches a token-note
+    destination, so the guard goes quiet and the next send onto that account is accepted, proved
+    for minutes, and dropped on-chain. A dropped vault entry re-mints a holding and rebinds the
+    faucet cooldown marker PDA. The window is wide because a mutation can span a chain round
+    trip: `token-registry add` does an `account get` between its load and its save.
+
+    Advisory flock on a SIDECAR path, never on the registry itself - os.replace would swap the
+    locked inode out from under the holder and the next writer would lock a different file.
+    """
+    path = reg_path() + ".lock"
+    f = open(path, "a+")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        finally:
+            f.close()
+
+
 def record_private_dest(dest):
     """Remember a successfully-submitted private OUTPUT destination (one-shot on rc5)."""
-    reg = load_reg()
-    if dest not in reg["privateDests"]:
-        reg["privateDests"].append(dest)
-        save_reg(reg)
+    with reg_lock():
+        reg = load_reg()
+        if dest not in reg["privateDests"]:
+            reg["privateDests"].append(dest)
+            save_reg(reg)
 
 
 def submitted(proc):
@@ -271,8 +331,10 @@ def token_name(reg, defid):
         # where `account get` silently stops reporting token holdings). Caching the placeholder
         # would pin a wrong ticker forever, since definitions are otherwise immutable.
         return defid[:6] + "…"
-    reg["names"][defid] = m.group(1)
-    save_reg(reg)
+    with reg_lock():
+        reg = load_reg()                 # re-read INSIDE the lock: the caller's copy predates
+        reg["names"][defid] = m.group(1)  # the `account get` above and may be stale by now
+        save_reg(reg)
     return m.group(1)
 
 
@@ -305,13 +367,30 @@ def zone_compatible():
     if _zone_ok is None:
         try:
             r = run(["check-health"], timeout=20)
-            if r.returncode in (124, 127):
-                return True          # inconclusive, and deliberately NOT cached
-            _zone_ok = (r.returncode == 0)
+            if r.returncode == 0:
+                _zone_ok = True
+            elif MISMATCH_SIG in ((r.stdout or "") + (r.stderr or "")):
+                _zone_ok = False     # the engine SAID the ids differ - that is an answer
+            else:
+                # Nonzero WITHOUT that sentence is not a verdict. check-health panics the same
+                # way whether the ids differ or the sequencer simply could not be reached: the
+                # program-id fetch is an .expect("Error fetching program ids"), so a 502 from a
+                # flapping testnet exited nonzero and was published to the user as "this zone
+                # runs a different LEZ build - install a Medusa built for it", then CACHED for
+                # the rest of the process. Observed twice live on seq-testnet inside a minute,
+                # with check-health answering rc=0 three times in a row on either side of it.
+                # Frightening, wrong, and it blocks every token verb. Stay inconclusive (and
+                # uncached): the operation then succeeds, or fails in the chain's own words.
+                return True
         except Exception:
             return True              # same: could not tell, so do not claim a mismatch
     return _zone_ok
 
+
+# The engine asserts this exact phrasing for each of its four program ids (wallet/src/cli:
+# "Local ID for <program> is different from remote"), so the shared tail identifies a REAL
+# mismatch and separates it from every other way check-health can exit nonzero.
+MISMATCH_SIG = "is different from remote"
 
 ZONE_MISMATCH = ("this zone runs a different LEZ build than this wallet (program ids differ) - "
                  "switch zone, or install a Medusa built for it")
@@ -409,10 +488,15 @@ def poll_ata(user_bare, defb, predicate, timeout=150):
 
 def emit(proc):
     out = (proc.stdout or "").strip()
-    try:
-        json.loads(out)
-        print(out)
-    except (json.JSONDecodeError, ValueError):
+    # first_json, not json.loads(out): v0.2.2 appends "Stored statistics at <path>" AFTER the
+    # payload, which made a perfectly good JSON reply look like plain text. That is worse here
+    # than anywhere else - this is the wrapper's universal output path, so a real JSON reply was
+    # re-wrapped as {"ok":true,"output":"<the json> Stored statistics..."} and the module parsed
+    # the wrapper's envelope instead of the engine's answer.
+    payload = first_json(out)
+    if payload is not None:
+        print(json.dumps(payload))
+    else:
         if proc.returncode != 0:
             msg = (proc.stderr or "").strip() or out or f"wallet command failed (exit {proc.returncode})"
             msg = msg.replace("Input password: ", "").replace("Input recovery phrase: ", "")
@@ -439,14 +523,32 @@ def id_arg():
 
 
 # ── Token privacy (shield / deshield) ────────────────────────────────────────
-def owned_accounts():
-    """The wallet's own accounts as rc5's `account list --json` array (or [])."""
-    res = run(["account", "list", "--json"], timeout=45)
+def first_json(text):
+    """The FIRST JSON value in `text`, ignoring whatever the engine prints after it.
+
+    v0.2.2 gained a statistics file and now writes `Stored statistics at <path>` on its own line
+    AFTER the payload of every command, including `--json` ones. A whole-string json.loads() then
+    dies with "Extra data: line 2 column 1" and the caller's except-branch turns a perfectly good
+    account list into []. That failure is SILENT and it is not cosmetic: owned_accounts() feeds
+    direct_holdings_list(), so the wallet reported "no directly-owned holding of this token" for
+    tokens it was holding, token-shield refused, consolidate refused, and a bootstrapped holding
+    became invisible with tokens already moved into it. Parse the payload and stop there.
+    """
+    s = (text or "").lstrip()
+    if not s:
+        return None
     try:
-        a = json.loads((res.stdout or "").strip())
-        return a if isinstance(a, list) else []
+        val, _ = json.JSONDecoder().raw_decode(s)
+        return val
     except (json.JSONDecodeError, ValueError):
-        return []
+        return None
+
+
+def owned_accounts():
+    """The wallet's own accounts as the engine's `account list --json` array (or [])."""
+    res = run(["account", "list", "--json"], timeout=45)
+    a = first_json(res.stdout)
+    return a if isinstance(a, list) else []
 
 
 def private_dest_block(dest):
@@ -485,7 +587,7 @@ def run_faucet_client(cmd, timeout=300):
         return subprocess.run([_faucet_client(), *cmd], capture_output=True, text=True,
                               input=pw, timeout=timeout)
     except subprocess.TimeoutExpired as e:
-        return subprocess.CompletedProcess(cmd, 124, e.stdout or "", "timed out")
+        return subprocess.CompletedProcess(cmd, 124, _timeout_text(e.stdout), "timed out")
     except OSError as e:
         return subprocess.CompletedProcess(cmd, 127, "", "faucet client cannot be run: %s" % e)
 
@@ -507,15 +609,13 @@ def bootstrap_holding(owner, defb):
         return None
     bare = m.group(1)
     res = run_faucet_client(["init-holding", "--definition", defb, "--holding", bare])
-    try:
-        out = json.loads((res.stdout or "").strip())
-    except (json.JSONDecodeError, ValueError):
+    out = first_json(res.stdout)
+    if not isinstance(out, dict) or not out.get("ok"):
         return None
-    if not out.get("ok"):
-        return None
-    reg = load_reg()
-    reg.setdefault("vaults", {}).setdefault(owner, {})[defb] = bare
-    save_reg(reg)
+    with reg_lock():
+        reg = load_reg()                 # re-read: init-holding above was a chain round trip
+        reg.setdefault("vaults", {}).setdefault(owner, {})[defb] = bare
+        save_reg(reg)
     return bare
 
 
@@ -611,15 +711,19 @@ def vault_for(defb, owner=None):
     if owner:
         d, _b = holding_state(owner)
         if d == defb:
-            reg.setdefault("vaults", {}).setdefault(owner, {})[defb] = owner
-            save_reg(reg)
+            with reg_lock():
+                reg = load_reg()
+                reg.setdefault("vaults", {}).setdefault(owner, {})[defb] = owner
+                save_reg(reg)
             return owner
     if owner:
         return pristine
     for h in direct_holdings_list():
         if h["definitionId"] == defb:
-            reg.setdefault("vaults", {}).setdefault(h["account"], {})[defb] = h["account"]
-            save_reg(reg)
+            with reg_lock():
+                reg = load_reg()
+                reg.setdefault("vaults", {}).setdefault(h["account"], {})[defb] = h["account"]
+                save_reg(reg)
             return h["account"]
     return pristine
 
@@ -690,12 +794,10 @@ if len(args) >= 2 and args[0] == "account" and args[1] in ("list", "ls"):
         sys.exit(0)
     # WITH -l: the caller wants live balances, so pay for the chain.
     res = run(["account", "list", "--json"], timeout=(45 if zone_key() == "diaphani" else 20))
-    out = (res.stdout or "").strip()
-    try:
-        json.loads(out)            # the wallet emitted the JSON array - pass it through
-        print(out)
-    except (json.JSONDecodeError, ValueError):
+    arr = first_json(res.stdout)   # the wallet emitted the JSON array - pass it through
+    if arr is None:
         emit(res)                  # auth failure (wrong password) / unreachable - surface it
+    print(json.dumps(arr))
     sys.exit(0)
 
 # `token new …` → run it, then record the new definition id so the wallet can show
@@ -704,11 +806,12 @@ if len(args) >= 2 and args[0] == "token" and args[1] == "new":
     proc = run(args)
     for i, a in enumerate(args):
         if a == "--definition-account-id" and i + 1 < len(args):
-            reg = load_reg()
             defid = args[i + 1].split("/")[-1]
-            if defid not in reg["definitions"]:
-                reg["definitions"].append(defid)
-                save_reg(reg)
+            with reg_lock():
+                reg = load_reg()
+                if defid not in reg["definitions"]:
+                    reg["definitions"].append(defid)
+                    save_reg(reg)
     emit(proc)
 
 # `tokens <account-id>` (wrapper verb) → JSON array of the account's token holdings
@@ -973,9 +1076,19 @@ if args and args[0] == "consolidate" and len(args) >= 3:
     # account's holding would move the user's tokens somewhere they cannot spend them.
     vault = vault_for(defb, owner)
     if not vault or holding_state(vault)[0] != defb:
-        print(json.dumps({"error": "no initialized vault holding for this token yet - claim "
-                          "from the faucet (or receive a direct send) once, then retry"}))
-        sys.exit(1)
+        # BOOTSTRAP IT rather than refuse. The old branch sent the user to the faucet, but the
+        # faucet mints nothing any more - it pays into ATAs - so "claim once, then retry" could
+        # never produce the holding it asked for, and consolidate was unreachable for every
+        # freshly-claimed token: the ONE thing that creates a vault is token-shield's
+        # auto-consolidate, so the user had to shield (a multi-minute proof) before they could
+        # sweep. That is backwards - sweeping is what makes a balance shieldable in the first
+        # place. This is the same situation token-shield already handles (an ATA balance with
+        # no holding to put it in), so give it the same treatment.
+        vault = bootstrap_holding(owner, defb)
+        if not vault:
+            print(json.dumps({"error": "could not create a holding for this token on this zone "
+                              "- the token program may be a different build"}))
+            sys.exit(1)
     before = holding_state(vault)[1] or 0
     snd = run(["ata", "send", "--from", "Public/" + owner, "--token-definition", defb,
                "--to", vault, "--amount", str(bal)], timeout=300)
@@ -1026,10 +1139,12 @@ if args and args[0] == "token-registry":
             if v not in owned:
                 print(json.dumps({"error": "that account is not in this wallet"}))
                 sys.exit(1)
-        reg.setdefault("vaults", {}).setdefault(owner, {})[defid] = bare
-        if defid not in reg["definitions"]:
-            reg["definitions"].append(defid)
-        save_reg(reg)
+        with reg_lock():
+            reg = load_reg()             # owned_accounts() above was a chain round trip
+            reg.setdefault("vaults", {}).setdefault(owner, {})[defid] = bare
+            if defid not in reg["definitions"]:
+                reg["definitions"].append(defid)
+            save_reg(reg)
         print(json.dumps({"ok": True, "definitionId": defid, "vault": bare, "owner": owner}))
         sys.exit(0)
     if len(args) >= 3 and args[1] == "add":
@@ -1045,9 +1160,11 @@ if args and args[0] == "token-registry":
         if info.returncode == 0 and "Uninitialized" in out:
             print(json.dumps({"error": "no token with this id exists on this zone"}))
             sys.exit(1)
-        if defid not in reg["definitions"]:
-            reg["definitions"].append(defid)
-            save_reg(reg)
+        with reg_lock():
+            reg = load_reg()             # re-read: the `account get` above is a round trip,
+            if defid not in reg["definitions"]:   # and registerFaucetTokens fires three of
+                reg["definitions"].append(defid)  # these back to back while jobs are running
+                save_reg(reg)
         print(json.dumps({"ok": True, "definitionId": defid}))
         sys.exit(0)
     print(json.dumps({"definitions": reg["definitions"], "names": reg["names"],
@@ -1128,8 +1245,14 @@ if len(args) >= 2 and args[0] == "pinata" and args[1] == "claim":
 # InvalidPrivacyPreservingProof. So auto-sync the private state first (idempotent; the manual
 # "sync" button is easy to forget). A shield (--from Public/) needs no sync - it's a new commit.
 def _sends_from_private(a):
-    for i in range(len(a) - 1):
-        if a[i] == "--from" and a[i + 1].startswith("Private/"):
+    # BOTH spellings, for the same reason id_arg() takes both: clap accepts `--from X` and
+    # `--from=X` alike. Matching only the separated form meant a `--from=Private/...` spend
+    # skipped the mandatory sync below, built its membership proof against a stale root, and
+    # was rejected as InvalidPrivacyPreservingProof after a full-length proof.
+    for i, x in enumerate(a):
+        if x == "--from" and i + 1 < len(a) and a[i + 1].startswith("Private/"):
+            return True
+        if x.startswith("--from=") and x.split("=", 1)[1].startswith("Private/"):
             return True
     return False
 
@@ -1139,8 +1262,9 @@ def _sends_from_private(a):
 # must not cost the caller a multi-minute chain scan first.
 if "send" in args:
     # Via id_arg(), which knows both `--to X` and `--to=X`. This used to scan for the separated
-    # form inline, so a `--to=Private/...` slipped past the guard and into the engine: the same
-    # blind spot the sync hook below already avoided by using id_arg().
+    # form inline, so a `--to=Private/...` slipped past the guard and into the engine. The sync
+    # hook below and the recording side at the bottom of this file had the same blind spot;
+    # all three now go through the both-spellings path.
     _dest = id_arg()
     if _dest and _dest.startswith("Private/"):
         _blocked = private_dest_block(_dest)
@@ -1189,14 +1313,26 @@ if "send" in args:
     _tmo = PROOF_TMO if _is_privacy else 300
 elif args[:2] == ["account", "sync-private"]:
     _tmo = 900
+elif args[:1] == ["restore-keys"]:
+    # restore-keys runs the SAME sync_to_latest_block() as `account sync-private` two lines
+    # up (measured 353s on ~2700 blocks), but it matched no verb here and fell into the 90s
+    # catch-all - so the wrapper killed the restore while the plugin was still happily
+    # waiting on its own 300s budget. Worse than a plain timeout: sync_to_block persists
+    # inside its per-block loop, so the kill leaves a half-synced store on disk.
+    _tmo = int(os.environ.get("MEDUSA_RESTORE_TIMEOUT_S", "900"))
 else:
     _tmo = 90
 _res = run(args, timeout=_tmo)
 if "send" in args and submitted(_res):
     # A submitted private OUTPUT makes its destination one-shot-used (see
     # private_dest_block) - remember it so it is never offered/used again.
-    for _i in range(len(args) - 1):
-        if args[_i] == "--to" and args[_i + 1].startswith("Private/"):
-            record_private_dest(args[_i + 1])
-            break
+    # id_arg(), NOT a scan for the separated form. The guard that READS this registry uses
+    # id_arg() and so understands `--to=Private/X`; this arming side did not, so a send in
+    # the joined form executed, landed, and was never recorded. The destination then looked
+    # fresh forever, and for a TOKEN note that registry is the guard's only signal (native
+    # `account list` cannot see a token-note balance), so the next send onto it passed the
+    # guard, proved for minutes, printed a hash, and was silently dropped on-chain.
+    _rec = id_arg()
+    if _rec and _rec.startswith("Private/"):
+        record_private_dest(_rec)
 emit(_res)

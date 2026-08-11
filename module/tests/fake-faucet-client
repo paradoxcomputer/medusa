@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""Offline stand-in for medusa-faucet-client, for wrapper_test.py.
+
+Only `init-holding` is modelled, because that is the one call the wrapper makes outside a
+claim: bootstrap_holding() mints a keytree account with the engine and then asks THIS binary
+to send token::InitializeAccount for it. Without a stub the bootstrap always failed in tests,
+so the paths that create a holding on demand (token-shield's auto-consolidate, and now
+consolidate itself) could only ever be tested through their failure branch.
+
+Writes the same $FAKE_CHAIN file fake-wallet-lez reads, so a holding initialized here is
+visible to every later `account get`.
+"""
+import json
+import os
+import sys
+
+STATE = os.environ.get("FAKE_CHAIN", "/tmp/fake_chain.json")
+
+
+def arg(flag, default=None):
+    a = sys.argv[1:]
+    return a[a.index(flag) + 1] if flag in a else default
+
+
+def main():
+    a = sys.argv[1:]
+    if not sys.stdin.isatty():
+        sys.stdin.read()          # drain the piped password, as the real client does
+    if a[:1] != ["init-holding"]:
+        print(json.dumps({"ok": False, "error": "fake client: unsupported %s" % (a[:1] or [""])[0]}))
+        return 1
+    defb = arg("--definition")
+    holding = (arg("--holding") or "").split("/")[-1]
+    if not defb or not holding:
+        print(json.dumps({"ok": False, "error": "definition and holding are required"}))
+        return 1
+    with open(STATE) as f:
+        st = json.load(f)
+    # Initialize it EMPTY. A freshly initialized holding owns nothing yet; the caller's
+    # ata-send is what puts tokens in it, and a stub that pre-filled it would hide a
+    # caller that forgot to move them.
+    st["chain"].setdefault(holding, {"kind": "holding", "def": defb, "balance": 0})
+    with open(STATE, "w") as f:
+        json.dump(st, f)
+    print(json.dumps({"ok": True, "holding": holding, "definitionId": defb}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

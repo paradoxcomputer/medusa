@@ -28,14 +28,17 @@ Rectangle {
     color: "#0E0E10"
 
     // Demo recipient. A real, INITIALISED account that exists on BOTH selectable zones under the
-    // SAME id: an account id derives from its key, so one key exported on one chain and imported
-    // on the other yields one id on both. It was registered under the authenticated-transfer
-    // program (`auth-transfer init`) on each zone, which is not optional: a PRISTINE account
+    // SAME id: an account id derives from its key, so one keystore used against both chains
+    // yields one id on both. It was registered under the authenticated-transfer program
+    // (`auth-transfer init`) on each zone, which is not optional: a PRISTINE account
     // (balance 0, nonce 0, all-zero program_owner) is dropped at block-build time, the sequencer
     // says nothing, and the sender's wallet just polls until it reports "not included" ~8 blocks
-    // later. Provenance, keystore path and the per-zone on-chain proof:
-    // medusa-recovery-2026-07-31/tipjar-recipient.md (created 2026-07-31).
-    readonly property string tipTo:     "Public/6LRot16tmr3Syh3HA1czPeSp153aSEYLHBsRMArnhtyV"
+    // later. That is exactly how this demo broke: a zone reset deregisters the recipient without
+    // touching its key, so the id survives and the registration does not. If a tip ever silently
+    // fails to settle again, check `getAccount` for an all-zero program_owner FIRST and re-run
+    // `auth-transfer init`. Provenance, keystore path and the per-zone on-chain proof:
+    // medusa-recovery-2026-07-31/tipjar-recipient.md (this account created 2026-08-11).
+    readonly property string tipTo:     "Public/Apjs2xrWeBZmBZPmrzCincQ3xfD2Y96H7VkDZjEZjZYc"
     readonly property string tipAmount: "1"
 
     // THE ONLY endpoint table in this dApp, and it is a FALLBACK. `id` is the wallet's own
@@ -43,7 +46,7 @@ Rectangle {
     // prefers the endpoint + name the wallet reports, so the dApp follows the wallet rather
     // than asserting where a zone lives. These literals are what we use when getZones is
     // unavailable (a wallet too old to have it) or does not list the id - both zones run LEZ
-    // v0.2.0 with identical program ids, which is why the same recipient works on either.
+    // v0.2.2 with identical program ids, which is why the same recipient works on either.
     readonly property var zoneTable: [
         { id: "paradox-clearnet", label: "Paradox Computer",
           sequencer: "https://seq-testnet.paradox.computer/", tor: false },

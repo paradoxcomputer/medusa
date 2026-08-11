@@ -20,6 +20,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 WRAPPER = os.path.join(HERE, "..", "scripts", "wallet-wrapper")
 FAKE = os.path.join(HERE, "fake-wallet-lez")
+FAKE_FAUCET = os.path.join(HERE, "fake-faucet-client")
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 DEF = "DefAccount111111111111111111111111111111"
@@ -48,6 +49,7 @@ class WrapperTest(unittest.TestCase):
             WALLET_LEZ=FAKE,
             LEE_WALLET_HOME_DIR=self.home,
             MEDUSA_TREASURY_HOME=self.treasury,
+            MEDUSA_FAUCET_CLIENT=FAKE_FAUCET,
             FAKE_CHAIN=self.chain,
         )
 
@@ -126,7 +128,12 @@ class WrapperTest(unittest.TestCase):
         self.assertEqual(out[0]["ataBalance"], "0")
         self.assertEqual(out[0]["vaultBalance"], "100")
 
-    def test_consolidate_refuses_without_initialized_vault(self):
+    def test_consolidate_bootstraps_a_holding_when_there_is_none(self):
+        """Consolidate used to REFUSE here and tell the user to claim the faucet first. The
+        faucet mints nothing any more - it pays into ATAs - so that advice could never produce
+        the holding it asked for, and the only thing that creates one is token-shield's
+        auto-consolidate. That made sweeping reachable only AFTER a multi-minute shield proof,
+        which is backwards: sweeping is what makes a balance shieldable. It creates one now."""
         self.std_state(vault_bal=40, ata_bal=60)
         self.seed_reg(definitions=[DEF], names={DEF: "TOK"}, vaults={})
         # remove the vault holding so no initialized direct holding exists at all
@@ -136,8 +143,17 @@ class WrapperTest(unittest.TestCase):
         with open(self.chain, "w") as f:
             json.dump(st, f)
         rc, out = self.wrap("consolidate", "Public/" + OWNER, DEF)
-        self.assertEqual(rc, 1)
-        self.assertIn("no initialized vault", out["error"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["moved"], 60)
+        self.assertEqual(out["vaultBalance"], "60")
+        # the holding it made is OWNER's own, recorded, and is NOT the deleted VAULT
+        made = self.reg()["vaults"][OWNER][DEF]
+        self.assertNotEqual(made, VAULT)
+        self.assertEqual(out["vault"], made)
+        # and the ATA it swept is empty afterwards
+        rc, out = self.wrap("tokens", "Public/" + OWNER)
+        self.assertEqual(out[0]["ataBalance"], "0")
+        self.assertEqual(out[0]["vaultBalance"], "60")
 
     def test_a_pristine_record_is_never_healed_with_another_accounts_holding(self):
         """An owner whose recorded vault is pristine must NOT be silently re-pointed at some
@@ -148,10 +164,12 @@ class WrapperTest(unittest.TestCase):
         self.seed_reg(definitions=[DEF], names={DEF: "TOK"},
                       vaults={OWNER: {DEF: "PristineRecorded111111111111111111111111"}})
         rc, out = self.wrap("consolidate", "Public/" + OWNER, DEF)
-        self.assertEqual(rc, 1, out)
-        self.assertIn("no initialized vault", out["error"])
-        # and it did not quietly re-designate VAULT as OWNER's
+        # It may now bootstrap OWNER a holding of their own instead of refusing, but the
+        # guarantee under test is unchanged and is the whole point: whatever it ends up
+        # using, it is NEVER the other account's initialized holding.
+        self.assertEqual(rc, 0, out)
         self.assertNotEqual(self.reg()["vaults"][OWNER][DEF], VAULT)
+        self.assertNotEqual(out["vault"], VAULT)
 
     def test_an_owner_that_is_itself_a_holding_designates_itself(self):
         """The one self-designation that IS sound: the owner account's own on-chain data says
@@ -217,6 +235,51 @@ class WrapperTest(unittest.TestCase):
         with open(self.chain) as f:
             st = json.load(f)
         self.assertEqual(st["chain"][VAULT]["balance"], 35)
+
+    def test_a_real_program_id_mismatch_still_refuses(self):
+        """The gate has to keep working: a wallet pointed at a foreign build must not burn a
+        proof on a doomed transaction."""
+        self.std_state(vault_bal=40, ata_bal=60)
+        env = dict(self.env, FAKE_ZONE_MISMATCH="1")
+        p = subprocess.run([sys.executable, WRAPPER, "consolidate", "Public/" + OWNER, DEF],
+                           capture_output=True, text=True, input="\n", env=env, timeout=120)
+        out = json.loads(p.stdout.strip())
+        self.assertIn("different LEZ build", out["error"])
+
+    def test_an_unreachable_sequencer_is_not_reported_as_a_build_mismatch(self):
+        """check-health panics identically whether the ids differ or the sequencer simply
+        could not be reached - fetching them is an .expect("Error fetching program ids") - so
+        a 502 from a flapping testnet used to be published as "this zone runs a different LEZ
+        build ... install a Medusa built for it" and cached for the rest of the process. It is
+        a wrong and alarming diagnosis for a network hiccup, and it blocks every token verb.
+        Seen twice live on seq-testnet with check-health answering rc=0 on either side."""
+        self.std_state(vault_bal=40, ata_bal=60)
+        env = dict(self.env, FAKE_ZONE_FETCH_FAIL="1")
+        p = subprocess.run([sys.executable, WRAPPER, "consolidate", "Public/" + OWNER, DEF],
+                           capture_output=True, text=True, input="\n", env=env, timeout=120)
+        out = json.loads(p.stdout.strip())
+        self.assertNotIn("different LEZ build", json.dumps(out))
+        # and it got on with the job rather than refusing on a guess
+        self.assertEqual(p.returncode, 0, out)
+        self.assertEqual(out["moved"], 60)
+
+    def test_a_timed_out_proof_answers_with_json_not_a_traceback(self):
+        """The reported symptoms: "tx is never sent, processing forever" and "Shield failed:
+        Invalid response". Both are this. subprocess.TimeoutExpired carries UNDECODED bytes
+        even under text=True, so run()'s timeout branch used to hand callers a stdout of the
+        wrong type: submitted() concatenated it with stderr ("can't concat str to bytes") and
+        first_json() passed it to raw_decode (TypeError). Neither is caught, so the wrapper
+        printed a traceback and NO JSON, and the module - which parses stdout - had nothing
+        to read. A long proof is an ordinary event; it has to come back as an error object."""
+        self.std_state(vault_bal=40)
+        env = dict(self.env, MEDUSA_PROOF_TIMEOUT_S="1", FAKE_TOKEN_SEND_STALL_MS="4000")
+        p = subprocess.run([sys.executable, WRAPPER, "token-shield", "Public/" + OWNER,
+                            PRIV, DEF, "5"],
+                           capture_output=True, text=True, input="\n", env=env, timeout=120)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertTrue(p.stdout.strip(), "wrapper printed nothing at all")
+        out = json.loads(p.stdout.strip())          # must parse - that is the whole point
+        self.assertIn("error", out)
 
     def test_token_shield_auto_tops_up_vault_from_ata(self):
         self.std_state(vault_bal=10, ata_bal=60)
@@ -350,6 +413,73 @@ class WrapperTest(unittest.TestCase):
                             "--to=" + PRIV, "--amount", "5")
         self.assertEqual(rc, 1, out)
         self.assertIn("one-shot", out["error"])
+
+    def test_the_joined_to_flag_is_also_RECORDED_after_a_successful_send(self):
+        """The mirror of the guard test above, on the ARMING side. The guard that reads
+        privateDests understood `--to=Private/X`; the code that writes it scanned only for the
+        separated form, so a joined send executed, landed, and was never recorded. The
+        destination then looked fresh forever - and for a token note that registry is the only
+        signal the guard has, because native `account list` cannot see a token-note balance.
+        The next send onto it would pass the guard, prove for minutes, print a hash, and be
+        dropped on-chain: the wallet telling the user funds moved when they did not."""
+        self.std_state()
+        self.seed_reg(definitions=[DEF], names={DEF: "TOK"}, vaults={OWNER: {DEF: VAULT}})
+        rc, out = self.wrap("token", "send", "--from", "Public/" + VAULT,
+                            "--to=" + PRIV, "--amount", "5")
+        self.assertEqual(rc, 0, out)
+        self.assertIn(PRIV, self.reg()["privateDests"])
+        # and the guard now bites on the very next attempt, in either spelling
+        rc, out = self.wrap("token", "send", "--from", "Public/" + VAULT,
+                            "--to=" + PRIV, "--amount", "1")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("one-shot", out["error"])
+
+    def test_restore_keys_is_not_killed_by_the_90s_catch_all(self):
+        """restore-keys runs the same full-chain sync as `account sync-private` (measured 353s
+        on ~2700 blocks) but matched no verb in the timeout tail, so it fell into the 90s
+        catch-all while the plugin waited on its own 300s budget. The kill is not harmless:
+        the engine persists inside its per-block loop, so it leaves a half-synced store."""
+        self.std_state()
+
+        def run_restore(**over):
+            env = dict(self.env, **over)
+            return subprocess.run([sys.executable, WRAPPER, "restore-keys"], capture_output=True,
+                                  text=True, input="\n", env=env, timeout=120)
+
+        # PROOF THAT THE BRANCH IS TAKEN, not just that a short restore survives: a 3s stall
+        # against a 1s restore budget must be killed. If restore-keys fell into the 90s
+        # catch-all instead, the same stall would sail through and this assertion fails - which
+        # is exactly what it did before the fix. Asserting a generous budget "works" would
+        # have been vacuous, since a fast restore passes under either branch.
+        p = run_restore(FAKE_SLOW_RESTORE_MS="3000", MEDUSA_RESTORE_TIMEOUT_S="1")
+        self.assertIn("timed out", json.loads(p.stdout.strip()).get("error", ""))
+
+        # And with a budget above the stall it completes and answers with JSON.
+        p = run_restore(FAKE_SLOW_RESTORE_MS="1000", MEDUSA_RESTORE_TIMEOUT_S="600")
+        out = json.loads(p.stdout.strip())
+        self.assertNotIn("timed out", json.dumps(out))
+
+        # The DEFAULT must clear the plugin's own 300s budget, so the caller's deadline binds.
+        import re as _re
+        src = open(WRAPPER).read()
+        m = _re.search(r'MEDUSA_RESTORE_TIMEOUT_S", "(\d+)"', src)
+        self.assertIsNotNone(m, "restore-keys no longer has its own timeout budget")
+        self.assertGreaterEqual(int(m.group(1)), 300)
+
+    def test_a_private_spend_syncs_in_either_from_spelling(self):
+        """A spend FROM a private account must sync the private tree first or the membership
+        proof is built against a stale root and the sequencer rejects it after a full proof.
+        The hook matched only the separated `--from`, so `--from=Private/X` skipped it."""
+        self.std_state()
+        self.seed_reg(definitions=[DEF], names={DEF: "TOK"}, vaults={OWNER: {DEF: VAULT}})
+        for spelling in (["--from", PRIV], ["--from=" + PRIV]):
+            env = dict(self.env, FAKE_TRACE=os.path.join(self.home, "trace.txt"))
+            subprocess.run([sys.executable, WRAPPER, "token", "send", *spelling,
+                            "--to", "Public/" + RECIP, "--amount", "1"],
+                           capture_output=True, text=True, input="\n", env=env, timeout=120)
+            trace = open(os.path.join(self.home, "trace.txt")).read()
+            self.assertIn("sync-private", trace, f"no private sync for {spelling}")
+            os.unlink(os.path.join(self.home, "trace.txt"))
 
     def test_legacy_registry_migrates_to_devnet(self):
         self.seed_chain({})

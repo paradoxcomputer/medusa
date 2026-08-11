@@ -88,7 +88,7 @@ static const QString kForeignRecipient =
 // mixed in. It was deployed under exactly this id to seq-testnet.paradox.computer (block 975)
 // and testnet.lez.logos.co (block 44810) on 2026-07-31.
 static const QString kFaucetId =
-    QStringLiteral("214dc4329f8d260eaa6e91818fc299ed201d366b3d2d235e716cc1672ab2b4b1");
+    QStringLiteral("fe68ee1535e3a97c05c44c9d5f3e36337474de98014f46e5b26476b990c568e6");
 
 // ── The per-zone faucet token table, transcribed independently of the module ───────────────
 // Same reasoning as kFaucetId: these are chain facts (definitions minted and treasuries funded
@@ -96,17 +96,17 @@ static const QString kFaucetId =
 // quietly repoint every claim at accounts that do not exist. The wallet's DEFAULT zone is
 // "paradox-clearnet", which is why these are the ids the untouched tests below see.
 static const QStringList kParadoxDefs{
-    QStringLiteral("5YEhWdY2edtRFkCruXjtnFH5F62VkCiCxXmNAvHuVkEY"),   // GOLD
-    QStringLiteral("HUDERmRqyX6swMnuk9FT5vmqNbcdLNbVxDRtLEdzsMXk"),   // SILV
-    QStringLiteral("3zS3bGdToZcqPU9jBZC8c1aK9MQvpekse9EJ52nD1wiM") }; // BRNZ
+    QStringLiteral("8s3is166TjLLnnW2ark7P8EaXd6JctmB8TdFyQjfcXcC"),   // GOLD
+    QStringLiteral("ESzFSiGDHffJBxrTR9bRUsbDf6AyqXX5oCL3QJszJNWy"),   // SILV
+    QStringLiteral("87F1T6q5F5aRasjRsrMcrhS7MXzxH6QwMAUSDWBtErLn") }; // BRNZ
 static const QStringList kParadoxTreasuries{
-    QStringLiteral("7wkFSuBQyUeTaKKfoFAKpKxe3FQTNHqkqK4BPLTvLyb5"),
-    QStringLiteral("38nM3WKHCMpBXxgG3W19V6g3Z2bXs6efekcph3RKfC6Z"),
-    QStringLiteral("ArdHwtFt75239nKcFgaHYUGCh8nHyGi3hbHeJn9svnM9") };
+    QStringLiteral("Ecsr89CYDJ9cnB4E8tVdvVM3xUjqexUGh6fGAKFHmYgJ"),
+    QStringLiteral("HadizEAxcniTjwrxfX5fmjHTRdSYQ8ZAa1FyBKb4H4s1"),
+    QStringLiteral("ERuQAMcL3ZJb9FXXvmh9dw7vN2pnmeaLYuZKdc9DQLtP") };
 static const QStringList kLogosDefs{
-    QStringLiteral("7ZZGE941fzSGCAfxxdkPWQszSspBhZEcjHUkLqWrrnz6"),   // GOLD
-    QStringLiteral("CfuvpaUhbxEzWd6ZtLDiKWVg5DZLiYj14Q8HgtDUwuS6"),   // SILV
-    QStringLiteral("EEMUsdWL1WxrQBi1SmNFUKVcMUjgVcky12NRv2BjBuxp") }; // BRNZ
+    QStringLiteral("CbFY4JMzmbUQXCgRDCTB2RjEfZsC3RWdyjqU3cUYhbhW"),   // GOLD
+    QStringLiteral("6g6uu2qY8UmUkxGFDuv66LfuJhx51eS3SGjKpY6oMK66"),   // SILV
+    QStringLiteral("6SEMCjTX5Zkkf5R1b8hWLmfUhy9WVBsDPHtU8ponF4w1") }; // BRNZ
 
 // ── Test class ────────────────────────────────────────────────────────────────
 class TestWalletPlugin : public QObject
@@ -323,10 +323,13 @@ private:
     // Add a user zone and make it active. Returns its id.
     QString useUserZone(WalletPlugin& p, const QString& name = QStringLiteral("My node"))
     {
+        // kPw unconditionally: addZone/setActiveZone are gated ONLY once a session exists, and
+        // a password handed to a locked wallet is ignored - so one helper serves armed and
+        // unarmed tests alike.
         const auto add = parseObj(p.addZone(name, QStringLiteral("https://example.invalid:3072/"),
-                                            false));
+                                            kPw));
         const QString id = add[QStringLiteral("id")].toString();
-        p.setActiveZone(id);
+        p.setActiveZone(id, kPw);
         return id;
     }
     // Wait for a job to leave "running" (the fake client exits at once, but through the event
@@ -853,7 +856,7 @@ private slots:
         useWorkingFaucet();
         WalletPlugin p;
         arm(p);
-        QVERIFY(!parseObj(p.setActiveZone(QStringLiteral("z-evil"))).contains(QStringLiteral("error")));
+        QVERIFY(!parseObj(p.setActiveZone(QStringLiteral("z-evil"), kPw)).contains(QStringLiteral("error")));
 
         const QJsonArray zones = parseObj(p.getZones())[QStringLiteral("zones")].toArray();
         for (const QJsonValue& v : zones)
@@ -1863,7 +1866,7 @@ private slots:
         const QString zone = useUserZone(p, QStringLiteral("Hidden node"));
         // Make it a Tor zone: editZone with an onion is the same path addZone takes.
         p.editZone(zone, QStringLiteral("Hidden node"),
-                   QStringLiteral("abcdefghijklmnop.onion:3077"), true);
+                   QStringLiteral("abcdefghijklmnop.onion:3077"), kPw);
 
         const auto r = parseObj(p.getSequencerStatus());
         QVERIFY2(r.contains(QStringLiteral("reason")), qPrintable(QJsonDocument(r).toJson()));
@@ -3187,16 +3190,43 @@ private slots:
         // is allowed to stay visible in the REPORT, because a report cannot let anyone in.
         QCOMPARE(parseObj(p.getSecurityState())[QStringLiteral("unencrypted")].toBool(), true);
 
+        // The owner, who knows the password, is not locked out by the same file. Asserted HERE,
+        // before the wrong-guess loop below, because that is the claim this test exists to make:
+        // it is about the re-wrapped STORE not deciding the gate. Left until after the loop it
+        // would instead be asserting that a dozen failed guesses cost nothing, which is the
+        // opposite of what the shared backoff is for.
+        QVERIFY(parseObj(p.exportMnemonic(kPw))[QStringLiteral("reason")].toString().isEmpty());
+
         // What it must not do any more is decide the gate. Every gated verb, wrong password.
+        //
+        // Two reasons count as a refusal now, not one. authorize() shares unlock()'s backoff, so
+        // after kUnlockFreeAttempts wrong guesses the refusal becomes "rate-limited" instead of
+        // "unauthorized" - and this loop makes one guess per gated verb, well past three. Both
+        // are refusals and neither hands anything over; the assertion that matters is the one
+        // below, that no seed comes back. Insisting on "unauthorized" here would be insisting
+        // the wallet keep answering guesses at full speed, which is the bug the backoff fixes.
+        bool first = true;
         for (const auto& v : gatedVerbs()) {
             const auto r = parseObj(v.second(p, QStringLiteral("i-do-not-know-the-password")));
-            QVERIFY2(r[QStringLiteral("reason")].toString() == QStringLiteral("unauthorized"),
+            const QString reason = r[QStringLiteral("reason")].toString();
+            QVERIFY2(reason == QStringLiteral("unauthorized")
+                         || reason == QStringLiteral("rate-limited"),
                      qPrintable(v.first + QStringLiteral(" was opened by a re-wrapped store")));
+            // The FIRST refusal must still be the gate itself, not the throttle - otherwise a
+            // wallet that rate-limited everything would pass this test without a gate at all.
+            if (first)
+                QCOMPARE(reason, QString("unauthorized"));
+            first = false;
             QVERIFY2(!r[QStringLiteral("mnemonic")].toString().contains(QStringLiteral("SEED")),
                      qPrintable(v.first + QStringLiteral(" leaked the seed")));
         }
-        // …and the owner, who knows the password, is not locked out by the same file.
-        QVERIFY(parseObj(p.exportMnemonic(kPw))[QStringLiteral("reason")].toString().isEmpty());
+        // …and after that many wrong guesses the backoff is closed to EVERYONE, the owner
+        // included. That is deliberate and it is the whole point: a throttle that stepped aside
+        // for the correct password would not slow a guesser down at all, since the guesser's
+        // last attempt is by definition the correct one. Stated as an assertion so a future
+        // change that "fixes" the owner's lockout has to argue with this comment first.
+        QCOMPARE(parseObj(p.exportMnemonic(kPw))[QStringLiteral("reason")].toString(),
+                 QString("rate-limited"));
         QFile::remove(storage);
     }
 
@@ -3592,16 +3622,22 @@ private slots:
     // handed some other value to prove - and would refuse every spend the user makes.
     void testEveryGatedVerbKeepsThePasswordLast()
     {
-        // Mirrors Main.qml's gatedVerbs list, which mirrors the authorize() sites.
+        // Mirrors Main.qml's gatedVerbs list, which mirrors the core's gate sites: 15 direct
+        // authorize() calls plus the five that go through zoneChangeRefusal(). setCliPath used to
+        // be listed here and is DELETED from the class, not merely ungated, so naming it asserted
+        // nothing (the loop below skips names the metaobject does not carry).
         static const QStringList kGated{
             QStringLiteral("sendTransfer"),      QStringLiteral("startSendTransfer"),
             QStringLiteral("startSendToken"),    QStringLiteral("startShield"),
             QStringLiteral("startDeshield"),     QStringLiteral("startPrivateTransfer"),
             QStringLiteral("consolidateToken"),  QStringLiteral("approveAction"),
             QStringLiteral("approveZone"),       QStringLiteral("exportMnemonic"),
-            QStringLiteral("exportKey"),         QStringLiteral("startTokenFaucet"),
-            QStringLiteral("resetWallet"),       QStringLiteral("restoreWallet"),
-            QStringLiteral("setCliPath") };
+            QStringLiteral("exportKey"),         QStringLiteral("importKey"),
+            QStringLiteral("startTokenFaucet"),
+            QStringLiteral("addZone"),           QStringLiteral("editZone"),
+            QStringLiteral("removeZone"),        QStringLiteral("setActiveZone"),
+            QStringLiteral("setNetwork"),
+            QStringLiteral("resetWallet"),       QStringLiteral("restoreWallet") };
         // A defaulted parameter makes moc emit ONE metamethod PER ARITY (resetWallet() and
         // resetWallet(QString) are two entries), so compare the FULL form of each verb - the
         // one callGated() targets when it appends the password.
@@ -3779,10 +3815,10 @@ private slots:
     {
         WalletPlugin p;
         const auto clear = parseObj(p.addZone(QStringLiteral("Clear"),
-                                              QStringLiteral("example.invalid:3072"), false));
+                                              QStringLiteral("example.invalid:3072")));
         QCOMPARE(clear[QStringLiteral("ok")].toBool(), true);
         const auto tor = parseObj(p.addZone(QStringLiteral("Onion"),
-                                            QStringLiteral("abcd1234.onion"), true));
+                                            QStringLiteral("abcd1234.onion")));
         QCOMPARE(tor[QStringLiteral("ok")].toBool(), true);
 
         QHash<QString, QString> endpoints;
@@ -3794,11 +3830,20 @@ private slots:
                  QString("http://example.invalid:3072"));
         QCOMPARE(endpoints.value(tor[QStringLiteral("id")].toString()), QString("abcd1234.onion"));
 
-        // The transport is still explicit, so "Tor" plus a clearnet address is still refused
-        // rather than silently downgraded to an unprotected clearnet zone.
-        QVERIFY(parseObj(p.addZone(QStringLiteral("Bad"), QStringLiteral("https://host:1/"), true))
-                    .contains(QStringLiteral("error")));
-        QVERIFY(parseObj(p.addZone(QStringLiteral("Bad"), QStringLiteral("abcd.onion"), false))
+        // THE ADDRESS DECIDES, so the contradictory pair no longer exists to be refused: it
+        // used to be expressible (tor=true with a clearnet URL, or an .onion with tor=false)
+        // and had to be validated away. What must hold now is that the record the zone list
+        // reports back is always self-consistent with the address that was given - a .onion is
+        // a Tor zone and nothing else can be, so no combination downgrades a hidden service to
+        // an unprotected clearnet endpoint.
+        QHash<QString, bool> torFlag;
+        for (const auto& v : parseObj(p.getZones())[QStringLiteral("zones")].toArray())
+            torFlag.insert(v.toObject()[QStringLiteral("id")].toString(),
+                           v.toObject()[QStringLiteral("tor")].toBool());
+        QCOMPARE(torFlag.value(tor[QStringLiteral("id")].toString()), true);
+        QCOMPARE(torFlag.value(clear[QStringLiteral("id")].toString()), false);
+        // And a clearnet address that is not a URL at all is still refused outright.
+        QVERIFY(parseObj(p.addZone(QStringLiteral("Bad"), QStringLiteral("   ")))
                     .contains(QStringLiteral("error")));
     }
 
@@ -3947,6 +3992,106 @@ private slots:
     }
 
     // ── surface that had no test at all ────────────────────────────────────────────────
+    // Repointing the wallet at a sequencer is the harm approveZone is gated for - but that gate
+    // only ever covered the Connect path. addZone + setActiveZone reached the same end with no
+    // request, no approval sheet and no password, and the user's next ordinary Send from the
+    // wallet's own UI went to the attacker's endpoint. editZone is worse: it repoints a zone the
+    // user already trusts, keeping its name; removeZone deletes zones and moves the wallet off
+    // the one it deleted.
+    //
+    // The gate is keyed on the STORE (storeCanProvePassword), not on the session. The version
+    // keyed on `!m_password.isEmpty()` is pinned as an exploit by the test below this one.
+    void testZoneSelectionIsGatedOnAnyStoreThatCanProveAPassword()
+    {
+        useCli(makeFakeCli(QStringLiteral("{\"ok\":true}")));
+        {   // ONBOARDING: no storage.json at all, so no password can be proved and nothing is
+            // being protected. This is the case that justified leaving these verbs open, and it
+            // is the only one that still gets them free.
+            WalletPlugin p;
+            const auto add = parseObj(p.addZone(QStringLiteral("Onboard"),
+                                                QStringLiteral("https://a.invalid:3072/")));
+            QCOMPARE(add[QStringLiteral("ok")].toBool(), true);
+            QCOMPARE(parseObj(p.setActiveZone(add[QStringLiteral("id")].toString()))
+                         [QStringLiteral("ok")].toBool(), true);
+        }
+        {   // UNLOCKED: the same calls without the password are refused, and change nothing.
+            WalletPlugin p;
+            arm(p);
+            const QString before = parseObj(p.getNetwork())[QStringLiteral("network")].toString();
+            // Three, because the gate shares unlock()'s counters and kUnlockFreeAttempts is 3.
+            for (const auto& r : { parseObj(p.addZone(QStringLiteral("Evil"),
+                                                      QStringLiteral("https://evil.invalid/"))),
+                                   parseObj(p.setActiveZone(QStringLiteral("devnet"))),
+                                   parseObj(p.editZone(QStringLiteral("z-onboard"),
+                                                       QStringLiteral("E"),
+                                                       QStringLiteral("https://evil.invalid/"))) })
+                QCOMPARE(r[QStringLiteral("reason")].toString(), QString("unauthorized"));
+            // The fourth is the point: an empty or wrong password at the ZONE gate spends the
+            // same budget as a wrong password at unlock(), so this is not a fresh unthrottled
+            // oracle that a grinder can loop on. (The cost, accepted and pinned elsewhere, is
+            // that a co-resident module can arm the owner's backoff.)
+            QCOMPARE(parseObj(p.removeZone(QStringLiteral("z-onboard")))
+                         [QStringLiteral("reason")].toString(), QString("rate-limited"));
+            QCOMPARE(parseObj(p.getNetwork())[QStringLiteral("network")].toString(), before);
+            for (const auto& v : parseObj(p.getZones())[QStringLiteral("zones")].toArray())
+                QVERIFY2(v.toObject()[QStringLiteral("name")].toString() != QStringLiteral("Evil"),
+                         "an unauthorised addZone still created the zone");
+        }
+        {   // …and with the password they work. A fresh instance because the backoff the block
+            // above armed is per-plugin, and this asserts the gate, not the throttle.
+            WalletPlugin p;
+            arm(p);
+            const auto ok = parseObj(p.addZone(QStringLiteral("Mine"),
+                                               QStringLiteral("https://b.invalid:3072/"), kPw));
+            QCOMPARE(ok[QStringLiteral("ok")].toBool(), true);
+            QCOMPARE(parseObj(p.setActiveZone(ok[QStringLiteral("id")].toString(), kPw))
+                         [QStringLiteral("ok")].toBool(), true);
+            QCOMPARE(parseObj(p.removeZone(ok[QStringLiteral("id")].toString(), kPw))
+                         [QStringLiteral("ok")].toBool(), true);
+        }
+    }
+
+    // THE ROUND-6 EXPLOIT, pinned. The gate as first written was
+    // `if (!m_password.isEmpty() && !authorize(password))`, which is a condition the caller can
+    // delete: clearSessionPassword() is ungated by design and empties m_password. Three calls, no
+    // secret, and the wallet is talking to the attacker's sequencer. The refusal must survive the
+    // lock, and it must name the LOCKED reason rather than authRefusal()'s plaintext-store advice.
+    void testLockingTheWalletDoesNotUnlockTheZoneGate()
+    {
+        useCli(makeFakeCli(QStringLiteral("{\"ok\":true}")));
+        WalletPlugin p;
+        arm(p);                                  // encrypted store on disk + a live session
+        const QString before = parseObj(p.getNetwork())[QStringLiteral("network")].toString();
+
+        p.clearSessionPassword();                // ← the one ungated call the exploit needs
+
+        const auto add = parseObj(p.addZone(QStringLiteral("Attacker"),
+                                            QStringLiteral("http://attacker.invalid:3072/")));
+        QCOMPARE(add[QStringLiteral("reason")].toString(), QString("locked"));
+        QVERIFY2(!add.contains(QStringLiteral("id")), "addZone created a zone while locked");
+        QCOMPARE(parseObj(p.setActiveZone(QStringLiteral("devnet")))
+                     [QStringLiteral("reason")].toString(), QString("locked"));
+        QCOMPARE(parseObj(p.setNetwork(QStringLiteral("devnet")))
+                     [QStringLiteral("reason")].toString(), QString("locked"));
+        QCOMPARE(parseObj(p.removeZone(QStringLiteral("z-attacker")))
+                     [QStringLiteral("reason")].toString(), QString("locked"));
+        QCOMPARE(parseObj(p.editZone(QStringLiteral("z-attacker"), QStringLiteral("E"),
+                                     QStringLiteral("http://attacker.invalid/")))
+                     [QStringLiteral("reason")].toString(), QString("locked"));
+
+        // Nothing moved, and no zone was created for a later setActiveZone to select.
+        QCOMPARE(parseObj(p.getNetwork())[QStringLiteral("network")].toString(), before);
+        for (const auto& v : parseObj(p.getZones())[QStringLiteral("zones")].toArray())
+            QVERIFY2(v.toObject()[QStringLiteral("name")].toString() != QStringLiteral("Attacker"),
+                     "the zone survived the refusal");
+        // Guessing at the gate is not a free oracle either: a wrong password while locked cannot
+        // pass, and the honest owner gets back in by unlocking, not by re-presenting it here.
+        QCOMPARE(parseObj(p.addZone(QStringLiteral("Attacker"),
+                                    QStringLiteral("http://attacker.invalid/"),
+                                    QStringLiteral("not the password")))
+                     [QStringLiteral("reason")].toString(), QString("locked"));
+    }
+
     // A built-in zone is part of the shipped table, not the user's list: removing one would
     // leave the wallet pointing at a zone it cannot describe. Only user-added zones go.
     void testOnlyAUserAddedZoneCanBeRemovedAndTheActiveOneFallsBack()
@@ -3954,16 +4099,19 @@ private slots:
         useCli(makeFakeCli(QStringLiteral("{\"ok\":true}")));
         WalletPlugin p;
         arm(p);
+        // kPw throughout: removeZone is gated like the rest of the zone verbs now, and this
+        // wallet is armed, so an omitted password would refuse with "unauthorized" and the
+        // built-in check below would pass for entirely the wrong reason.
         for (const QString& builtin : { QStringLiteral("devnet"),
                                         QStringLiteral("paradox-clearnet"),
                                         QStringLiteral("logos-testnet") })
-            QVERIFY2(parseObj(p.removeZone(builtin)).contains(QStringLiteral("error")),
-                     qPrintable(QStringLiteral("built-in zone %1 was removable").arg(builtin)));
+            QCOMPARE(parseObj(p.removeZone(builtin, kPw))[QStringLiteral("error")].toString(),
+                     QStringLiteral("not a removable (user) zone"));
 
         const QString id = useUserZone(p);              // added AND active
-        QCOMPARE(parseObj(p.removeZone(id))[QStringLiteral("ok")].toBool(), true);
+        QCOMPARE(parseObj(p.removeZone(id, kPw))[QStringLiteral("ok")].toBool(), true);
         // the active zone just vanished: the wallet must not be left pointing at it
-        QVERIFY2(parseObj(p.getNetwork())[QStringLiteral("id")].toString() != id,
+        QVERIFY2(parseObj(p.getNetwork())[QStringLiteral("network")].toString() != id,
                  "the removed zone was still active");
         for (const auto& v : parseArr(p.getZones()))
             QVERIFY2(v.toObject()[QStringLiteral("id")].toString() != id, "zone still listed");

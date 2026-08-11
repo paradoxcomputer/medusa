@@ -26,7 +26,7 @@ public:
     // Must track modules/medusa_core/manifest.json. It was left at 0.2.0 through two ABI-breaking
     // rounds (every gated verb grew a trailing password), so a host or a UI that consulted it was
     // told the old surface was still there.
-    QString version() const override { return QStringLiteral("0.3.0"); }
+    QString version() const override { return QStringLiteral("0.4.0"); }
 
     // ── THE THREE INVARIANTS THIS CLASS ENFORCES ──────────────────────────────────
     // Rounds 1 and 2 each fixed the reviewer's example and each shipped the same capability
@@ -170,7 +170,7 @@ public:
     // The active zone id (back-compat alias of getZones' active): {network}.
     Q_INVOKABLE QString getNetwork() const;
     // Switch the active zone (alias of setActiveZone). {ok}.
-    Q_INVOKABLE QString setNetwork(const QString& network);
+    Q_INVOKABLE QString setNetwork(const QString& network, const QString& password = QString());
 
     // ── Zones (LEZ chains the wallet can switch between, token-agnostic) ───────
     // {zones:[{id,name,kind,endpoint,tor,builtin}], active}. kind = local-standalone
@@ -183,15 +183,24 @@ public:
     // back as a single "endpoint" field, and the UI has always had a single endpoint box that
     // it split at the call site. Collapsing it takes editZone off the 5-argument ceiling and
     // removes the "tor=true with a clearnet url" state that had to be validated away.
-    Q_INVOKABLE QString addZone(const QString& name, const QString& endpoint, bool tor);
+    // GATED unless the store on disk has no password to prove (a fresh install, or a plaintext
+    // store): adding a zone and switching to it is repointing the wallet at a sequencer, which
+    // is the very harm approveZone is gated for. Keyed on the store and NOT on the session,
+    // because clearSessionPassword() is ungated and empties the session in one call. See
+    // zoneChangeRefusal() in the .cpp for the full argument and for the two zone-adjacent verbs
+    // that are deliberately not in this class.
+    Q_INVOKABLE QString addZone(const QString& name, const QString& endpoint,
+                                const QString& password = QString());
     // Edit a user zone's name/endpoint/transport (built-ins can't be edited). {ok}.
     Q_INVOKABLE QString editZone(const QString& id, const QString& name,
-                                 const QString& endpoint, bool tor);
-    // Remove a user zone (built-ins can't be removed). {ok}.
-    Q_INVOKABLE QString removeZone(const QString& id);
+                                 const QString& endpoint,
+                                 const QString& password = QString());
+    // Remove a user zone (built-ins can't be removed). {ok}. Same gate: it mutates the zone list
+    // and moves the wallet off the zone it deletes.
+    Q_INVOKABLE QString removeZone(const QString& id, const QString& password = QString());
     // Switch the active zone - repoints the wallet (local sequencer, or thin client over
     // Tor/clearnet) and reloads. {ok}.
-    Q_INVOKABLE QString setActiveZone(const QString& id);
+    Q_INVOKABLE QString setActiveZone(const QString& id, const QString& password = QString());
 
     // Account management
     Q_INVOKABLE QString listAccounts();
@@ -397,9 +406,12 @@ public:
     // it completed a chain with no user in it at all - connectRequest -> approveConnect ->
     // requestZone -> approveZone, every step callable by a co-resident module - leaving the wallet
     // talking to the attacker's sequencer, which sees every public transaction, can censor them
-    // and controls every balance the UI shows. Zone SELECTION (addZone/setActiveZone/setNetwork)
-    // stays ungated because onboarding and the lock screen need it while locked; approving a
-    // foreign app's zone switch does not.
+    // and controls every balance the UI shows. Zone SELECTION (addZone/editZone/removeZone/
+    // setActiveZone/setNetwork) carries the same weight and is gated by zoneChangeRefusal(),
+    // which is free only on a store no password can be proved against (onboarding). Leaving it
+    // ungated outright made this gate bypassable in two calls: addZone(attacker endpoint) +
+    // setActiveZone(it), no request and no sheet - and gating it on `!m_password.isEmpty()`
+    // made it bypassable in three, the first being the ungated clearSessionPassword().
     Q_INVOKABLE QString approveZone(const QString& requestId,
                                     const QString& password = QString());
     Q_INVOKABLE QString rejectZone(const QString& requestId);
@@ -537,6 +549,10 @@ private:
     // readable "reason" so the UI can tell "locked" (prompt for unlock) from "unauthorized"
     // (wrong password) without string-matching.
     QString authRefusal() const;
+    // The one gate for the zone-changing verbs (addZone/editZone/removeZone/setActiveZone/
+    // setNetwork). Empty string = proceed; anything else is the refusal to return verbatim.
+    // Keyed on storeCanProvePassword(), not on the session: see the comment on the definition.
+    QString zoneChangeRefusal(const QString& password);
     // Compare two secrets without leaking their contents through timing. Both sides are hashed
     // first and the fixed-width digests are compared with a branch-free accumulator, so neither
     // the length nor the first differing byte is observable. This is the one check standing
@@ -744,6 +760,14 @@ private:
     // ── unlock() throttle ──────────────────────────────────────────────────────
     // unlock() is otherwise an unrate-limited password oracle. Consecutive failures earn an
     // exponential backoff; a success resets it.
+    bool   authThrottled() const;   // shared unlock/gate backoff window, read-only
+    void   noteAuthFailure();       // the one copy of the backoff arithmetic
+
+    // How many times the idle lock has been pushed out by a running job without any real user
+    // activity in between. Bounded, so a job that never terminates cannot pin a session open.
+    int    m_lockDeferrals = 0;
+    static constexpr int kMaxLockDeferrals = 4;
+
     int    m_unlockFails = 0;
     qint64 m_unlockRetryAtMs = 0;
     static constexpr int kUnlockFreeAttempts = 3;        // no delay for honest typos
@@ -784,8 +808,11 @@ private:
     // Validate + split a zone endpoint into the (url, onion) pair the zone record stores.
     // tor=true → the endpoint must be a .onion; tor=false → a http(s) URL, normalised the way
     // addZone has always normalised it (a missing scheme defaults to http://).
-    static bool normalizeZoneEndpoint(const QString& endpoint, bool tor, QString* url,
-                                      QString* onion, QString* error);
+    // Switch zones with NO gate - for callers that already established user intent.
+    QString applyActiveZone(const QString& id);
+    QString applyAddZone(const QString& name, const QString& endpoint);
+    static bool normalizeZoneEndpoint(const QString& endpoint, QString* url,
+                                      QString* onion, bool* tor, QString* error);
     // Ensure an account id carries the required privacy prefix ("Public"/"Private").
     // Returns the prefixed id, or an empty string on an explicit prefix conflict.
     static QString withPrivacyPrefix(const QString& id, const QString& kind, bool* conflict);
@@ -812,6 +839,10 @@ private:
         QString        result;    // normalised CLI JSON once terminal
         QString        outBuf;    // stdout accumulated incrementally (for phase detection)
         bool           killedByTimeout = false;
+        // Did a human prove the password to start this? Only a gated job may defer the idle
+        // auto-lock: startFaucet is ungated by design, so an ungated job deferring the lock
+        // let any co-resident module hold the session open for as long as it liked.
+        bool           gated = false;
         QElapsedTimer  timer;
         // ── Queued start (only the faucet's token half uses this) ──────────────────────
         // The job is registered and reported "running" from the moment it is created; the

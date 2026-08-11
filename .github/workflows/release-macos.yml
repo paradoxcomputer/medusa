@@ -58,13 +58,13 @@ jobs:
           # no-op; the zkVM guests are prebuilt .bin artifacts committed in the LEZ tree.
           cargo risczero install --version "$RISC0_VERSION" || true
 
-      - name: Build the LEZ engine (patched v0.2.0 source)
+      - name: Build the LEZ engine (patched v0.2.4 source, v0.2.2 program generation)
         run: |
           # build.sh replays the patch series with `git am`, which needs a committer identity.
           # The macOS image happens to supply one today; don't depend on that.
           git config --global user.name  "medusa build"
           git config --global user.email "build@medusa.local"
-          # clones logos-execution-zone@v0.2.0, applies wallet/patches-v020/*, builds:
+          # clones the pinned logos-execution-zone commit (tag v0.2.4), applies wallet/patches-v022/*, builds:
           #   wallet (→ wallet-lez), sequencer_service (standalone), sequencer_service_l1 (L1),
           #   diaphani-forward (Tor forwarder). Produces native darwin binaries.
           bash wallet/build.sh
@@ -109,6 +109,19 @@ jobs:
           # No `|| true`: wallet/build.sh now fails closed on an unresolvable diaphani pin, so a
           # missing binary here means that check was bypassed.
           install -m755 "$DIA/diaphani-forward"       "$stg/bin/diaphani-forward"
+          # medusa-faucet-client, built natively by the same wallet/build.sh run above. Required by
+          # TWO paths: the on-chain token faucet, and the wrapper's `init-holding` bootstrap, which
+          # is the only way to shield a token that lives in an ATA (a PDA cannot sign a private
+          # send). Mirrors release-linux.yml; without it Shield fails on every claimed token.
+          install -m755 wallet/faucet/client/target/release/medusa-faucet-client \
+                                                      "$stg/bin/medusa-faucet-client"
+          # The risc0 guest is not built on this runner either (it needs the docker risc0
+          # toolchain); bundle the committed artifact when the tree carries one.
+          if [ -f wallet/faucet/guest/medusa_faucet.bin ]; then
+            install -m644 wallet/faucet/guest/medusa_faucet.bin "$stg/bin/medusa_faucet.bin"
+          else
+            echo "::warning::medusa_faucet.bin not in the tree - the on-chain token faucet will report it missing"
+          fi
           # NOTE: medusa-tor is not built here - on mac the wallet falls back to a system `tor`
           #       (resolveTorBin), and the "no Tor" disclaimer covers a machine without it.
           mainfile=$(basename "$(ls "$stg"/*.dylib 2>/dev/null || ls "$stg"/*plugin* | head -1)")
