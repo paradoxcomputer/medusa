@@ -9,6 +9,13 @@
 # These artifacts are then merged with the linux .lgx into the multi-variant packages served
 # by paradox-modules-repo (see its scripts/build-release.sh + `lgx merge`).
 #
+# The "-dev" variant names that a Basecamp built from source requires are NOT added here, and
+# neither are the per-architecture publish files. Both happen once, after the merge, in
+# release-linux.yml, so a single step covers both platforms and the darwin artifacts this job
+# uploads carry the plain names only. Do not add a second aliasing step here: it would be dead
+# work, and merging two packages that each already contain their -dev trees would produce one
+# carrying four copies of the payload.
+#
 # Trigger: a release tag (v*) or manual dispatch - macOS minutes are ~10× Linux, so not on
 # every push.
 name: release-macos

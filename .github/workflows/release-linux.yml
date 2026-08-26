@@ -297,6 +297,68 @@ jobs:
           fi
 
           mkdir -p publish
+
+          # Give every variant its "-dev" twin, then verify the package.
+          #
+          # Basecamp resolves variants by name and accepts exactly one spelling:
+          # package_manager_lib.cpp::platformVariantsToTry() REPLACES its candidate list with
+          # the "<platform>-dev" forms unless the host was compiled with LGPM_PORTABLE_BUILD.
+          # So a package carrying only linux-amd64 + darwin-arm64 installs on the AppImage and
+          # fails on every build from source with
+          #   "Package does not contain variant for platform: linux-x86_64-dev".
+          # The payload is identical either way - .#lgx-portable is self-contained ($ORIGIN
+          # only, Qt from the host) - so one tree serves both names. The real .#lgx dev bundle
+          # cannot be shipped instead: its RUNPATH points at the builder's /nix/store, which no
+          # other machine has. Idempotent: a variant that already has a twin is left alone.
+          alias_dev() {
+            pkgfile="$1"
+            work=$(mktemp -d)
+            python3 - "$pkgfile" > "$work/plan" <<'ALIASPY'
+          import json, sys, tarfile
+          m = json.load(tarfile.open(sys.argv[1]).extractfile("manifest.json"))
+          have = {k.split("/", 1)[1] for k in m.get("hashes", {}) if k.startswith("variants/")}
+          view = m.get("view", "") or "-"
+          main = m.get("main", {})
+          if isinstance(main, str):
+              main = {v: main for v in have}
+          for v in sorted(have):
+              if v.endswith("-dev") or f"{v}-dev" in have:
+                  continue
+              print(v, main.get(v) or "-", view)
+          ALIASPY
+            if [ -s "$work/plan" ]; then
+              "$LGX" extract "$pkgfile" -o "$work/ex" >/dev/null
+              while read -r v vmain vview; do
+                echo "  $(basename "$pkgfile"): $v -> ${v}-dev"
+                args=(--variant "${v}-dev" --files "$work/ex/$v" -y)
+                # `cmd && arr+=(...)` would be the whole command, so an empty field would
+                # return 1 and set -e would kill the job. Use if/fi.
+                if [ "$vmain" != "-" ]; then args+=(--main "$vmain"); fi
+                if [ "$vview" != "-" ]; then args+=(--view "$vview"); fi
+                "$LGX" add "$pkgfile" "${args[@]}"
+              done < "$work/plan"
+            fi
+            rm -rf "$work"
+            "$LGX" verify "$pkgfile"
+            # A package whose variants lack -dev twins cannot be installed by a build from
+            # source at all, so fail the release rather than publish one.
+            python3 - "$pkgfile" <<'TWINPY'
+          import json, sys, tarfile
+          m = json.load(tarfile.open(sys.argv[1]).extractfile("manifest.json"))
+          have = {k.split("/", 1)[1] for k in m.get("hashes", {}) if k.startswith("variants/")}
+          plain = {v for v in have if not v.endswith("-dev")}
+          missing = sorted(v for v in plain if v + "-dev" not in have)
+          assert plain, "no platform variants at all"
+          assert not missing, f"variants without a -dev twin: {missing}"
+          print("  variant pairs OK:", sorted(have))
+          TWINPY
+          }
+
+          # Read the single architecture out of a one-platform artifact.
+          arch_of() {
+            python3 -c "import sys,gzip,io,tarfile,json;tf=tarfile.open(fileobj=io.BytesIO(gzip.open(sys.argv[1],'rb').read()));m=json.load(tf.extractfile('manifest.json'));print(sorted(k.split('/',1)[1] for k in m['hashes'] if k.startswith('variants/'))[0])" "$1"
+          }
+
           for pkg in medusa_core medusa_ui tip_jar; do
             lin="artifacts/$pkg-${{ matrix.variant }}.lgx"
             [ -f "$lin" ] || { echo "::warning::$lin missing, skipping"; continue; }
@@ -310,7 +372,28 @@ jobs:
             else
               cp "$lin" "$out"
             fi
-            "$LGX" verify "$out"
+            alias_dev "$out"
+
+            # Also publish ONE FILE PER ARCHITECTURE, alongside the merged package.
+            #
+            # The catalog carries a single url per version and package_downloader has no
+            # platform awareness, so a catalog install always pulls EVERY architecture. That
+            # matters because Basecamp abandons a download after 300s - kDownloadIpcDeadlineMs
+            # in PackageCoordinator.cpp, which wraps the whole batch, so curl's own 600s cap
+            # never fires - and there is no resume: a failed attempt restarts at byte 0.
+            # Merged medusa_core is far past that budget on an ordinary connection, and worse,
+            # a timeout is reported to the user as a SUCCESSFUL install.
+            # These single-architecture files are about half the size and are meant for the
+            # "Install LGX Package" path, which reads from disk and so has no download timeout.
+            for part in "$lin" "$mac"; do
+              [ -n "$part" ] || continue
+              [ -f "$part" ] || continue
+              pv=$(arch_of "$part")
+              pout="publish/$pkg-$pkgver-$pv.lgx"
+              cp "$part" "$pout"
+              chmod u+w "$pout"
+              alias_dev "$pout"
+            done
           done
           ls -la publish
 
