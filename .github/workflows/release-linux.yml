@@ -185,9 +185,11 @@ jobs:
           PY
             # engine binaries under bin/ (resolveBin looks at <module>/bin/<name> first):
             install -m755 "$LEZ/wallet"                     "$stg/bin/wallet-lez"
+            # BOTH names: cliPath() prefers "medusa-wallet" and the legacy "wallet" fallback is
+            # documented as one-release-only, so shipping only the legacy name is a delayed
+            # break. Same file twice.
+            install -m755 module/scripts/wallet-wrapper      "$stg/bin/medusa-wallet"
             install -m755 module/scripts/wallet-wrapper      "$stg/bin/wallet"
-            install -m755 "$LEZ/sequencer_service"           "$stg/bin/sequencer_service"
-            install -m755 "$LEZ/sequencer_service_l1"        "$stg/bin/sequencer_service_l1"
             # No `|| true` here: wallet/build.sh now fails closed if the pinned diaphani commit
             # cannot be checked out, so a missing binary means the pin check was bypassed.
             install -m755 "$DIA/diaphani-forward"            "$stg/bin/diaphani-forward"

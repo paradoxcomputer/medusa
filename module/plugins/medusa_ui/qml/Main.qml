@@ -141,6 +141,9 @@ Rectangle {
     property string seqStatus:           "unknown"   // running | starting | unreachable
     property bool   seqBinaryMissing:    false       // devnet selected but no sequencer binary on disk
     property string seqBinaryPath:       ""          // where the wallet looked for it
+    property string seqRequiredVersion:  ""          // LEZ release a user-supplied sequencer must be
+    property string seqBinaryEnvVar:     ""          // env var that points the wallet at one
+    property int    seqExpectedPort:     0           // port the wallet looks for a sequencer on
     property bool   torBinaryMissing:    false       // Tor/onion zone but no bundled/system Tor found
     property int    torPercent:          0           // bundled-Tor bootstrap % (connect bar)
     property string torStage:            ""           // current Tor bootstrap stage text
@@ -645,11 +648,25 @@ Rectangle {
     // manager) and installs it on demand. Entirely guarded on logos.callModuleAsync
     // so it silently no-ops (no button) if the async bridge isn't present. Basecamp
     // can't hot-reload a running module, so after install we ask the user to reopen.
+    // Shown on the opening screen so a user can report which build they are on without
+    // digging through the Package Manager. Read from the installed manifest rather than
+    // hard-coded, so it can never disagree with the package the user actually has.
+    property string appVersion:   ""
     property bool   updAvailable: false
     property string updVersion:   ""     // newest medusa_ui version offered
-    property var    updPlan:      []     // [{name,version,repoUrl,rootHash,isCore}] core-first
+    property var    updPlan:      []     // [{name,version,repoUrl,rootHash,isCore,fileName}] core-first
     property string updState:     ""     // "" | "downloading" | "installing" | "done" | "error"
     property string updMsg:       ""
+    // Download progress is tracked by WATCHING FOR THE FILE, not by the reply to downloadPinned.
+    // logos.callModuleAsync's timeoutMs arms only the bridge's own timer; it is not passed down to
+    // invokeRemoteMethodAsync (LogosQmlBridge.cpp:120), so the transport's ~20s default governs and
+    // any package of real size times out, delivering an empty QVariant that surfaces as
+    // {"error":"Invalid response"}. The downloader keeps working through that (its own budget is
+    // 600s) and writes the file anyway, so completion is detected with package_manager.verifyPackage
+    // on the destination path - which also proves the bytes are whole before we install them.
+    property int    updDlIndex:   0      // which plan entry is downloading
+    property var    updPaths:     []     // verified files, in install order
+    property int    updWaitedMs:  0
     function jparse(raw) {
         try { var t = JSON.parse(raw); return (typeof t === 'string') ? JSON.parse(t) : t } catch(e) { return null }
     }
@@ -662,6 +679,18 @@ Rectangle {
         }
         return 0
     }
+    function readAppVersion() {
+        if (typeof logos === "undefined" || !logos.callModuleAsync) return
+        logos.callModuleAsync("package_manager", "getInstalledPackages", [], function(ij) {
+            var inst = root.jparse(ij); if (!Array.isArray(inst)) return
+            for (var i = 0; i < inst.length; i++) {
+                if (inst[i] && inst[i].name === "medusa_ui" && inst[i].version) {
+                    root.appVersion = String(inst[i].version); return
+                }
+            }
+        })
+    }
+
     function checkForUpdate() {
         if (typeof logos === "undefined" || !logos.callModuleAsync) return   // needs the async bridge
         if (root.updState === "downloading" || root.updState === "installing") return
@@ -683,8 +712,11 @@ Rectangle {
                     var lh = v.rootHash || (v.manifest && v.manifest.hashes && v.manifest.hashes.root) || ""
                     var ch = (cur.hashes && cur.hashes.root) || ""
                     if (root.verCmp(lv, cur.version) > 0 || (lv === cur.version && lh && ch && lh !== ch)) {
+                        var furl = String(v.url || "")
+                        var fname = furl ? furl.split("/").pop() : (row.name + "-" + lv + ".lgx")
                         plan.push({ name: row.name, version: lv, isCore: row.name === "medusa_core",
-                                    repoUrl: row.repositoryUrl || row.repository || "", rootHash: lh })
+                                    repoUrl: row.repositoryUrl || row.repository || "", rootHash: lh,
+                                    fileName: fname })
                         if (row.name === "medusa_ui") uiVer = lv
                     }
                 }
@@ -695,39 +727,94 @@ Rectangle {
             })
         })
     }
+    // The destination package_downloader writes to: TMPDIR (else /tmp) + the url's basename
+    // (package_downloader_lib.cpp derives it exactly this way).
+    function updDestFor(p) {
+        return "/tmp/" + p.fileName
+    }
+
     function doUpdate() {
         if (!root.updAvailable || !root.updPlan.length || !logos.callModuleAsync) return
-        var plan = root.updPlan.slice(), paths = []
-        root.updState = "downloading"; root.updMsg = "Downloading update…"
-        function dl(i) {
-            if (i >= plan.length) { inst(0); return }
-            var p = plan[i]
-            logos.callModuleAsync("package_downloader", "downloadPinned",
-                                  [p.repoUrl, p.name, p.version, p.rootHash], function(rj) {
+        root.updPaths = []
+        root.updDlIndex = 0
+        root.updState = "downloading"
+        root.updMsg = "Downloading update…"
+        root.startDownload(0)
+    }
+
+    // Fire the download and STOP CARING about its reply. On a link where the package cannot
+    // arrive within the transport's ~20s deadline the reply is an empty QVariant, reported as
+    // "Invalid response" - but the transfer itself continues and completes. The poll below is
+    // the real completion signal; a reply that does arrive in time short-circuits it.
+    function startDownload(i) {
+        if (i >= root.updPlan.length) { root.beginInstall(0); return }
+        var p = root.updPlan[i]
+        root.updDlIndex = i
+        root.updWaitedMs = 0
+        root.updMsg = "Downloading " + p.name + " v" + p.version + "…"
+        logos.callModuleAsync("package_downloader", "downloadPinned",
+                              [p.repoUrl, p.name, p.version, p.rootHash], function(rj) {
+            var r = root.jparse(rj)
+            if (root.updState !== "downloading") return          // already resolved by the poll
+            if (r && r.path && !r.error) {
+                updPollTimer.stop()
+                var acc = root.updPaths.slice(); acc.push(r.path); root.updPaths = acc
+                root.startDownload(i + 1)
+            }
+            // An error here is expected on a slow link and is NOT terminal - let the poll decide.
+        })
+        updPollTimer.restart()
+    }
+
+    // Poll the destination with verifyPackage: it fails while the file is absent or half-written
+    // (the archive cannot be parsed and its hashes cannot match) and succeeds only once the bytes
+    // are complete and internally consistent.
+    Timer {
+        id: updPollTimer
+        interval: 3000; repeat: true; running: false
+        onTriggered: {
+            if (root.updState !== "downloading") { stop(); return }
+            var p = root.updPlan[root.updDlIndex]
+            if (!p) { stop(); return }
+            var dest = root.updDestFor(p)
+            root.updWaitedMs += interval
+            logos.callModuleAsync("package_manager", "verifyPackage", [dest], function(rj) {
+                if (root.updState !== "downloading") return
                 var r = root.jparse(rj)
-                if (!r || r.error || !r.path) {
-                    root.updState = "error"; root.updMsg = "Download failed: " + ((r && r.error) || "unknown"); return
+                var ok = !!(r && !r.error && (r.valid === undefined || r.valid))
+                if (ok) {
+                    updPollTimer.stop()
+                    var acc = root.updPaths.slice(); acc.push(dest); root.updPaths = acc
+                    root.startDownload(root.updDlIndex + 1)
+                } else if (root.updWaitedMs > 660000) {
+                    // Past the downloader's own 600s ceiling: it is not still working.
+                    updPollTimer.stop()
+                    root.updState = "error"
+                    root.updMsg = "Update timed out fetching " + p.name
+                                + ". Install it from Basecamp's Package Manager instead."
                 }
-                paths.push(r.path); dl(i + 1)
             })
         }
-        function inst(i) {
-            if (i >= paths.length) {
-                root.updState = "done"; root.updAvailable = false
-                root.updMsg = "Updated to v" + root.updVersion + " - reopen Medusa to apply."
+    }
+
+    function beginInstall(i) {
+        if (i >= root.updPaths.length) {
+            root.updState = "done"; root.updAvailable = false
+            root.updMsg = "Updated to v" + root.updVersion + " - reopen Medusa to apply."
+            return
+        }
+        root.updState = "installing"; root.updMsg = "Installing…"
+        logos.callModuleAsync("package_manager", "installPlugin", [root.updPaths[i], false], function(rj) {
+            var r = root.jparse(rj)
+            if (!r || r.error) {
+                root.updState = "error"
+                root.updMsg = "Install failed: " + ((r && r.error) || "unknown")
                 return
             }
-            root.updState = "installing"; root.updMsg = "Installing…"
-            logos.callModuleAsync("package_manager", "installPlugin", [paths[i], false], function(rj) {
-                var r = root.jparse(rj)
-                if (!r || r.error) {
-                    root.updState = "error"; root.updMsg = "Install failed: " + ((r && r.error) || "unknown"); return
-                }
-                inst(i + 1)
-            })
-        }
-        dl(0)
+            root.beginInstall(i + 1)
+        })
     }
+
     Timer { id: updateCheckTimer; interval: 900000; running: true; repeat: true   // re-check every 15 min
             onTriggered: root.checkForUpdate() }
 
@@ -839,8 +926,11 @@ Rectangle {
         if (s && s.state) { root.seqStatus = s.state; if (s.mode) root.seqMode = s.mode }
         // Devnet (a local zone) needs a sequencer binary on disk to spawn one; if it's absent
         // the sequencer can never come up - flag it so the UI shows a clear disclaimer.
-        root.seqBinaryMissing = !!(s && s.mode === "local-standalone" && s.binaryAvailable === false)
+        root.seqBinaryMissing = !!(s && s.mode === "local-standalone" && s.reason === "binary-missing")
         root.seqBinaryPath = (s && s.binaryPath) ? s.binaryPath : ""
+        root.seqRequiredVersion = (s && s.requiredVersion) ? s.requiredVersion : ""
+        root.seqBinaryEnvVar = (s && s.binaryEnvVar) ? s.binaryEnvVar : "MEDUSA_SEQ_PATH"
+        root.seqExpectedPort = (s && s.expectedPort) ? s.expectedPort : 0
         // Tor/onion zone with no usable Tor binary (neither bundled medusa-tor nor a system tor).
         root.torBinaryMissing = !!(s && s.needsTor === true && s.torAvailable === false)
         // Failure surface for the offline modal + local-sequencer banner.
@@ -1100,6 +1190,24 @@ Rectangle {
     function seqProblemTitle() {
         return root.seqProblem === "mismatch" ? "Zone build mismatch" : "Local sequencer not running"
     }
+    // How to supply a sequencer, now that the module no longer ships one. ensureSequencer()
+    // checks seqHealthy(port) BEFORE it ever resolves a binary, so simply RUNNING one on the
+    // expected port is the whole requirement - the wallet adopts it and spawns nothing. Pointing
+    // MEDUSA_SEQ_PATH at a binary is the alternative, for letting the wallet spawn it instead.
+    // --listen-address 127.0.0.1 is not optional advice: the sequencer defaults to 0.0.0.0 and
+    // its RPC has no caller authentication, so an unpinned bind exposes funds to the network.
+    function seqSetupHint() {
+        var ver  = root.seqRequiredVersion || "v0.2.4"
+        var port = root.seqExpectedPort || 3071
+        return "Medusa no longer ships a sequencer. Build sequencer_service from "
+             + "logos-execution-zone " + ver + " (cargo build --release -p sequencer_service "
+             + "--features standalone), then run it on port " + port
+             + " with --listen-address 127.0.0.1 - its RPC has no authentication, so do not "
+             + "bind it to anything else. The wallet picks up a sequencer that is already "
+             + "listening. Alternatively set " + (root.seqBinaryEnvVar || "MEDUSA_SEQ_PATH")
+             + " to the binary before starting Basecamp and the wallet will start it for you."
+    }
+
     // Reason-specific advice for the banner + offline modal. Every branch says what to DO
     // (reinstall the module / restart Basecamp / switch zone).
     function seqProblemBody() {
@@ -1107,9 +1215,10 @@ Rectangle {
             return "This zone's sequencer runs a different LEZ build than this wallet (program "
                  + "ids differ). Reinstall/update the Medusa module so both match, or switch zone."
         if (root.seqProblem === "binary-missing")
-            return "The bundled sequencer binary was not found"
+            return "This zone needs a LEZ sequencer running on your machine, and none was found"
                  + (root.seqBinaryPath ? " (looked for " + root.seqBinaryPath + ")" : "")
-                 + ". Reinstall the Medusa module, or switch zone."
+                 + ". " + root.seqSetupHint()
+                 + " Or switch to a hosted zone, which needs no sequencer."
         if (root.seqProblem === "launch-failed")
             return "The local sequencer failed to launch"
                  + (root.seqLaunchError ? ": " + root.seqLaunchError : "")
@@ -2650,6 +2759,7 @@ Rectangle {
     // veil swallows input for the same window in which the blocked thread ignored it anyway.
     Component.onCompleted: {
         if (typeof logos === "undefined" || !logos.callModule) return
+        root.readAppVersion()
         root.runBusy("Loading", function() {
             root.refreshCliConfig()
             var scfg = root.callModuleParse(logos.callModule("medusa_core", "getSequencerConfig", []))
@@ -4071,6 +4181,15 @@ Rectangle {
                     Layout.preferredWidth: 44; Layout.preferredHeight: 2; radius: 1
                     color: root.silver; opacity: 0.85 }
 
+                // Build identity. Hidden until known rather than showing "v" with nothing after
+                // it, since the read is async and the screen paints first.
+                Text { textFormat: Text.PlainText; font.family: root.faceFont
+                    Layout.alignment: Qt.AlignHCenter; Layout.topMargin: 2
+                    visible: root.appVersion.length > 0
+                    text: "v" + root.appVersion
+                    font.pixelSize: 10; color: root.textSecondary; opacity: 0.8
+                }
+
                 // ── State-specific prompt ──
                 Text { textFormat: Text.PlainText; font.family: root.faceFont;
                     Layout.alignment: Qt.AlignHCenter; Layout.topMargin: 4
@@ -5466,8 +5585,7 @@ Rectangle {
                     text: root.torBinaryMissing
                         ? "This onion zone tunnels over Tor, but neither the bundled medusa-tor nor a system tor "
                           + "was found - install Tor (e.g. apt install tor), or pick a clearnet network below."
-                        : "The devnet zone runs a sequencer on your machine, but none was found - install the "
-                          + "sequencer_service binary in ~/.local/bin, or pick a hosted network below."
+                        : root.seqSetupHint() + " Or pick a hosted network below, which needs none."
                 }
             }
             Rectangle {

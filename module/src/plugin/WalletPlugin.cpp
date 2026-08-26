@@ -242,7 +242,7 @@ static constexpr const char* kSeqPathKey = "medusa-wallet/seqPath";   // sequenc
 // accounts) and applies this `genesis` array on top: fund the system bridge account, plus a
 // couple of supply accounts. (The diaphani L1 zone rewrites node_url in writeSeqConfig.)
 static const char* kSeqConfigTemplate =
-R"SEQ({"home":"__SEQ_HOME__","max_num_tx_in_block":20,"max_block_size":"1 MiB","mempool_max_size":1000,"block_create_timeout":"3s","retry_pending_blocks_timeout":"5s","bedrock_config":{"channel_id":"0202020202020202020202020202020202020202020202020202020202020202","node_url":"http://127.0.0.1:1"},"signing_key":[37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37],"genesis":[{"supply_bridge_account":{"balance":1000000000}},{"supply_account":{"account_id":"CbgR6tj5kWx5oziiFptM7jMvrQeYY3Mzaao6ciuhSr2r","balance":100000000}},{"supply_account":{"account_id":"2RHZhw9h534Zr3eq2RGhQete2Hh667foECzXPmSkGni2","balance":100000000}}]})SEQ";
+R"SEQ({"home":"__SEQ_HOME__","max_num_tx_in_block":20,"max_block_size":"1 MiB","mempool_max_size":1000,"block_create_timeout":"3s","retry_pending_blocks_timeout":"5s","bedrock_config":{"channel_id":"0202020202020202020202020202020202020202020202020202020202020202","node_url":"http://127.0.0.1:1","funding_key":"2e03b2eff5a45478e7e79668d2a146cf2c5c7925bce927f2b1c67f2ab4fc0d26"},"signing_key":[37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37,37],"genesis":[{"supply_bridge_account":{"balance":1000000000}},{"supply_account":{"account_id":"CbgR6tj5kWx5oziiFptM7jMvrQeYY3Mzaao6ciuhSr2r","balance":100000000}},{"supply_account":{"account_id":"2RHZhw9h534Zr3eq2RGhQete2Hh667foECzXPmSkGni2","balance":100000000}}]})SEQ";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -912,12 +912,24 @@ QString WalletPlugin::cliPath() const
     // medusa-tor-monitor, diaphani-forward). A bare "wallet" in a shared ~/.local/bin is both a
     // collision risk and the most plantable name there is, which is exactly the surface
     // resolveBin() distrusts on packaged installs.
+    // Guarded on EXISTENCE, not just on a non-empty string. On a packaged install resolveBin()
+    // returns <bundle>/bin/<name> unconditionally, without checking the file is there - so
+    // `named` is non-empty even when the package ships no medusa-wallet, and an isEmpty() guard
+    // made the legacy branch below dead exactly where it was needed. Packages up to 0.4.2 staged
+    // the wrapper as bin/wallet only, so every packaged install failed with
+    // "wallet CLI not found: <bundle>/bin/medusa-wallet" while a perfectly good bin/wallet sat
+    // beside it. Dev installs were unaffected (no bundle bin/, so resolveBin fell through to
+    // ~/.local/bin), which is why this only ever showed up for users on a release build.
     const QString named = resolveBin(QStringLiteral("medusa-wallet"), "MEDUSA_WALLET_CLI");
-    if (!named.isEmpty())
+    if (!named.isEmpty() && QFileInfo::exists(named))
         return named;
-    // Legacy fallback, one release only: installs made before the rename staged the wrapper as
-    // "wallet". Without this an upgrade would fail "wallet CLI not found" on every operation.
-    return resolveBin(QStringLiteral("wallet"), "MEDUSA_WALLET_CLI");
+    // Legacy fallback: installs made before the rename staged the wrapper as "wallet".
+    const QString legacy = resolveBin(QStringLiteral("wallet"), "MEDUSA_WALLET_CLI");
+    if (!legacy.isEmpty() && QFileInfo::exists(legacy))
+        return legacy;
+    // Nothing exists anywhere. Report the namespaced path: it is what a correct package ships,
+    // so the error names the file the user should be looking for.
+    return named;
 }
 
 // ── QProcess runner ──────────────────────────────────────────────────────────
@@ -1322,13 +1334,25 @@ QString WalletPlugin::setCliPath(const QString& path, const QString& password)
 // It is now resolved exactly like cliPath(): a launcher-owned env var, else the module's own
 // bundle. The setting is still REPORTED by getSequencerConfig (as seqPath/seqPathIgnored) so a
 // poisoned install shows what was planted, and it is never executed.
+// The LEZ release a user-supplied sequencer must be built from. The module no longer ships a
+// sequencer binary (the two were 77 MB of a 128 MB payload, and sequencer_service_l1 was never
+// spawned by any zone), so a local zone now needs one the user builds and runs themselves. This
+// is the human name of wallet/build.sh's LEZ_BASE_REV and MUST move in the same commit that
+// flips it, exactly like kEngineEpoch (declared further down with seqHome). Do not show `sequencer_service --version` to the
+// user instead: it prints the crate version, which has read "0.1.0" at every LEZ release.
+static constexpr const char* kRequiredSeqVersion = "v0.2.4";
+// The only mechanism that can point a PACKAGED install at a user-supplied binary. resolveBin()
+// returns the module's own bundle path unconditionally and deliberately never honours a path
+// stored on disk, so this env var - read by the launcher, not from settings - is the supported
+// route. Named in the UI so the instruction is actionable.
+static constexpr const char* kSeqPathEnvVar = "MEDUSA_SEQ_PATH";
+
 QString WalletPlugin::seqPath() const
 {
-    // diaphani/Tor mode talks to a REAL shared Bedrock L1, so it needs the non-standalone
-    // build (sequencer_service_l1); devnet/testnet use the L1-free standalone build.
-    const QString binName = (netId() == QStringLiteral("diaphani"))
-        ? QStringLiteral("sequencer_service_l1") : QStringLiteral("sequencer_service");
-    return resolveBin(binName, "MEDUSA_SEQ_PATH");
+    // Only ever the standalone build. The diaphani zone is a THIN CLIENT of a shared Bedrock L1
+    // (ensureSequencer returns early for kind "local-l1-tor" without spawning anything), so
+    // sequencer_service_l1 was never executed and is no longer shipped or looked for.
+    return resolveBin(QStringLiteral("sequencer_service"), kSeqPathEnvVar);
 }
 
 // ── Zones ───────────────────────────────────────────────────────────────────────
@@ -1872,7 +1896,13 @@ void WalletPlugin::ensureSequencer()
 
     const QString bin = seqPath();
     appendLog(QStringLiteral("spawning sequencer: %1 --port %2").arg(bin).arg(port));
-    startChild(*m_seqProc, bin, { QStringLiteral("--port"), QString::number(port), cfg });
+    // --listen-address: the sequencer's own default is 0.0.0.0 and its RPC has NO caller
+    // authentication (see the flag's doc comment upstream), so spawning it with --port alone
+    // published a fund-moving RPC on every interface. Loopback is the only safe bind for a
+    // sequencer we start on the user's behalf.
+    startChild(*m_seqProc, bin, { QStringLiteral("--port"), QString::number(port),
+                                  QStringLiteral("--listen-address"), QStringLiteral("127.0.0.1"),
+                                  cfg });
     if (!m_seqProc->waitForStarted(3000)) {
         // Distinguish "no binary on disk" from "binary present but won't exec" - the UI
         // gives different advice for each (reinstall the module vs check the log/perms).
@@ -2481,6 +2511,11 @@ QString WalletPlugin::getSequencerStatus()
         const bool binMissing = !(si.exists() && si.isFile());
         o[QStringLiteral("binaryAvailable")] = !binMissing;
         o[QStringLiteral("binaryPath")]      = seqPath();
+        // What the user has to install when it is missing. Published from the constants above so
+        // the UI never hard-codes a version that can drift from wallet/build.sh's pin.
+        o[QStringLiteral("requiredVersion")] = QString::fromLatin1(kRequiredSeqVersion);
+        o[QStringLiteral("expectedPort")]    = netPort();
+        o[QStringLiteral("binaryEnvVar")]    = QString::fromLatin1(kSeqPathEnvVar);
         const bool procUp = m_seqProc && m_seqProc->state() != QProcess::NotRunning;
         o[QStringLiteral("running")]         = procUp;
         o[QStringLiteral("lastLaunchError")] = m_seqLaunchError;

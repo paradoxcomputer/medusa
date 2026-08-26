@@ -45,10 +45,14 @@ PY
 
 # ── 2. runtime binaries → modules/medusa_core/bin/ (the dir resolveBin()/dladdr looks in) ──
 echo "[2/5] bundling runtime binaries…"
-install -m755 "$REPO/scripts/wallet-wrapper"     "$BINDIR/wallet"            # JSON wrapper (calls wallet-lez next to it)
+# BOTH names, on purpose. cliPath() resolves "medusa-wallet" FIRST and only falls back to the
+# legacy "wallet" - a fallback its own comment calls "one release only" - while every packaging
+# route shipped nothing but "wallet". That works today and breaks silently the day the fallback
+# goes, so ship the preferred name and keep the legacy one beside it for installs made before
+# the rename.
+install -m755 "$REPO/scripts/wallet-wrapper"     "$BINDIR/medusa-wallet"     # JSON wrapper (calls wallet-lez next to it)
+install -m755 "$REPO/scripts/wallet-wrapper"     "$BINDIR/wallet"            # legacy name, same file
 need "$WB/wallet" "wallet binary";               install -m755 "$WB/wallet"               "$BINDIR/wallet-lez"
-need "$WB/sequencer_service" "sequencer";        install -m755 "$WB/sequencer_service"    "$BINDIR/sequencer_service"
-need "$WB/sequencer_service_l1" "L1 sequencer";  install -m755 "$WB/sequencer_service_l1" "$BINDIR/sequencer_service_l1"
 install -m755 "$REPO/scripts/medusa-tor-monitor" "$BINDIR/medusa-tor-monitor"
 # medusa-faucet-client is NOT optional decoration: besides the on-chain token faucet, the wrapper
 # calls its `init-holding` to bootstrap a keytree holding, which is the only way to shield a token
@@ -134,7 +138,7 @@ Install:
   2. Run:  ./install.sh
   3. Restart Basecamp, then open "Medusa" and create your wallet.
 
-This bundle is self-contained: the wallet CLI, sequencer, and Tor all ship inside
+This bundle is self-contained: the wallet CLI and Tor ship inside
 modules/medusa_core/bin/, so no build tools are needed.
 
 Uninstall: delete modules/medusa_core and plugins/medusa_ui from your Basecamp data dir.
